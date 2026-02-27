@@ -4704,10 +4704,23 @@ app.mount("/fonts", StaticFiles(directory=str(APP_DIR / "fonts")), name="fonts")
 @app.on_event("startup")
 async def startup():
     global _cached_template
+
     init_db()
+
     if not TEMPLATE_PATH.exists():
         raise RuntimeError(f"template.html not found: {TEMPLATE_PATH}")
     _cached_template = TEMPLATE_PATH.read_text(encoding="utf-8")
+
+    # Playwright browser path (Render disk)
+    browsers_path = os.getenv("PLAYWRIGHT_BROWSERS_PATH")
+    if browsers_path:
+        Path(browsers_path).mkdir(parents=True, exist_ok=True)
+
+    # Ensure Chromium exists
+    try:
+        subprocess.check_call(["python", "-m", "playwright", "install", "chromium"])
+    except Exception as e:
+        raise RuntimeError(f"Playwright install failed: {e}")
 
 
 @app.post("/upload")
