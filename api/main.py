@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import base64
 import json
-import os
+import os, subprocess
 import re
 import uuid
 from dataclasses import dataclass
@@ -43,6 +43,8 @@ from psycopg.rows import dict_row
 import fitz  # pymupdf
 
 import shutil
+
+
 
 load_dotenv()
 
