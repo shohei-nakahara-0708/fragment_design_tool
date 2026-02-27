@@ -1,0 +1,45 @@
+# --- OS & IDE ---
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
+*.swp
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+*.sqlite
+*.sqlite3
+
+# --- Runtime data ---
+_data/
+
+# --- Node ---
+node_modules/
+dist/
+build/
+
+# --- Playwright ---
+playwright-report/
+
+# --- Environment ---
+.env.local
+.env.development.local
+.env.production.local
+
+# --- Coverage ---
+coverage/
+*.lcov
+
+# --- Misc ---
+*.bak
+*.tmp
+
+api/_master/
+_master/
+*.json
