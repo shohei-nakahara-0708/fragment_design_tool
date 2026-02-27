@@ -46,22 +46,31 @@ import shutil
 
 load_dotenv()
 
-
-
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "")
-SA_PATH = os.getenv("GOOGLE_SA_PATH", "api/_master/client_secret.json")
-gsa_json = os.environ.get("GSA_JSON")
-if not gsa_json:
-    raise RuntimeError("GSA_JSON is not set")
 
-APP_DIR = Path(__file__).parent
-DATA_DIR = Path(os.getenv("DATA_DIR", str(APP_DIR / "_data")))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+APP_DIR = Path(__file__).resolve().parent
+
+def resolve_data_dir() -> Path:
+    v = (os.getenv("DATA_DIR") or "").strip()
+    if v:
+        p = Path(v)
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except PermissionError:
+            pass
+
+    p = APP_DIR / "_data"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+DATA_DIR = resolve_data_dir()
 
 TEMPLATE_PATH = APP_DIR / "template.html"
 _cached_template: Optional[str] = None
 
+# Postgres移行したなら不要。残すならローカル専用に。
 DB_PATH = DATA_DIR / "index.sqlite"
 
 EXPORT_DIR = DATA_DIR / "_exports"
@@ -1701,6 +1710,23 @@ def apply_vm_correction_no_ai(payload, vm_rows: list[dict], *, hi=0.90, gap=0.06
 
     return payload
 
+def get_gsa_credentials(scopes):
+    gsa_json = (os.getenv("GSA_JSON") or "").strip()
+    if gsa_json:
+        return Credentials.from_service_account_info(
+            json.loads(gsa_json),
+            scopes=scopes,
+        )
+
+    # ローカル用 fallback
+    sa_path = (os.getenv("GOOGLE_SA_PATH") or str(APP_DIR / "_master" / "client_secret.json")).strip()
+    if Path(sa_path).exists():
+        return Credentials.from_service_account_file(
+            sa_path,
+            scopes=scopes,
+        )
+
+    raise RuntimeError("GSA_JSON (or GOOGLE_SA_PATH) is not set")
 
 def read_spreadsheet(event_id) -> str:
     print("Reading spreadsheet...")
@@ -1708,7 +1734,7 @@ def read_spreadsheet(event_id) -> str:
     scope = ['https://www.googleapis.com/auth/spreadsheets',
          'https://www.googleapis.com/auth/drive']
     
-    credentials = Credentials.from_service_account_info(json.loads(gsa_json), scopes=scope)
+    credentials = get_gsa_credentials(scope)
     gc = gspread.authorize(credentials)
     SPREADSHEET_KEY = '1hiV0Ve2cnYyrPkBuZcZIcLWeAnJ-ucNiB0P4owZpXug'
     workbook = gc.open_by_key(SPREADSHEET_KEY)
@@ -4779,7 +4805,7 @@ async def upload_batch_stream(
                 "https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive",
             ]
-            credentials = Credentials.from_service_account_info(json.loads(gsa_json), scopes=scope)
+            credentials = get_gsa_credentials(scope)
             gc = gspread.authorize(credentials)
 
             SPREADSHEET_KEY = "1hiV0Ve2cnYyrPkBuZcZIcLWeAnJ-ucNiB0P4owZpXug"
@@ -4909,7 +4935,7 @@ async def upload_batch(
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    credentials = Credentials.from_service_account_info(json.loads(gsa_json), scopes=scope)
+    credentials = get_gsa_credentials(scope)
     gc = gspread.authorize(credentials)
 
     SPREADSHEET_KEY = "1hiV0Ve2cnYyrPkBuZcZIcLWeAnJ-ucNiB0P4owZpXug"
