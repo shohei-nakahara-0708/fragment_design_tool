@@ -4693,7 +4693,7 @@ app = FastAPI(title="PPTX → JSON → HTML → jpg (Keep Newlines + Split ~...~
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://<your-vercel-app>.vercel.app",
+        "https://fragment-design-tool.vercel.app",
         "http://localhost:5173",
     ],
     allow_credentials=True,
