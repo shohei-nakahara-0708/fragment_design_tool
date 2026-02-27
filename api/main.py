@@ -51,6 +51,9 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "")
 SA_PATH = os.getenv("GOOGLE_SA_PATH", "api/_master/client_secret.json")
+gsa_json = os.environ.get("GSA_JSON")
+if not gsa_json:
+    raise RuntimeError("GSA_JSON is not set")
 
 APP_DIR = Path(__file__).parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(APP_DIR / "_data")))
@@ -1705,7 +1708,7 @@ def read_spreadsheet(event_id) -> str:
     scope = ['https://www.googleapis.com/auth/spreadsheets',
          'https://www.googleapis.com/auth/drive']
     
-    credentials = Credentials.from_service_account_file(SA_PATH, scopes=scope)
+    credentials = Credentials.from_service_account_info(json.loads(gsa_json), scopes=scope)
     gc = gspread.authorize(credentials)
     SPREADSHEET_KEY = '1hiV0Ve2cnYyrPkBuZcZIcLWeAnJ-ucNiB0P4owZpXug'
     workbook = gc.open_by_key(SPREADSHEET_KEY)
@@ -4776,7 +4779,7 @@ async def upload_batch_stream(
                 "https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive",
             ]
-            credentials = Credentials.from_service_account_file(SA_PATH, scopes=scope)
+            credentials = Credentials.from_service_account_info(json.loads(gsa_json), scopes=scope)
             gc = gspread.authorize(credentials)
 
             SPREADSHEET_KEY = "1hiV0Ve2cnYyrPkBuZcZIcLWeAnJ-ucNiB0P4owZpXug"
@@ -4906,7 +4909,7 @@ async def upload_batch(
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    credentials = Credentials.from_service_account_file(SA_PATH, scopes=scope)
+    credentials = Credentials.from_service_account_info(json.loads(gsa_json), scopes=scope)
     gc = gspread.authorize(credentials)
 
     SPREADSHEET_KEY = "1hiV0Ve2cnYyrPkBuZcZIcLWeAnJ-ucNiB0P4owZpXug"
