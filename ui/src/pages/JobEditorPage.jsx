@@ -11,6 +11,8 @@ import { Link, useParams } from "react-router-dom";
  * - datetime_parts と datetime の同期、timeはtextareaで改行OK
  */
 
+const API_BASE = import.meta.env.VITE_API_BASE || "";
+
 function tryParseJson(text) {
   try {
     return { ok: true, value: JSON.parse(text) };
@@ -339,7 +341,7 @@ const HeroOverridesEditor = React.memo(function HeroOverridesEditor({ json, upda
   const arr = Array.isArray(json.title_overrides) ? json.title_overrides : [];
 
   const add = () => {
-    const next = [...arr, { index: null, target: "", font_size: 22, font_weight: 700, color: "" }];
+    const next = [...arr, { index: null, target: "", font_size: 30, color: "" }];
     updateAtPath(["title_overrides"], next);
   };
 
@@ -410,7 +412,7 @@ const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath }) {
   const addTalkOverride = (idx) => {
     const cur = arr[idx] || {};
     const curOv = Array.isArray(cur.title_overrides) ? cur.title_overrides : [];
-    const nextOv = [...curOv, { index: null, target: "", font_size: "", font_weight: "", color: "" }];
+    const nextOv = [...curOv, { index: null, target: "", font_size: 25,  color: "" }];
     setTalkField(idx, "title_overrides", nextOv);
   };
 
@@ -526,7 +528,9 @@ export default function JobEditorPage() {
   const pendingRef = useRef(false);
 
   useEffect(() => {
-    fetch(`/job/${jobId}`)
+    const API_BASE = import.meta.env.VITE_API_BASE || "";
+
+    fetch(`${API_BASE}/job/${jobId}`)
       .then((r) => r.json())
       .then((d) => {
         const j = ensureBaseDefaults(d.json || {});
@@ -549,7 +553,8 @@ export default function JobEditorPage() {
     inFlightRef.current = true;
     setBusy(true);
     try {
-      const r = await fetch("/render", {
+     
+      const r = await fetch(`${API_BASE}/render`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jobId, design: payload }), // ← サーバの RenderReq に合わせて
@@ -817,7 +822,7 @@ export default function JobEditorPage() {
           right={
             <div style={{ display: "flex", gap: 8 }}>
               <a
-                href={`/download/${jobId}.jpg?t=${previewBuster}`}
+                href={`${API_BASE}/download/${jobId}.jpg?t=${previewBuster}`}
                style={{
                                   padding: "10px 14px",
                                   borderRadius: 12,
@@ -839,7 +844,7 @@ export default function JobEditorPage() {
         >
           <div style={styles.previewFrame}>
             <img
-              src={`/preview/${jobId}.jpg?t=${previewBuster}`}
+              src={`${API_BASE}/preview/${jobId}.jpg?t=${previewBuster}`}
               style={{ width: "100%", maxWidth: 600, display: "block", margin: "0 auto" }}
               alt=""
             />

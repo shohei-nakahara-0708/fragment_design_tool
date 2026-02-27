@@ -311,7 +311,11 @@ export default function UploadPage() {
     rows.forEach((r) => fd.append("files", r.file, r.filename));
     rows.forEach((r) => fd.append("eventIds", normalizeEventId(r.eventId)));
 
-    const r = await fetch("/upload/batch/stream", { method: "POST", body: fd });
+    const API_BASE = import.meta.env.VITE_API_BASE || "";
+
+
+
+    const r = await fetch(`${API_BASE}/upload/batch/stream`, { method: "POST", body: fd });
     if (!r.ok || !r.body) throw new Error(await r.text());
 
     const reader = r.body.getReader();

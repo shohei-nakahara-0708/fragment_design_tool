@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState, useCallback } from "react";
 import { Link, useNavigate } from "react-router-dom";
-
+const API_BASE = import.meta.env.VITE_API_BASE || "";
 /** ---------- helpers ---------- */
 function toIsoStart(dateStr) {
   if (!dateStr) return "";
@@ -29,7 +29,8 @@ function clamp(v, min, max) {
 
 /** Blob download with custom filename */
 async function downloadWithFilename(url, filename) {
-  const r = await fetch(url, { cache: "no-store" });
+  
+  const r = await fetch(`${API_BASE}${url}`, { cache: "no-store" });
   if (!r.ok) throw new Error(`download failed: ${r.status} ${await r.text()}`);
   const blob = await r.blob();
   const a = document.createElement("a");
@@ -315,7 +316,8 @@ export default function JobListPage() {
         if (cf) params.set("created_from", cf);
         if (ct) params.set("created_to", ct);
 
-        const r = await fetch(`/jobs?${params.toString()}`);
+        const API_BASE = import.meta.env.VITE_API_BASE || "";
+        const r = await fetch(`${API_BASE}/jobs?${params.toString()}`);
         if (!r.ok) throw new Error(await r.text());
         const d = await r.json();
 
@@ -380,7 +382,9 @@ export default function JobListPage() {
     if (selected.size === 0) return;
     const jobIds = Array.from(selected);
 
-    const r = await fetch("/jobs/export.zip", {
+    const API_BASE = import.meta.env.VITE_API_BASE || "";
+
+    const r = await fetch(`${API_BASE}/jobs/export.zip`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ jobIds, nameMode: "filename", includeJson: false }),
@@ -406,8 +410,9 @@ export default function JobListPage() {
     if (!confirm(`選択した ${selected.size} 件を削除しますか？`)) return;
 
     const jobIds = Array.from(selected);
+    const API_BASE = import.meta.env.VITE_API_BASE || "";
     for (const id of jobIds) {
-      const r = await fetch(`/job/${id}`, { method: "DELETE" });
+      const r = await fetch(`${API_BASE}/job/${id}`, { method: "DELETE" });
       if (!r.ok) {
         const t = await r.text();
         alert(`delete failed: ${id}\n${t}`);
@@ -598,7 +603,12 @@ export default function JobListPage() {
                       const id = it.job_id || it.jobId;
                       const checked = selected.has(id);
 
-                      const previewUrl = it.previewUrl || `/preview/${id}.jpg`;
+                      const API_BASE = import.meta.env.VITE_API_BASE || "";
+
+                      const previewUrl =
+                      it.previewUrl
+                        ? `${API_BASE}${it.previewUrl}`
+                        : `${API_BASE}/preview/${id}.jpg`;
                       const updatedKey =
                         it.updated_at || it.updatedAt || it.preview_updated_at || it.previewUpdatedAt || it.created_at || it.createdAt || "";
                       const previewSrc = `${previewUrl}?v=${encodeURIComponent(updatedKey || Date.now())}`;
@@ -803,7 +813,7 @@ export default function JobListPage() {
         }}
       >
         <img
-          src={preview.src}
+          src={`${API_BASE}${preview.src}`}
           alt=""
           style={{
             maxWidth: "100%",
