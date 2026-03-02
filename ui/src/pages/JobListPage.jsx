@@ -711,7 +711,7 @@ export default function JobListPage() {
 
                                <button style={ui.smallBtn2} onClick={async () => {
                                   const eventIdLike = it.event_id || id || "event";
-                                  const filename = `${eventIdLike}_招聘.json`;
+                                  const filename = `${eventIdLike}_backup.json`;
                                   const url = `/debug/${id}/latest.json?t=${encodeURIComponent(previewBuster)}`;
                                   await downloadWithFilename(url, filename);
                                 }}>
@@ -837,7 +837,7 @@ export default function JobListPage() {
 
                                <button style={ui.smallBtn2} onClick={async () => {
                                   const eventIdLike = preview.eventId || preview.id || "event";
-                                  const filename = `${eventIdLike}_招聘.json`;
+                                  const filename = `${eventIdLike}_backup.json`;
                                   const url = `/debug/${preview.id}/latest.json?t=${encodeURIComponent(previewBuster)}`;
                                   await downloadWithFilename(url, filename);
                                 }}>

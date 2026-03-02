@@ -913,7 +913,7 @@ export default function JobEditorPage() {
 
                                <button style={ui.smallBtn2} onClick={async () => {
                                   const eventIdLike = json.event_id || jobId || "event";
-                                  const filename = `${eventIdLike}_招聘.json`;
+                                  const filename = `${eventIdLike}_backup.json`;
                                   const url = `/debug/${jobId}/latest.json?t=${encodeURIComponent(previewBuster)}`;
                                   await downloadWithFilename(url, filename);
                                 }}>
