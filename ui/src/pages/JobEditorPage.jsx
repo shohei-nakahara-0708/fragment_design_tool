@@ -31,6 +31,16 @@ const ui = {
     minHeight: "100vh",
     background: "#fafafa",
   },
+
+  smallBtn2: {
+    padding: "8px 10px",
+    borderRadius: 12,
+    border: "1px solid rgba(226,232,240,0.95)",
+    background: "#fff",
+    fontSize: 12,
+    fontWeight: 900,
+    cursor: "pointer",
+  },
   leftCol: { display: "grid", gap: 12, alignContent: "start" },
   rightCol: {
     display: "grid",
@@ -431,6 +441,10 @@ const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath }) {
     setTalkField(talkIdx, "title_overrides", nextOv);
   };
 
+
+
+  
+
   return (
     <Card
       title="講演"
@@ -577,6 +591,65 @@ export default function JobEditorPage() {
       }
     }
   };
+
+    async function downloadWithFilename(url, filename) {
+  
+  const r = await fetch(`${API_BASE}${url}`, { cache: "no-store" });
+  if (!r.ok) throw new Error(`download failed: ${r.status} ${await r.text()}`);
+  const blob = await r.blob();
+  const a = document.createElement("a");
+  const objectUrl = URL.createObjectURL(blob);
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(objectUrl);
+  }
+  
+
+  const downloadBlob = (blob, filename) => {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+};
+
+
+  const getFilenameFromDisposition = (disposition) => {
+  // Content-Disposition: attachment; filename="xxx.zip"
+  if (!disposition) return null;
+  const m = /filename\*=UTF-8''([^;]+)|filename="([^"]+)"/i.exec(disposition);
+  const raw = (m && (m[1] || m[2])) ? (m[1] || m[2]) : null;
+  if (!raw) return null;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+};
+
+  const exportOneZip = async (jobId, filename) => {
+  const API_BASE = import.meta.env.VITE_API_BASE || "";
+
+  const r = await fetch(`${API_BASE}/export/${encodeURIComponent(jobId)}.zip`);
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    alert(`export failed: ${r.status}\n${t}`);
+    return;
+  }
+
+  const blob = await r.blob();
+  const cd = r.headers.get("Content-Disposition");
+  const suggested = getFilenameFromDisposition(cd);
+  // const filename = suggested || filename || `export_${jobId}.zip`;
+
+  downloadBlob(blob, filename);
+};
 
   useEffect(() => {
     if (!json || !autoRender) return;
@@ -817,29 +890,45 @@ export default function JobEditorPage() {
 
       {/* Right */}
       <div style={ui.rightCol}>
+
+        
+        
         <Card
           title="Preview"
           right={
-            <div style={{ display: "flex", gap: 8 }}>
-              <a
-                href={`${API_BASE}/download/${jobId}.jpg?t=${previewBuster}`}
-               style={{
-                                  padding: "10px 14px",
-                                  borderRadius: 12,
-                                  border: "none",
-                                  background: "#2563eb",
-                 color: "#fff",
-                                  fontSize: 12,
-                                  fontWeight: 800,
-                                  cursor: "pointer",
-                 boxShadow: "0 10px 24px rgba(37,99,235,0.25)",
-                  textDecoration: "none",
-                                }}
-              >
-                ⬇ Download
-              </a>
-              <span style={ui.badge(busy ? "blue" : "green")}>{busy ? "Rendering…" : "Ready"}</span>
-            </div>
+             <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
+
+                       <div style={{ fontSize: 14, color: "#64748b",width: "100%", paddingTop: 8 }}>
+                                Download
+          </div>
+
+                              <button style={ui.smallBtn2} onClick={async () => {
+                                  const eventIdLike = json.event_id || jobId || "event";
+                                  const filename = `${eventIdLike}_招聘.jpg`;
+                                  const url = `/download/${jobId}.jpg?t=${encodeURIComponent(previewBuster)}`;
+                                  await downloadWithFilename(url, filename);
+                                }}>
+                                JPG
+                              </button> 
+
+                               <button style={ui.smallBtn2} onClick={async () => {
+                                  const eventIdLike = json.event_id || jobId || "event";
+                                  const filename = `${eventIdLike}_招聘.json`;
+                                  const url = `/debug/${jobId}/latest.json?t=${encodeURIComponent(previewBuster)}`;
+                                  await downloadWithFilename(url, filename);
+                                }}>
+                                JSON
+                              </button> 
+
+
+                              <button style={ui.smallBtn2} onClick={async () => {
+                                 const eventIdLike = json.event_id || jobId || "event";
+                                  const filename = `${eventIdLike}_export.zip`;
+                                  await exportOneZip(jobId,filename);
+                                }}>
+                                まとめてダウンロード
+                              </button> 
+        </div>
           }
         >
           <div style={styles.previewFrame}>

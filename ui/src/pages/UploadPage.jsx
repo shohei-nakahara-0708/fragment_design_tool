@@ -211,6 +211,112 @@ const ui = {
   fileTitle: { fontWeight: 900, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
   fileSub: { marginTop: 4, fontSize: 12, color: "#64748b", lineHeight: 1.4 },
   msgErr: { marginTop: 6, fontSize: 12, color: "#991b1b", whiteSpace: "pre-wrap" },
+   tabs: {
+    display: "inline-flex",
+    gap: 6,
+    padding: 6,
+    borderRadius: 14,
+    border: "1px solid rgba(226,232,240,0.95)",
+    background: "rgba(255,255,255,0.85)",
+  },
+  tabBtn: (active) => ({
+    padding: "9px 12px",
+    borderRadius: 12,
+    border: "1px solid " + (active ? "rgba(37,99,235,0.35)" : "transparent"),
+    background: active ? "rgba(37,99,235,0.10)" : "transparent",
+    color: active ? "#1d4ed8" : "#0f172a",
+    fontWeight: 950,
+    fontSize: 13,
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+  }),
+  headerLeft: { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" },
+  headerTitleBlock: { minWidth: 220 },
+
+  divider: { height: 1, background: "rgba(226,232,240,0.85)", margin: "12px 0" },
+
+  btnSmall: {
+    background: "rgba(255,255,255,0.85)",
+    color: "#0f172a",
+    padding: "8px 10px",
+    borderRadius: 12,
+    border: "1px solid rgba(226,232,240,0.95)",
+    fontWeight: 900,
+    fontSize: 12,
+    cursor: "pointer",
+  },
+
+  progressCard: {
+    marginTop: 10,
+    background: "#fff",
+    border: "1px solid rgba(226,232,240,0.95)",
+    borderRadius: 12,
+    padding: 10,
+  },
+
+  tableCard: {
+    background: "rgba(255,255,255,0.9)",
+    border: "1px solid rgba(226,232,240,0.95)",
+    borderRadius: 14,
+    boxShadow: "0 12px 30px rgba(2,6,23,0.06)",
+    overflow: "hidden",
+  },
+
+  restoreHead: {
+  display: "grid",
+  gridTemplateColumns: "44px 1fr 140px 120px 220px",
+  gap: 10,
+  background: "#f8fafc",
+  borderBottom: "1px solid rgba(226,232,240,0.85)",
+  fontSize: 12,
+  color: "#64748b",
+  padding: "10px 12px",
+  fontWeight: 900,
+},
+
+restoreRow: (tone) => ({
+  display: "grid",
+  gridTemplateColumns: "44px 1fr 140px 120px 220px",
+  gap: 10,
+  alignItems: "center",
+  padding: "12px 12px",
+  borderTop: "1px solid rgba(226,232,240,0.75)",
+  background:
+    tone === "error"
+      ? "rgba(239,68,68,0.04)"
+      : tone === "ok"
+      ? "rgba(34,197,94,0.04)"
+      : "#fff",
+  transition: "background .15s ease",
+  }),
+
+  codeChip: {
+  display: "inline-block",
+  padding: "3px 8px",
+  borderRadius: 999,
+  border: "1px solid rgba(226,232,240,0.95)",
+  background: "rgba(248,250,252,0.9)",
+  fontSize: 12,
+  fontWeight: 900,
+  color: "#0f172a",
+  },
+  
+  dropRestore: (dragOver) => ({
+  border: "2px dashed " + (dragOver ? "rgba(37,99,235,0.7)" : "rgba(148,163,184,0.55)"),
+  borderRadius: 16,
+  padding: 18,
+  background: dragOver ? "rgba(37,99,235,0.06)" : "rgba(248,250,252,0.75)",
+  transition: "all .15s ease",
+  }),
+  
+  progressCard: {
+  marginTop: 10,
+  background: "#fff",
+  border: "1px solid rgba(226,232,240,0.95)",
+  borderRadius: 12,
+  padding: 12,
+  boxShadow: "0 6px 16px rgba(2,6,23,0.04)",
+},
 };
 
 export default function UploadPage() {
@@ -226,7 +332,14 @@ export default function UploadPage() {
 
   const inputRef = useRef(null);
 
-  
+const [tab, setTab] = useState("upload"); // "upload" | "restore"
+const [restoring, setRestoring] = useState(false);
+const [restoreError, setRestoreError] = useState("");
+const restoreInputRef = useRef(null);
+
+const [restoreFiles, setRestoreFiles] = useState([]); // File[]
+  const [restoreRows, setRestoreRows] = useState([]);   // 結果の配列
+  const [restoreDragOver, setRestoreDragOver] = useState(false);
 
   useEffect(() => {
     const handler = (e) => {
@@ -261,6 +374,26 @@ export default function UploadPage() {
     setRows((prev) => [...prev, ...next]);
     if (inputRef.current) inputRef.current.value = "";
   };
+
+  const addRestoreFiles = (fileList) => {
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+
+  const jsons = files.filter((f) => /\.json$/i.test(f.name));
+  if (jsons.length !== files.length) {
+    setRestoreError("※ .json 以外は無視しました");
+  } else {
+    setRestoreError("");
+  }
+
+  setRestoreFiles((prev) => {
+    const mp = new Map(prev.map((f) => [f.name + ":" + f.size, f]));
+    for (const f of jsons) mp.set(f.name + ":" + f.size, f); // 同名同サイズは重複排除
+    return Array.from(mp.values());
+  });
+
+  if (restoreInputRef.current) restoreInputRef.current.value = "";
+};
 
   const removeRow = (id) => {
     if (uploading) return;
@@ -298,7 +431,10 @@ export default function UploadPage() {
     setGlobalError(validate.msg);
     return;
   }
-  if (uploading) return;
+   if (uploading) return;
+   
+
+
 
   setUploading(true);
   setProgressText("準備中…");
@@ -398,7 +534,56 @@ export default function UploadPage() {
  };
   
   
+const restoreBatchFromJson = async () => {
+  setRestoreError("");
+  setRestoreRows([]);
+  if (!restoreFiles.length) return;
+  if (uploading || restoring) return;
 
+  let returnedSessionId = null;
+
+  setRestoring(true);
+  try {
+    const API_BASE = import.meta.env.VITE_API_BASE || "";
+    const fd = new FormData();
+    restoreFiles.forEach((f) => fd.append("files", f, f.name));
+
+    const r = await fetch(`${API_BASE}/jobs/restore/batch`, { method: "POST", body: fd });
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      throw new Error(`restore failed: ${r.status}\n${t}`);
+    }
+    const data = await r.json();
+    setRestoreRows(data.results || []);
+
+    returnedSessionId = data.sessionId ?? returnedSessionId;
+    setTimeout(() => {
+            nav(`/jobs?session=${encodeURIComponent(returnedSessionId || "")}`);
+    }, 250);
+    
+  } catch (e) {
+    setRestoreError(String(e?.message || e));
+  } finally {
+    setRestoring(false);
+  }
+};
+  
+  const restoreItems = useMemo(() => {
+  // filename -> result
+  const mp = new Map((restoreRows || []).map((r) => [String(r.filename || ""), r]));
+  return (restoreFiles || []).map((f) => {
+    const r = mp.get(String(f.name)) || null;
+    const status = r ? (r.ok ? "ok" : "error") : (restoring ? "pending" : "pending");
+    return {
+      key: f.name + ":" + f.size,
+      file: f,
+      filename: f.name,
+      size: f.size,
+      status,
+      result: r, // {ok, jobId, eventId, previewUrl, error, ...} or null
+    };
+  });
+}, [restoreFiles, restoreRows, restoring]);
 
 
 const progress = useMemo(() => {
@@ -413,25 +598,88 @@ const progress = useMemo(() => {
     <div style={ui.page}>
       <div style={ui.container}>
         {/* Header */}
-        <div style={ui.header}>
-          <div>
-            <h1 style={ui.h1}>Upload</h1>
-            <div style={ui.sub}>
-              複数PPTX / PDFをまとめてアップロード → event_id を付与 → 生成
-            </div>
-          </div>
+    <div style={ui.header}>
+  {/* Left */}
+  <div style={ui.headerLeft}>
+            <div style={ui.headerTitleBlock}>
+              <div style={{marginBottom:5}}>
+                              <Link to="/" style={{ textDecoration: "none" }}>
+                                ← 一覧へ
+                              </Link>
+                            </div>
+      <h1 style={ui.h1}>Upload</h1>
+      <div style={ui.sub}>
+        {tab === "upload"
+          ? "複数PPTX / PDFをまとめてアップロード → event_id を付与 → 生成"
+          : "backup用json（複数可）をアップロード → 復元して再生成"}
+      </div>
+    </div>
+
+  
+  </div>
+
+  {/* Right */}
           <div style={ui.headerRight}>
-            <Link to="/jobs" style={{ textDecoration: "none" }}>
-              <button style={ui.btnGhost}>一覧へ</button>
-            </Link>
-            <button style={ui.btnDanger} onClick={clearAll} disabled={!hasFiles || uploading}>
-              全削除
-            </button>
-            <button style={ui.btnPrimary} onClick={uploadBatch} disabled={!hasFiles || uploading || !validate.ok}>
-              生成する
-            </button>
-          </div>
-        </div>
+            
+            
+
+            
+              <div style={ui.tabs}>
+      <button
+        style={ui.tabBtn(tab === "upload")}
+        onClick={() => setTab("upload")}
+        disabled={uploading || restoring}
+      >
+        アップロード
+      </button>
+      <button
+        style={ui.tabBtn(tab === "restore")}
+        onClick={() => setTab("restore")}
+        disabled={uploading || restoring}
+      >
+        JSONから復元
+      </button>
+    </div>
+
+    {tab === "upload" ? (
+      <>
+        <button style={ui.btnDanger} onClick={clearAll} disabled={!hasFiles || uploading}>
+          全削除
+        </button>
+        <button style={ui.btnPrimary} onClick={uploadBatch} disabled={!hasFiles || uploading || !validate.ok}>
+          {uploading ? "アップロード中…" : "アップロードして生成"}
+        </button>
+      </>
+    ) : (
+      <>
+        <button
+          style={ui.btnDanger}
+          onClick={() => {
+            if (restoring || uploading) return;
+            setRestoreFiles([]);
+            setRestoreRows([]);
+            setRestoreError("");
+            if (restoreInputRef.current) restoreInputRef.current.value = "";
+          }}
+          disabled={restoring || uploading}
+        >
+          全削除
+        </button>
+        <button
+          style={ui.btnPrimary}
+          onClick={restoreBatchFromJson}
+          disabled={!restoreFiles.length || restoring || uploading}
+        >
+          {restoring ? "復元中…" : "復元して再生成"}
+        </button>
+      </>
+    )}
+  </div>
+</div>
+
+         {tab === "upload" && (
+          <>
+       
 
         {/* Dropzone card */}
         <div style={ui.card}>
@@ -456,7 +704,7 @@ const progress = useMemo(() => {
                     multiple
                     accept=".pptx,.pdf"
                     disabled={uploading}
-                    style={{opacity:0}}
+                    style={{display: "none"}}
                     onChange={(e) => addFiles(e.target.files)}
                   />
                   <button style={ui.btnGhost} onClick={() => inputRef.current?.click?.()} disabled={uploading}>
@@ -471,13 +719,13 @@ const progress = useMemo(() => {
             </div>
 
 {uploading && (
-  <div style={{ marginTop: 10, background:"#fff", border:"1px solid #eee", borderRadius:12, padding:10 }}>
-    <div style={{ display:"flex", justifyContent:"space-between", fontSize:12, color:"#555" }}>
+  <div style={ui.progressCard}>
+    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#475569", fontWeight: 900 }}>
       <span>⏳ {progressText || "処理中…"}</span>
       <span>{progress}%</span>
     </div>
-    <div style={{ marginTop:8, height:10, background:"#eee", borderRadius:999, overflow:"hidden" }}>
-      <div style={{ width:`${progress}%`, height:"100%", background:"#2563eb", transition:"width 200ms ease" }} />
+    <div style={{ marginTop: 8, height: 10, background: "rgba(226,232,240,0.9)", borderRadius: 999, overflow: "hidden" }}>
+      <div style={{ width: `${progress}%`, height: "100%", background: "#2563eb", transition: "width 200ms ease" }} />
     </div>
   </div>
 )}
@@ -592,7 +840,174 @@ const progress = useMemo(() => {
           ・event_id は必須（未入力があると生成できません）<br />
           ・同名ファイルが複数あってもOK（ここでは重複排除していません）
         </div>
+        </>
+        )}
+        
+        {tab === "restore" && (
+  <div style={{ marginTop: 12 }}>
+   <div style={ui.card}>
+  <div style={ui.cardInner}>
+    <div
+      onDragOver={(e) => {
+        e.preventDefault();
+        setRestoreDragOver(true);
+      }}
+      onDragLeave={() => setRestoreDragOver(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setRestoreDragOver(false);
+        addRestoreFiles(e.dataTransfer.files);
+      }}
+      style={ui.drop(restoreDragOver)}
+    >
+      <div style={ui.row}>
+        <div style={{ fontWeight: 950 }}>
+          ここに <span style={{ color: "#2563eb" }}>.json</span> をドロップ
+        </div>
+
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <input
+            ref={restoreInputRef}
+            type="file"
+            multiple
+            accept="application/json,.json"
+            disabled={restoring || uploading}
+            style={{ display: "none" }}
+            onChange={(e) => addRestoreFiles(e.target.files)}
+          />
+          <button
+            style={ui.btnGhost}
+            onClick={() => restoreInputRef.current?.click?.()}
+            disabled={restoring || uploading}
+          >
+            JSON選択
+          </button>
+
+          
+
+
+        </div>
+      </div>
+
+      <div style={ui.hint}>
+        選択中: <b>{restoreFiles.length}</b> 件
+        {restoreFiles.length ? (
+          <>
+            {" "}
+            ・例: <code>{restoreFiles[0].name}</code>
+          </>
+        ) : null}
       </div>
     </div>
+
+                {!!restoreError && <div style={ui.alertErr}>{restoreError}</div>}
+                
+  {restoreFiles.length > 0 && (
+  <div style={{ ...ui.card, marginTop: 12 }}>
+    <div style={ui.restoreHead}>
+      <div>#</div>
+      <div>JSON</div>
+      <div>eventId</div>
+      <div>状態</div>
+      <div style={{ textAlign: "right" }}>操作</div>
+    </div>
+
+    {restoreItems.map((it, idx) => {
+      const r = it.result;
+      return (
+        <div key={it.key} style={ui.restoreRow(it.status === "pending" ? "pending" : it.status)}>
+          <div style={{ color: "#64748b", fontWeight: 900 }}>{idx + 1}</div>
+
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontWeight: 900, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {it.filename}
+            </div>
+
+            <div style={ui.mini}>
+              {fmtSize(it.size)}
+              {r?.jobId ? (
+                <>
+                  {" "}
+                  ・ jobId: <span style={ui.codeChip}>{String(r.jobId).slice(0, 8)}…</span>
+                </>
+              ) : null}
+            </div>
+
+            {r?.error ? (
+              <div style={{ marginTop: 6, fontSize: 12, color: "#991b1b", whiteSpace: "pre-wrap" }}>
+                {String(r.error)}
+              </div>
+            ) : null}
+          </div>
+
+          <div style={ui.mini}>
+            {r?.eventId ? <span style={ui.codeChip}>{String(r.eventId)}</span> : "-"}
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <StatusPill status={it.status} />
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
+            {/* pendingでも消せる */}
+            <button
+              style={ui.btnSmall}
+              disabled={restoring || uploading}
+              onClick={() => {
+                if (restoring || uploading) return;
+                setRestoreFiles((prev) => prev.filter((x) => !(x.name === it.file.name && x.size === it.file.size)));
+                // 行を消したら結果も掃除（任意）
+                setRestoreRows((prev) => (prev || []).filter((x) => String(x.filename || "") !== it.file.name));
+              }}
+            >
+              削除
+            </button>
+
+            {r?.ok && r?.previewUrl ? (
+              <a
+                href={`${(import.meta.env.VITE_API_BASE || "")}${r.previewUrl}?v=${Date.now()}`}
+                target="_blank"
+                rel="noreferrer"
+                style={{ textDecoration: "none" }}
+              >
+                <button style={ui.btnSmall}>preview</button>
+              </a>
+            ) : null}
+
+            {r?.ok && r?.jobId ? (
+              <button style={ui.btnSmall} onClick={() => nav(`/edit/${encodeURIComponent(r.jobId)}`)}>
+                編集
+              </button>
+            ) : null}
+
+            {r?.ok && r?.jobId ? (
+              <a
+                href={`${(import.meta.env.VITE_API_BASE || "")}/debug/${encodeURIComponent(r.jobId)}/latest.json`}
+                target="_blank"
+                rel="noreferrer"
+                style={{ textDecoration: "none" }}
+              >
+                <button style={ui.btnSmall}>json</button>
+              </a>
+            ) : null}
+          </div>
+        </div>
+      );
+    })}
+  </div>
+)}
+
+      
+      </div>
+    </div>
+  </div>
+)}
+        
+      </div>
+
+    </div>
+
+
+    
   );
 }
