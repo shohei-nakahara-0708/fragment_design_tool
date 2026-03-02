@@ -12,7 +12,7 @@ from typing import List, Optional, Dict, Any, Literal, Tuple
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body,Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body,Form, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse,StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -2509,85 +2509,114 @@ def looks_like_format_value(s: str) -> bool:
     )
 
 def extract_event_title_lines_from_blocks(blocks: List[TextBlock]) -> List[str]:
-    """
-    タイトルは「上部」「大きめフォント」「日時っぽくない」を優先。
-    複数行（サブタイトル含む）は上から連続ブロックとして拾う。
-    """
     if not blocks:
         return []
 
-    # 上半分を優先（テンプレ安定）
     tops = [b.top for b in blocks]
     min_top, max_top = min(tops), max(tops)
-    mid_top = min_top + (max_top - min_top) * 0.55
+    mid_top = min_top + (max_top - min_top) * 0.35  # 上1/3
+
+    def kw_norm(s: str) -> str:
+        return re.sub(r"\s+", "", s)
+
+    def is_title_excluded(s: str) -> bool:
+        k = kw_norm(s)
+        return any(x in k for x in ["主催", "共催", "座長", "演者", "演題", "会場", "形式", "PROGRAM"])
+
+    def contains_japanese(s: str) -> bool:
+        return bool(re.search(r"[ぁ-んァ-ン一-龯]", s))
+
+    def english_ratio(s: str) -> float:
+        if not s:
+            return 0.0
+        latin = sum(1 for ch in s if ("A" <= ch <= "Z") or ("a" <= ch <= "z"))
+        return latin / max(1, len(s))
+
+    def trim_mixed_english_title(s: str) -> str:
+        """
+        例: "Seminar さてこの度…" → "Seminar" に切る
+        """
+        # 最初の日本語文字が出た位置でカット
+        m = re.search(r"[ぁ-んァ-ン一-龯]", s)
+        if m:
+            s = s[: m.start()].rstrip()
+        return s.strip()
 
     cand = []
     for b in blocks:
         s = normalize_space(b.text)
         if not s:
             continue
-        if looks_like_body_text_for_title(s):
+        if looks_like_datetime_text(s) or looks_like_format_value(s) or looks_like_body_text_for_title(s):
             continue
-        if looks_like_datetime_text(s):
+        if is_title_excluded(s):
             continue
-        if looks_like_format_value(s):
-            continue
-        # フッター/ラベル除外
-        if any(x in s for x in ["主催", "共催", "座長", "演者", "会場", "形式"]):
-            continue
-        # 上の方 & それなりに大きい
         if b.top <= mid_top and (b.max_font_pt or 0) >= 18:
             cand.append(b)
 
     if not cand:
-        # fallback：日時除外だけして最大フォント
         cand2 = [b for b in blocks if b.text and not looks_like_datetime_text(b.text)]
         if not cand2:
             return []
         b0 = max(cand2, key=lambda x: x.max_font_pt or 0)
         return [normalize_space(b0.text)]
 
-    # まず “タイトル本体” を決める（大きさ優先、同点なら上）
+    # head（タイトル本体）
     head = sorted(cand, key=lambda b: ((b.max_font_pt or 0), -b.top), reverse=True)[0]
+    head_text = normalize_space(head.text)
 
-    # タイトルは head と “近い縦位置の連続” を拾う（サブタイトルを残す）
-    # 同じカラム（左寄り）にあるものを拾う
-    lines = []
-    # head の周辺範囲
-    x0 = head.left - 500000
-    x1 = head.left + head.width + 500000
-    y0 = head.top - 200000
-    y1 = head.top + 2500000  # 下に2〜3行分
+    # head が英語っぽいなら “混ざり” を切る
+    head_is_english = english_ratio(head_text) >= 0.45 and not contains_japanese(head_text)
+    if head_is_english:
+        head_text = trim_mixed_english_title(head_text)
+
+    # ✅ near 範囲を狭める（タイトルはせいぜい2行分）
+    x0 = head.left - 400000
+    x1 = head.left + head.width + 400000
+    y0 = head.top - 150000
+    y1 = head.top + 900000  # ← 2行程度に絞る（広げすぎない）
 
     near = [b for b in blocks if in_region(b, x0, y0, x1, y1)]
     near = sorted(near, key=lambda b: (b.top, b.left))
 
+    lines: List[str] = []
     for b in near:
         s = normalize_space(b.text)
         if not s:
             continue
-        if looks_like_body_text_for_title(s):
+        if looks_like_datetime_text(s) or looks_like_format_value(s) or looks_like_body_text_for_title(s):
             continue
-        if looks_like_datetime_text(s):
+        if is_title_excluded(s):
             continue
-  
-        if looks_like_format_value(s):
+
+        # ✅ 本文（小さいフォント）を落とす：head との差でフィルタ
+        if (b.max_font_pt or 0) < max(14, (head.max_font_pt or 0) - 4):
             continue
-        if any(x in s for x in ["主催", "共催", "座長", "演者", "会場", "形式"]):
-            continue
-        # ここは subtitle "~...~" を消さない（要望対応）
+
+        # ✅ 英語タイトルモードなら、日本語混在をカットして本文側は捨てる
+        if head_is_english:
+            s2 = trim_mixed_english_title(s)
+            if not s2:
+                continue
+            s = s2
+
         lines.append(s)
+        # ✅ タイトルは最大2行まで（Web Seminar系の暴走防止）
+        if len(lines) >= 2:
+            break
+
+    # head が拾えてない時の保険
+    if not lines:
+        lines = [head_text] if head_text else [normalize_space(head.text)]
 
     # 重複除去（順序維持）
-    out = []
-    seen = set()
+    out, seen = [], set()
     for s in lines:
         if s not in seen:
             out.append(s)
             seen.add(s)
 
-    # それでも空なら head のみ
-    return out or [normalize_space(head.text)]
+    return out
 
 
 
@@ -5221,6 +5250,61 @@ def _parse_date_end(s: str) -> Optional[datetime]:
     dt = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     return dt.replace(hour=23, minute=59, second=59, microsecond=999999)
 
+@app.post("/jobs/restore/batch")
+async def restore_from_json_batch(files: list[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(400, "files is empty")
+
+    session_id = new_session_id()
+
+    results = []
+    for f in files:
+        job_id = uuid.uuid4().hex
+        p = job_paths(job_id)
+        try:
+            raw = await f.read()
+            text = raw.decode("utf-8")
+            data = json.loads(text)
+
+            payload = DesignJSON.model_validate(data)
+
+            # 保存
+            p["json"].write_text(dump_json(payload), encoding="utf-8")
+
+            # 復元→再レンダ（あなたのモデル名に合わせて）
+            # payload = Payload.model_validate(data)
+            # payload = normalize_for_render(payload)
+            # payload = post_format_design_initial(payload)
+            # payload = await apply_precise_typeset_initial(payload)
+            # payload = ensure_display_fields(payload)
+
+            
+
+            await render_png(payload, p["jpg"], p["debug_html"])
+
+            event_id = getattr(payload, "event_id", "") or ""
+            upsert_job_ok(job_id, f.filename or "restore.json", payload, session_id, event_id)
+
+            results.append({
+                "ok": True,
+                "filename": f.filename,
+                "jobId": job_id,
+                "eventId": getattr(payload, "event_id", None),
+                "previewUrl": f"/preview/{job_id}.jpg",
+            })
+        except Exception as e:
+            print("[restore/batch error]", f.filename, job_id)
+            print(traceback.format_exc())
+            results.append({
+                "ok": False,
+                "filename": f.filename,
+                "jobId": job_id,
+                "error": str(e),
+            })
+
+    ok_count = sum(1 for r in results if r.get("ok"))
+    return JSONResponse({"ok": True, "count": ok_count, "results": results,"sessionId": session_id})
+    
 @app.get("/jobs")
 async def list_jobs(
     q: str = "",
@@ -5349,6 +5433,65 @@ async def preview(job_id: str):
         raise HTTPException(status_code=404, detail="preview not found")
     return FileResponse(p["jpg"], media_type="image/jpg")
 
+def _resolve_event_id(job_id: str, p: dict) -> str:
+    event_id = job_id
+
+    # 1) jsonから
+    if p["json"].exists():
+        try:
+            data = json.loads(p["json"].read_text(encoding="utf-8"))
+            event_id = (data.get("event_id") or data.get("eventId") or job_id).strip()
+        except Exception:
+            pass
+    else:
+        # 2) DBから（フォールバック）
+        try:
+            with db_connect() as con:
+                row = con.execute("SELECT event_id FROM jobs WHERE job_id=%s", (job_id,)).fetchone()
+            if row and (row.get("event_id") or "").strip():
+                event_id = row["event_id"].strip()
+        except Exception:
+            pass
+
+    return event_id or job_id
+
+
+@app.get("/export/{job_id}.zip")
+async def export_zip(job_id: str):
+    p = job_paths(job_id)
+
+    jpg_path: Path = p["jpg"]
+    json_path: Path = p["json"]
+
+    if not jpg_path.exists():
+        raise HTTPException(404, "preview not found")
+    if not json_path.exists():
+        raise HTTPException(404, "latest.json not found")
+
+    event_id = _resolve_event_id(job_id, p)
+
+    # zip の中のファイル名
+    jpg_name = f"{event_id}_招聘.jpg"
+    json_name = f"{event_id}_backup.json"
+
+    # 一時zipを作って返す（OS temp）
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp_path = Path(tmp.name)
+    tmp.close()
+
+    try:
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.write(jpg_path, arcname=jpg_name)
+            z.write(json_path, arcname=json_name)
+
+        zip_filename = f"{event_id}_export.zip"
+        return FileResponse(tmp_path, media_type="application/zip", filename=zip_filename)
+
+    finally:
+        # FileResponse は送信後に読むので、ここで消すと壊れる。
+        # ✅ なので即削除はしない。代わりに「後で掃除」する方が安全。
+        # ひとまず残してOK（/var/data や /tmp を定期清掃）
+        pass
 
 @app.get("/download/{job_id}.jpg")
 async def download(job_id: str):
@@ -5376,7 +5519,12 @@ async def download(job_id: str):
     filename = f"{event_id}_招聘.jpg"
     return FileResponse(file_path, media_type="image/jpeg", filename=filename)
 
-
+@app.get("/debug/{job_id}/latest.json")
+async def debug_latest(job_id: str):
+    p = job_paths(job_id)
+    if not p["json"].exists():
+        raise HTTPException(status_code=404, detail="debug blocks not found")
+    return FileResponse(p["json"], media_type="application/json")
 
 
 
@@ -5388,10 +5536,37 @@ async def debug_blocks(job_id: str):
     return FileResponse(p["debug_blocks"], media_type="application/json")
 
 
+
+
+
 # ------------------------------------------------------------
 # 選択ジョブのPNGをまとめてZIP（納品用）
 # ------------------------------------------------------------
+def resolve_event_id(job_id: str) -> str:
+    p = job_paths(job_id)
+    event_id = job_id
 
+    # 1) JSON優先
+    if p["json"].exists():
+        try:
+            data = json.loads(p["json"].read_text(encoding="utf-8"))
+            event_id = (data.get("event_id") or data.get("eventId") or job_id).strip()
+        except Exception:
+            pass
+    else:
+        # 2) DBフォールバック
+        try:
+            with db_connect() as con2:
+                row = con2.execute(
+                    "SELECT event_id FROM jobs WHERE job_id=%s",
+                    (job_id,),
+                ).fetchone()
+            if row and (row.get("event_id") or "").strip():
+                event_id = row["event_id"].strip()
+        except Exception:
+            pass
+
+    return sanitize_basename(event_id or job_id)
 
 def sanitize_basename(s: str) -> str:
     s = (s or "").strip()
@@ -5413,40 +5588,85 @@ class ExportReq(BaseModel):
     includeJson: bool = False
 
 @app.post("/jobs/export.zip")
-async def export_zip(req: ExportReq):
+async def export_zip(req: ExportReq, background_tasks: BackgroundTasks):
     if not req.jobIds:
         raise HTTPException(400, "jobIds is empty")
 
-    # job_id -> filename（Postgres版）
+    # job_id -> filename（Postgres）
     with db_connect() as con:
         rows = con.execute(
             "SELECT job_id, filename FROM jobs WHERE job_id = ANY(%s)",
-            (req.jobIds,),  # ←タプルで包むのが重要
+            (req.jobIds,),
         ).fetchall()
-
     mp = {r["job_id"]: (r.get("filename") or "") for r in rows}
+
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
     export_id = f"export_{int(time.time())}_{uuid.uuid4().hex}"
     zip_path = EXPORT_DIR / f"{export_id}.zip"
 
     used = {}
+    added = 0
+
+    def pick_base(job_id: str) -> str:
+        p = job_paths(job_id)
+
+        # 1) jobId / filename は従来通り
+        if req.nameMode == "jobId":
+            base0 = job_id
+        elif req.nameMode == "filename":
+            base0 = (mp.get(job_id) or job_id)
+        elif req.nameMode == "eventId":
+            # 2) eventId 優先（json → DB）
+            event_id = job_id
+            if p["json"].exists():
+                try:
+                    data = json.loads(p["json"].read_text(encoding="utf-8"))
+                    event_id = (data.get("event_id") or data.get("eventId") or job_id).strip()
+                except Exception:
+                    pass
+            else:
+                try:
+                    with db_connect() as con2:
+                        row = con2.execute("SELECT event_id FROM jobs WHERE job_id=%s", (job_id,)).fetchone()
+                    if row and (row.get("event_id") or "").strip():
+                        event_id = row["event_id"].strip()
+                except Exception:
+                    pass
+            base0 = event_id or job_id
+        else:
+            base0 = job_id
+
+        base0 = sanitize_basename(base0)
+
+        # 同名衝突回避
+        used[base0] = used.get(base0, 0) + 1
+        return base0 if used[base0] == 1 else f"{base0} ({used[base0]})"
+
+    used = {}
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for job_id in req.jobIds:
             p = job_paths(job_id)
+
             if not p["jpg"].exists():
                 continue
 
-            base0 = job_id if req.nameMode == "jobId" else (mp.get(job_id) or job_id)
-            base0 = sanitize_basename(base0)
+            base0 = resolve_event_id(job_id)
 
             used[base0] = used.get(base0, 0) + 1
             base = base0 if used[base0] == 1 else f"{base0} ({used[base0]})"
 
             z.write(p["jpg"], arcname=f"{base}_招聘.jpg")
-            if req.includeJson and p["json"].exists():
-                z.write(p["json"], arcname=f"{base}.json")
 
-    return FileResponse(str(zip_path), media_type="application/zip", filename="export.zip")
+            if req.includeJson and p["json"].exists():
+                z.write(p["json"], arcname=f"{base}_backup.json")
+
+    # 送信後にzip削除（溜まり続けない）
+    background_tasks.add_task(lambda: os.remove(zip_path) if zip_path.exists() else None)
+
+    # zipファイル名（DL時）
+    dl_name = "export.zip"
+    return FileResponse(str(zip_path), media_type="application/zip", filename=dl_name)
 
 
 
