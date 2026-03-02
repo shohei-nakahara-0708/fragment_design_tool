@@ -5304,7 +5304,8 @@ async def restore_from_json_batch(files: list[UploadFile] = File(...)):
 
     ok_count = sum(1 for r in results if r.get("ok"))
     return JSONResponse({"ok": True, "count": ok_count, "results": results,"sessionId": session_id})
-    
+
+
 @app.get("/jobs")
 async def list_jobs(
     q: str = "",

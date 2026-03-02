@@ -3,14 +3,11 @@ import { Link, useNavigate } from "react-router-dom";
 const API_BASE = import.meta.env.VITE_API_BASE || "";
 /** ---------- helpers ---------- */
 function toIsoStart(dateStr) {
-  if (!dateStr) return "";
-  return new Date(`${dateStr}T00:00:00`).toISOString();
+  return dateStr || "";
 }
+
 function toIsoEnd(dateStr) {
-  if (!dateStr) return "";
-  const d = new Date(`${dateStr}T00:00:00`);
-  d.setHours(23, 59, 59, 999);
-  return d.toISOString();
+  return dateStr || "";
 }
 function dateformated(s) {
   if (!s) return "";
