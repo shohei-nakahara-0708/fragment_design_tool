@@ -518,9 +518,9 @@ const [restoreFiles, setRestoreFiles] = useState([]); // File[]
           returnedSessionId = ev.data.sessionId ?? returnedSessionId;
           setProgressText("完了");
           // 少し待って一覧へ
-          setTimeout(() => {
-            nav(`/jobs?session=${encodeURIComponent(returnedSessionId || "")}`);
-          }, 250);
+          // setTimeout(() => {
+          //   nav(`/jobs?session=${encodeURIComponent(returnedSessionId || "")}`);
+          // }, 250);
         }
       }
     }
@@ -557,9 +557,9 @@ const restoreBatchFromJson = async () => {
     setRestoreRows(data.results || []);
 
     returnedSessionId = data.sessionId ?? returnedSessionId;
-    setTimeout(() => {
-            nav(`/jobs?session=${encodeURIComponent(returnedSessionId || "")}`);
-    }, 250);
+    // setTimeout(() => {
+    //         nav(`/jobs?session=${encodeURIComponent(returnedSessionId || "")}`);
+    // }, 250);
     
   } catch (e) {
     setRestoreError(String(e?.message || e));
@@ -948,7 +948,7 @@ const progress = useMemo(() => {
             <StatusPill status={it.status} />
           </div>
 
-          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
+          <div style={{ display: "none", justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
             {/* pendingでも消せる */}
             <button
               style={ui.btnSmall}

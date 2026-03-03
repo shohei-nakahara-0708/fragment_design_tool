@@ -142,7 +142,7 @@ TYPESET_JS = r"""
   // ---- break candidates ----
   const breakPositions = (s) => {
     const out = [];
-    const breakers = new Set([" ", "、", "。",  ",", "，", ":", "：", "-", "－", "—", "–", "−"]);
+    const breakers = new Set([" ", "、", "。",  ",", "，", ":", "：",  "－", "—", "–", "−"]);
     for (let i = 0; i < s.length; i++) {
       const ch = s[i];
       if (breakers.has(ch)) out.push(i + 1);
@@ -305,7 +305,7 @@ if (m && m.index > 0) {
 
   // ---- event title ----
   const evBase = norm((data.event_title_lines?.length ? data.event_title_lines.join(" ") : data.event_title) ?? "");
-  const evLines = wrapPx(evBase, wrapW, heroStyle, 5, false); // ★subtitle強制ON
+  const evLines = wrapPx(evBase, wrapW, heroStyle, 5, true); // ★subtitle強制ON
   if (evLines.length) {
     data.event_title_lines = evLines;
     data.event_title = evLines.join("\n");
@@ -2622,22 +2622,61 @@ def extract_event_title_lines_from_blocks(blocks: List[TextBlock]) -> List[str]:
 
 
 
-def extract_datetime_from_blocks(blocks: List[TextBlock]) -> str:
-    lines = blocks_to_lines(blocks)
-    dt_pat = re.compile(
-        r"(20\d{2}年\s*\d{1,2}月\s*\d{1,2}日.*?\d{1,2}:\d{2}\s*[～〜\-ー~]\s*\d{1,2}:\d{2})"
-    )
-    for l in lines:
-        m = dt_pat.search(l)
-        if m:
-            return normalize_space(m.group(1))
+DATE_RE = re.compile(r"(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日(?:\s*（?([月火水木金土日])）?)?")
+TIME_RE2 = re.compile(r"(\d{1,2}[:：]\d{2})\s*[～〜\-ー~]\s*(\d{1,2}[:：]\d{2})")
 
+def _norm_time2(s: str) -> str:
+    s = (s or "").strip()
+    s = s.replace("：", ":")
+    s = s.replace("〜", "～").replace("~", "～").replace("-", "～").replace("ー", "～")
+    return s
+
+def extract_datetime_from_blocks(blocks: List[TextBlock]) -> str:
+    # 1) まず全テキスト（行）を作る
+    lines = [normalize_space(x) for x in blocks_to_lines(blocks)]
+    lines = [x for x in lines if x]
+
+    # 2) 日付を探す（どこか1行にあることが多い）
+    y = m = d = None
+    dow = ""
+    date_line = ""
     for l in lines:
-        if "日時" in l:
-            s = normalize_space(l)
-            s = re.sub(r"^.*日時\s*[:：]?\s*", "", s)
-            return s
-    return ""
+        mm = DATE_RE.search(l)
+        if mm:
+            y, m, d = mm.group(1), mm.group(2), mm.group(3)
+            dow = (mm.group(4) or "").strip()
+            date_line = l
+            break
+
+    # 3) 時間を探す（別行のことが多いので全行から探す）
+    t0 = t1 = ""
+    for l in lines:
+        if "日時" in l and TIME_RE2.search(_norm_time2(l)) is None:
+            # 「日時：2026年5月...」みたいに日付専用行もあるのでスルー
+            pass
+        mm = TIME_RE2.search(_norm_time2(l))
+        if mm:
+            t0, t1 = _norm_time2(mm.group(1)), _norm_time2(mm.group(2))
+            break
+
+    # 4) 「日時:」行のフォールバック（文字列をそのまま返す用途）
+    if not (y and m and d) and any("日時" in l for l in lines):
+        for l in lines:
+            if "日時" in l:
+                s = normalize_space(l)
+                s = re.sub(r"^.*日時\s*[:：]?\s*", "", s).strip()
+                return s
+
+    if not (y and m and d):
+        return ""
+
+    # 5) 表示文字列を組み立て（時間が無いなら日付だけ）
+    date_str = f"{int(y)}年{int(m)}月{int(d)}日"
+    if dow:
+        date_str += f"（{dow}）"
+    if t0 and t1:
+        return f"{date_str} {t0}～{t1}"
+    return date_str
 
 
 def extract_organizer_from_blocks(blocks: List[TextBlock]) -> str:
@@ -2662,57 +2701,7 @@ def extract_organizer_from_blocks(blocks: List[TextBlock]) -> str:
 
 
 
-def extract_datetime_from_blocks(blocks: List[TextBlock]) -> str:
-    if not blocks:
-        return ""
 
-    # 1) 「日時/日 時」ラベルを探す（分割にも強い）
-    label_blocks = []
-    for b in blocks:
-        k = normalize_key(b.text)
-        if "日時" in k or (("日" in k) and ("時" in k) and len(k) <= 6):
-            label_blocks.append(b)
-
-    # ラベルが見つかったら、その右・下の近傍を最優先で探す
-    if label_blocks:
-        anchor = sorted(label_blocks, key=lambda x: x.top, reverse=False)[0]
-        x0 = anchor.left - 200000
-        x1 = anchor.left + 6500000
-        y0 = anchor.top - 250000
-        y1 = anchor.top + 2000000
-
-        near = [b for b in blocks if in_region(b, x0, y0, x1, y1)]
-        near = sorted(near, key=lambda b: (b.top, b.left))
-
-        for b in near:
-            s = normalize_datetime_text(b.text)
-            if not s:
-                continue
-            m = DT_RE.search(s)
-            if m:
-                return normalize_datetime_text(m.group(1))
-            # “時間帯だけ”の行があるなら拾う（後で日付と組む余地）
-            if DATE_ONLY_RE.search(s) and TIME_RANGE_RE.search(s):
-                return normalize_datetime_text(s)
-
-    # 2) 全ブロックから正規表現で拾う（fallback）
-    for b in sorted(blocks, key=lambda x: (x.top, x.left)):
-        s = normalize_datetime_text(b.text)
-        if not s:
-            continue
-        m = DT_RE.search(s)
-        if m:
-            return normalize_datetime_text(m.group(1))
-
-    # 3) 「日時：」形式 fallback
-    for b in sorted(blocks, key=lambda x: (x.top, x.left)):
-        s = normalize_datetime_text(b.text)
-        if "日時" in s:
-            s2 = re.sub(r"^.*日時\s*[:：]?\s*", "", s).strip()
-            if s2:
-                return s2
-
-    return ""
 
 def extract_time_candidates_from_blocks(blocks: List[TextBlock]) -> List[str]:
     out: List[str] = []
@@ -3838,7 +3827,10 @@ def build_ai_prompt(
 # 重要ルール（厳守）
 - 出力は JSONのみ（前後に文章を付けない）
 - 誤推測禁止：抽出データに根拠がない値は空文字
-- datetime は日時のみ（形式/配信方法は入れない）
+- datetime は「開催日」＋「全体の開催時間(開始～終了)」を1つの文字列で返す
+  - 例: "2026年5月21日（木） 18:00～19:10"
+  - 時間が抽出できない場合のみ、日付だけでも可（例: "2026年5月21日（木）"）
+  - 形式/配信方法/会場などは絶対に混ぜない
 - organizer は主催の会社名（抽出データにある場合のみ）
 - chair は座長
 - talks は1〜4件、順序はスライドの登場順（top/left順）
@@ -3939,6 +3931,68 @@ async def ai_refine_json(
 
     refined = postprocess_refined(refined, speaker_map, time_candidates)
 
+    DATE_PAT = re.compile(r"(20\d{2}年\s*\d{1,2}月\s*\d{1,2}日(?:\s*（[^）]+）)?)")
+    TIME_RANGE_PAT2 = re.compile(r"(\d{1,2}:\d{2}\s*[～〜\-ー~]\s*\d{1,2}:\d{2})")
+
+    def extract_datetime_from_blocks_v2(blocks: List[TextBlock]) -> str:
+        lines = [normalize_space(x) for x in blocks_to_lines(blocks) if normalize_space(x)]
+
+        # 1) 同一行で “日付 + 時間帯” が揃ってるパターン（最強）
+        for l in lines:
+            m_date = DATE_PAT.search(l)
+            m_time = TIME_RANGE_PAT2.search(normalize_time_colon(l))
+            if m_date and m_time:
+                return normalize_space(f"{m_date.group(1)} {m_time.group(1)}")
+
+        # 2) “日時:” ラベル行
+        for l in lines:
+            if "日時" in l:
+                s = re.sub(r"^.*日時\s*[:：]?\s*", "", normalize_space(l))
+                # ラベル行自体に時間が無くても、近傍の時間行を結合
+                m_date = DATE_PAT.search(s)
+                m_time = TIME_RANGE_PAT2.search(normalize_time_colon(s))
+                if m_date and m_time:
+                    return normalize_space(f"{m_date.group(1)} {m_time.group(1)}")
+                if m_date:
+                    # 近傍探索
+                    near_time = ""
+                    for l2 in lines:
+                        mt = TIME_RANGE_PAT2.search(normalize_time_colon(l2))
+                        if mt:
+                            near_time = mt.group(1)
+                            break
+                    return normalize_space(f"{m_date.group(1)} {near_time}".strip())
+
+                return normalize_space(s)
+
+        # 3) 日付行 + どこかの時間行（よくある）
+        date_str = ""
+        for l in lines:
+            md = DATE_PAT.search(l)
+            if md:
+                date_str = md.group(1)
+                break
+
+        time_str = ""
+        for l in lines:
+            mt = TIME_RANGE_PAT2.search(normalize_time_colon(l))
+            if mt:
+                time_str = mt.group(1)
+                break
+
+        if date_str and time_str:
+            return normalize_space(f"{date_str} {time_str}")
+        if date_str:
+            return normalize_space(date_str)
+
+        return ""
+
+    rule_dt = extract_datetime_from_blocks_v2(blocks)  # 下に改善版を載せます
+
+    # ルールで取れてるなら AI の datetime は上書き（＝揺れが消える）
+    if rule_dt:
+        refined.datetime = normalize_space(rule_dt)
+
     if not refined.organizer:
         refined.organizer = extract_organizer_from_blocks(blocks)
 
@@ -4035,6 +4089,7 @@ def parse_blocks_to_design_json(blocks: List[TextBlock]) -> DesignJSON:
     print("event_title_lines:", event_title_lines)
 
     dt = extract_datetime_from_blocks(blocks)
+    print("datetime:", dt)
 
     org = extract_organizer_from_blocks(blocks)  # ←主催: を含めたいなら別途調整（必要なら次で直す）
 
@@ -4068,49 +4123,7 @@ def parse_blocks_to_design_json(blocks: List[TextBlock]) -> DesignJSON:
     )
 
 
-async def pptx_to_json(pptx_path: Path, debug_blocks_path: Optional[Path] = None) -> DesignJSON:
-    blocks = extract_blocks_from_pptx(pptx_path, first_slide_only=True)
 
-    if debug_blocks_path:
-        dbg = [
-            {
-                "text": b.text,
-                "left": b.left,
-                "top": b.top,
-                "width": b.width,
-                "height": b.height,
-                "max_font_pt": round(b.max_font_pt, 2),
-            }
-            for b in blocks
-        ]
-        debug_blocks_path.write_text(json.dumps(dbg, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    speaker_map = extract_speaker_affil_map_by_blocks(blocks)
-    time_candidates = extract_time_candidates_from_blocks(blocks)
-
-    draft = parse_blocks_to_design_json(blocks)
-    refined = await ai_refine_json(blocks, draft, speaker_map, time_candidates)
-    refined = fill_chair_affiliation_from_blocks(refined, blocks)
-
-    if refined.confidence < draft.confidence:
-        refined.warnings = sorted(set(refined.warnings + ["ai_lower_confidence"]))
-
-    # organizer OCR（空のときだけ）
-    if not refined.organizer:
-        org2 = await try_fill_organizer_from_logo(pptx_path)
-        if org2:
-            refined.organizer = f"主催：{normalize_organizer(org2)}"
-            refined.warnings = sorted(set(refined.warnings + ["organizer_from_logo_ocr"]))
-        else:
-            refined.warnings = sorted(set(refined.warnings + ["organizer_logo_ocr_failed"]))
-
-    fix_warnings(refined)
-
-    # 互換: event_title は常に event_title_lines から作る
-    refined.event_title_lines = normalize_lines_keep_order(refined.event_title_lines or [])
-    refined.event_title = "\n".join(refined.event_title_lines).strip() if refined.event_title_lines else refined.event_title
-
-    return refined
 
 
 # ---------------- Render (HTML→PNG) ----------------
@@ -4669,10 +4682,17 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
     time_candidates = extract_time_candidates_from_blocks(blocks)
 
     draft = parse_blocks_to_design_json(blocks)
+    print("draft from blocks:")
+    print(draft)
     refined = await ai_refine_json(blocks, draft, speaker_map, time_candidates)
+    print("after AI refinement:")
+    print(refined)
     refined = assign_talk_times_by_proximity(blocks, refined)
+    print("after talk time assignment:")
+    print(refined)
 
     refined = apply_vm_hints_from_blocks(blocks, refined, vm_rows)
+    
     refined = fill_missing_from_vm(refined, vm_rows)
 
     # ★VM演題がある時だけVM prune
@@ -4820,35 +4840,7 @@ async def startup():
         raise RuntimeError(f"Playwright install failed: {e}")
 
 
-@app.post("/upload")
-async def upload(pptx: UploadFile = File(...)):
-    if not pptx.filename.lower().endswith(".pptx"):
-        raise HTTPException(status_code=400, detail="Only .pptx is supported")
-    session_id = new_session_id()
-    job_id = uuid.uuid4().hex
-    p = job_paths(job_id)
-    filename = pptx.filename
-    
-    p["pptx"].write_bytes(await pptx.read())
 
-    try:
-        payload = await pptx_to_json(p["pptx"], debug_blocks_path=p["debug_blocks"])
-        p["json"].write_text(dump_json(payload), encoding="utf-8")
-        await render_png(payload, p["jpg"], p["debug_html"])
-
-        upsert_job_ok(job_id, filename, payload, session_id)
-
-        return JSONResponse({
-            "sessionId": session_id,
-            "jobId": job_id,
-            "json": payload.model_dump(exclude_none=True) if hasattr(payload, "model_dump") else json.loads(payload.json(ensure_ascii=False)),
-            "previewUrl": f"/preview/{job_id}.jpg",
-            "downloadUrl": f"/download/{job_id}.jpg",
-            "debugBlocksUrl": f"/debug/{job_id}/blocks.json",
-        })
-    except Exception as e:
-        upsert_job_error(job_id, filename, str(e))
-        raise
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
