@@ -301,6 +301,7 @@ export default function JobListPage() {
   const [pageSize] = useState(30);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [debug, setDebug] = useState(false);
 
   // right preview (sticky)
   const [preview, setPreview] = useState(null);
@@ -724,6 +725,17 @@ export default function JobListPage() {
                                 まとめてダウンロード
                               </button> 
 
+                              {debug && (
+                                <button style={ui.smallBtn2} onClick={() => {
+                                  const eventIdLike = it.event_id || id || "event";
+                                  const filename = `${eventIdLike}_blocks.json`;
+                                  const url = `/debug/${id}/blocks.json?t=${encodeURIComponent(previewBuster)}`;
+                                  downloadWithFilename(url, filename);
+                                }}>
+                                  Debug JSON
+                                </button>
+                              )}
+
                               
                               
                              
@@ -754,6 +766,16 @@ export default function JobListPage() {
                 <button style={ui.buttonGhost} onClick={() => setPreviewBuster(Date.now())} title="download/preview のキャッシュを更新">
                   ↻ キャッシュ更新
                 </button>
+                  <label style={{ fontSize: 13, color: "#64748b",marginLeft: "auto", display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                <input
+                type="checkbox"
+                checked={debug}
+                onChange={() => setDebug((d) => !d)}
+                
+                />
+              
+                  デバッグ表示
+                </label>
               </div>
             </div>
           </div>
