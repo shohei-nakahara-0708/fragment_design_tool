@@ -3135,6 +3135,61 @@ def pick_title_lines(texts: List[str]) -> List[str]:
 
     return uniq
 
+KANJI = r"[一-龠々]"
+
+TITLE_WORDS = [
+    "主任教授","教授","准教授","講師","助教",
+    "部長","医長","院長","センター長","科長","室長",
+]
+
+ORG_WORDS = ["大学","病院","センター","クリニック","医院","診療所","機構","学部","講座","科","部","外科","内科"]
+
+def _extract_name_anywhere(s: str) -> str:
+    s = normalize_space(s or "").replace("先生", "").strip()
+    if not s:
+        return ""
+    # 文字列中の「漢字2〜8連続」を全部拾って、組織語を含む候補を落とす
+    cands = re.findall(rf"{KANJI}{{2,8}}", s)
+    if not cands:
+        return ""
+    filtered = []
+    for t in cands:
+        if any(w in t for w in ORG_WORDS):  # "滋賀医科大学" みたいなのを避ける
+            continue
+        filtered.append(t)
+    return (filtered[-1] if filtered else cands[-1]).strip()
+
+def split_speaker_affiliation_fuzzy(s: str) -> tuple[str, str]:
+    s = normalize_space(s or "")
+    if not s:
+        return "", ""
+
+    # 末尾に「姓 名」or「姓名」が付いてるパターンが強い
+    parts = s.replace("\u3000", " ").split()
+    if len(parts) >= 2:
+        a, b = parts[-2], parts[-1]
+        if re.fullmatch(rf"{KANJI}{{1,4}}", a) and re.fullmatch(rf"{KANJI}{{1,4}}", b):
+            name = (a + b)
+            aff = " ".join(parts[:-2]).strip()
+            return name, aff
+
+    # 役職語で分割して右側から人名を拾う
+    for w in TITLE_WORDS:
+        if w in s:
+            left, right = s.split(w, 1)
+            left = normalize_space(left + " " + w)
+            name = _extract_name_anywhere(right)
+            if name:
+                return name, left
+
+    # 最後の保険：全体から名前を拾って、残りを所属扱い
+    name = _extract_name_anywhere(s)
+    if name:
+        aff = normalize_space(s.replace(name, " ", 1))
+        return name, aff
+
+    return "", s
+
 def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]) -> List[Talk]:
     """
     まず「講演1/演題1」等のアンカーを優先。
@@ -3153,14 +3208,18 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
         m = TIME_RANGE_RE.search(s2)
         return normalize_space(m.group(1)) if m else ""
 
-    def is_aff_line(s: str) -> bool:
-        if not s:
-            return False
-        if is_time_line(s):
-            return False
-        return any(k in s for k in s for s in [])  # dummy to keep mypy calm (ignored)
+    # def is_aff_line(s: str) -> bool:
+    #     if not s:
+    #         return False
+    #     if is_time_line(s):
+    #         return False
+    #     return any(k in s for k in s for s in [])  # dummy to keep mypy calm (ignored)
 
     # ↑ 上のダミーは不要なら削除してOK。ここから本物:
+
+    def is_label_only(s: str) -> bool:
+        k = normalize_key(s or "")
+        return k in {"演者", "座長", "演題", "演題演者"}
     def is_aff_line(s: str) -> bool:
         if not s:
             return False
@@ -3173,10 +3232,18 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
         ])
 
     def strip_label(prefixes, s: str) -> str:
-        s2 = normalize_space(s)
+        s2 = normalize_space(s or "")
+        s2_key = normalize_key(s2)  # スペースなどを潰した比較用
+
         for p in prefixes:
-            if s2.startswith(p):
-                s2 = re.sub(rf"^{re.escape(p)}\s*[:：]?\s*", "", s2).strip()
+            p_key = normalize_key(p)
+            if s2_key.startswith(p_key):
+                # 先頭の「演\s*者」みたいな形も含めて消す
+                # p が "演者" なら ^演\s*者\s*[:：]?\s* を消す
+                chars = list(p_key)  # "演者" -> ["演","者"]
+                pat = r"^" + r"\s*".join(map(re.escape, chars)) + r"\s*[:：]?\s*"
+                s2 = re.sub(pat, "", s2).strip()
+                return s2
         return s2
     
     def _key_variants(name: str) -> List[str]:
@@ -3372,9 +3439,8 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             s2 = normalize_space(s).replace("先生", "").strip()
             if TIME_RANGE_RE.search(normalize_time_colon(s2)):
                 return False
-            if any(k in s2 for k in ["演題", "演者", "座長", "病院", "クリニック", "大学", "内科", "外科", "教授", "講師", "部長", "院長", "理事長"]):
-                return False
-            return bool(re.fullmatch(r"[一-龥々]{2,6}\s*[一-龥々]{1,6}", s2))
+            # 名前候補が取れればOK（所属が混ざってても良い）
+            return bool(_extract_name_anywhere(s2))
 
         # 本文側leftで安定ソート
         time_blocks2.sort(key=lambda x: (x[2], x[0].top))
@@ -3463,16 +3529,32 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
 
                 if not speaker and "演者" in k:
                     sp = strip_label(["演者", "演者:", "演者："], s)
-                    sp = norm_name(sp)
-                    if sp:
-                        speaker = sp
+                    sp = normalize_space(sp)
+                    sp2, aff2 = split_speaker_affiliation_fuzzy(sp)
+                    if sp2:
+                        speaker = norm_name(sp2)
+                        if not affiliation and aff2 and is_aff_line(aff2):
+                            affiliation = aff2
+                    else:
+                        speaker = norm_name(sp)
 
                 # 「演者」ラベルが無いテンプレ用：名前っぽい行
                 if not speaker and looks_like_name_line(s):
-                    speaker = norm_name(s)
+                    sp2, aff2 = split_speaker_affiliation_fuzzy(s)
+                    if sp2:
+                        speaker = norm_name(sp2)
+                        if not affiliation and aff2 and is_aff_line(aff2):
+                            affiliation = aff2
 
                 if is_aff_line(s):
-                    aff_candidates.append(s)
+                    # affiliation候補として積む前に、末尾人名が付いてたら分離
+                    sp2, aff2 = split_speaker_affiliation_fuzzy(s)
+                    if sp2 and not speaker:
+                        speaker = norm_name(sp2)
+                    if aff2:
+                        aff_candidates.append(aff2)
+                    else:
+                        aff_candidates.append(s)
 
             # affiliation確定
             if not affiliation and aff_candidates:
@@ -4150,23 +4232,7 @@ def normalize_talk_speakers(payload: DesignJSON) -> DesignJSON:
     return payload
 
 
-def _clean_speaker_text(s: str) -> str:
-    s = str(s or "")
-    s = TIME_PAT.sub("", s)
-    s = re.sub(r"(演者|座長)", "", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
 
-def _clean_speaker_obj(t):
-    base = (getattr(t, "speaker_display", "") or "").strip() \
-           or (getattr(t, "speaker", "") or "").strip()
-
-    cleaned = _clean_speaker_text(base)
-    cleaned = add_space_to_jp_name(cleaned)
-
-    t.speaker_display = cleaned
-    t.speaker = cleaned.replace(" ", "")
-    return t
 
 def prune_talks_using_vm_titles(payload: DesignJSON, vm_rows: list[dict]) -> DesignJSON:
     talks = list(payload.talks or [])
