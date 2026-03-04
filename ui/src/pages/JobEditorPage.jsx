@@ -234,6 +234,7 @@ function ensureBaseDefaults(j) {
     speaker: t?.speaker ?? "",
     speaker_display: t?.speaker_display ?? "",
     affiliation: t?.affiliation ?? "",
+      honorific_title: t?.honorific_title ?? "",
     // ここが追加ポイント
     title_overrides: Array.isArray(t?.title_overrides) ? t.title_overrides : [],
   }));
@@ -252,6 +253,20 @@ const ChairEditor = React.memo(function ChairEditor({ chair, updateAtPath }) {
           onChange={(e) => updateAtPath(["chair", "name_display"], e.target.value)}
         />
       </Field>
+       <Field label="敬称">
+            <Control
+              as="select"
+              value={c.honorific_title || ""}
+              onChange={(e) => updateAtPath(["chair", "honorific_title"], e.target.value)}
+            >
+              <option value="">-- 選択してください --</option>
+              <option value="先生">先生</option>
+              <option value="様">様</option>
+          <option value="さん">さん</option>
+          <option value=""></option>
+            </Control>
+          </Field>
+
 
       <Field label="所属">
         <Control
@@ -409,6 +424,7 @@ const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath }) {
         speaker_display: "",
         affiliation: "",
         title_overrides: [],
+          honorific_title: "先生",
       },
     ];
     updateAtPath(["talks"], next);
@@ -486,6 +502,21 @@ const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath }) {
               />
             </Field>
 
+            <Field label="敬称">
+            <Control
+              as="select"
+              value={t.honorific_title || ""}
+              onChange={(e) => setTalkField(idx, "honorific_title", e.target.value)}
+            >
+              <option value="">-- 選択してください --</option>
+              <option value="先生">先生</option>
+              <option value="様">様</option>
+          <option value="さん">さん</option>
+          <option value=""></option>
+            </Control>
+            </Field>
+            
+         
             <Field label="所属">
               <Control
                 as="textarea"

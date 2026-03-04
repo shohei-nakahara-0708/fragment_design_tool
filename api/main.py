@@ -366,12 +366,14 @@ class Talk(BaseModel):
     speaker_display: str = ""
     affiliation: str = ""
     title_overrides: List[TextOverride] = Field(default_factory=list)
+    honorific_title: str = "先生"
 
 
 class Chair(BaseModel):
     name: str = ""
     name_display: str = ""
     affiliation: str = ""
+    honorific_title: str = "先生"
 
 
 class DesignJSON(BaseModel):
@@ -1898,33 +1900,44 @@ def normalize_organizer(org: str) -> str:
 KANJI_NAME_PAT = re.compile(r"^[\u4E00-\u9FFF]{2,6}$")
 
 def add_space_to_jp_name(name: str) -> str:
-    s = str(name or "").replace(" ", "").replace("\u3000", "").strip()
+    raw = str(name or "")
+    s = raw.replace("\u3000", " ").strip()
     if not s:
         return ""
 
-    # すでにスペース入りならそのまま
-    if " " in str(name) or "\u3000" in str(name):
-        return normalize_space(name)
+    # すでに「2塊」っぽい（改行/空白）なら、それを尊重
+    parts = [p for p in re.split(r"\s+", s) if p]
+    if len(parts) >= 2:
+        # 「座長」「先生」など混ざってる可能性があるので軽く掃除
+        joined = "".join(parts)
+        joined = re.sub(r"^(座長|演者|司会|講師|:|：)\s*", "", joined)
+        joined = re.sub(r"(先生)\s*$", "", joined)
+        # 元のpartsから再構成（姓/名っぽく2つに寄せる）
+        # 例: ["阿部","弘太郎"] をそのまま使う
+        if len(parts[0]) >= 1 and len(parts[1]) >= 1:
+            return f"{parts[0]} {parts[1]}"
 
-    # 日本語っぽい（ざっくりCJK）だけを対象
-    # ※ ここはあなたの既存判定があるならそれを使ってOK
-    if not all("\u3040" <= ch <= "\u30ff" or "\u4e00" <= ch <= "\u9fff" for ch in s):
-        return s
+    # 以降はスペース無しの本体で推定
+    core = re.sub(r"\s+", "", s)
+    core = re.sub(r"^(座長|演者|司会|講師|:|：)", "", core)
+    core = re.sub(r"(先生)$", "", core)
 
-    n = len(s)
-    if n == 2:
-        # 2文字は分けない（姓1名1を決め打ちすると事故るので）
-        return s
+    # CJK以外が混じるなら無理に分割しない
+    if not all(("\u3040" <= ch <= "\u30ff") or ("\u4e00" <= ch <= "\u9fff") or (ch == "々") for ch in core):
+        return core
+
+    n = len(core)
+    if n <= 2:
+        return core
     if n == 3:
-        return s[:2] + " " + s[2:]     # 前田 潤
+        return core[:2] + " " + core[2:]      # 前田 潤
     if n == 4:
-        return s[:2] + " " + s[2:]     # 山田 太郎
+        return core[:2] + " " + core[2:]      # 山田 太郎
     if n == 5:
-        return s[:3] + " " + s[3:]     # 佐々木 健太 など寄せ
+        return core[:2] + " " + core[2:]      # 阿部 弘太郎（2+3 を優先）
     if n == 6:
-        return s[:3] + " " + s[3:]
-    return s
-
+        return core[:3] + " " + core[3:]      # 佐々木 健太郎 など
+    return core
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -1981,9 +1994,11 @@ def normalize_for_render(payload: DesignJSON) -> DesignJSON:
     # ★座長ラベルの掃除（「座長：」が name に残るのを防ぐ）
     if getattr(payload, "chair", None):
         if getattr(payload.chair, "name", ""):
-            payload.chair.name = normalize_space(payload.chair.name).replace("座長：", "").replace("座長:", "").strip()
+            payload.chair.name = normalize_space(payload.chair.name).replace("座長", "").replace("：", "").replace(":", "").strip()
+            payload.chair.name = add_space_to_jp_name(payload.chair.name)
         if getattr(payload.chair, "name_display", ""):
-            payload.chair.name_display = normalize_space(payload.chair.name_display).replace("座長：", "").replace("座長:", "").strip()
+            payload.chair.name_display = normalize_space(payload.chair.name_display).replace("座長", "").replace("：", "").replace(":", "").strip()
+            payload.chair.name_display = add_space_to_jp_name(payload.chair.name_display)
 
     # talk title 合成（titleフィールドが存在する時だけ代入）
     for t in (payload.talks or []):

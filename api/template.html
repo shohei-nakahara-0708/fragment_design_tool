@@ -446,7 +446,7 @@ white-space: pre-line;
         <div class="info-row info-row-name" id="chairRow">
           <div class="pill">座長</div>
           <div>
-            <div class="info-sub info-main-chair"><span id="eventChairName"></span><span>先生</span></div>
+            <div class="info-sub info-main-chair"><span id="eventChairName"></span><span id="eventChairHonorificTitle"></span></div>
             <div class="info-sub"><small id="eventChairAff"></small></div>
           </div>
         </div>
@@ -468,8 +468,8 @@ LP-1受容体作動薬の有効利用を考える〜</div>
           <div class="talk-info">
             <div class="role-pill">演者</div>
             <div>
-              <div class="talk-speaker"><span class="talk-speaker-main">test</span>先生</div>
-              <div class="talk-aff">test</div>
+              <div class="talk-speaker"><span class="talk-speaker-main"></span><span id="talkHonorificTitle"></span></div>
+              <div class="talk-aff"></div>
             </div>
           </div>
         </div>
@@ -767,6 +767,7 @@ LP-1受容体作動薬の有効利用を考える〜</div>
         chairRow.classList.remove("hidden");
         document.getElementById("eventChairName").textContent = chairName ? `${chairName}` : "";
         document.getElementById("eventChairAff").textContent = chairAff || "";
+        document.getElementById("eventChairHonorificTitle").textContent = c.honorific_title || "";
       }
 
        const unit = document.getElementById("unitText");
@@ -822,7 +823,7 @@ LP-1受容体作動薬の有効利用を考える〜</div>
            <div class="talk-info">
              <div class="role-pill">演者</div>
              <div>
-              <div class="talk-speaker"><span class="talk-speaker-main">${esc(speaker)}</span>先生</div>
+              <div class="talk-speaker"><span class="talk-speaker-main">${esc(speaker)}</span>${esc(t.honorific_title || "")}</div>
               <div class="talk-aff">${esc(aff)}</div>
              </div>
             </div>
