@@ -1026,7 +1026,7 @@ def _set_field(payload, key: str, value):
     else:
         setattr(payload, key, value)
 
-CIRCLED_NUM = "①②③④⑤⑥⑦⑧⑨⑩"
+CIRCLED_NUM = "①②③④⑤⑥⑦⑧⑨⑩回目"
 
 def normalize_time_range(s: str) -> str:
     s = str(s or "")
