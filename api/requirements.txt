@@ -6,6 +6,8 @@ httpx
 
 playwright
 
+pillow
+
 python-pptx
 
 pydantic
