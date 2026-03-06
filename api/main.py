@@ -44,7 +44,9 @@ import fitz  # pymupdf
 
 import shutil
 
+import math
 
+from PIL import Image
 
 load_dotenv()
 
@@ -4750,7 +4752,12 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
 
 
 
-
+def trim_last_pixel(path: str):
+    img = Image.open(path)
+    w, h = img.size
+    if h > 1:
+        img = img.crop((0, 0, w, h - 1))
+        img.save(path, quality=100)
 
 
 async def render_png(payload: DesignJSON, out_path: Path, debug_html_path: Path):
@@ -4759,35 +4766,53 @@ async def render_png(payload: DesignJSON, out_path: Path, debug_html_path: Path)
         _cached_template = TEMPLATE_PATH.read_text(encoding="utf-8")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"],)
-        page = await browser.new_page(viewport=BASE_VIEWPORT)
+        browser = await p.chromium.launch(
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+
+        context = await browser.new_context(
+            viewport=BASE_VIEWPORT,
+            device_scale_factor=1,
+        )
+        page = await context.new_page()
 
         page.on("pageerror", lambda e: print("[pageerror]", e))
         page.on("console", lambda m: print("[console]", m.type, m.text))
 
-        # await page.set_content(_cached_template, wait_until="domcontentloaded")
         await page.goto(TEMPLATE_PATH.resolve().as_uri(), wait_until="domcontentloaded")
         await page.evaluate("() => document.fonts && document.fonts.ready")
 
-        data_json = payload.model_dump_json() if hasattr(payload, "model_dump_json") else payload.json(ensure_ascii=False)
-
+        data_json = (
+            payload.model_dump_json()
+            if hasattr(payload, "model_dump_json")
+            else payload.json(ensure_ascii=False)
+        )
         data_obj = json.loads(data_json)
 
-        # ★ここで初期値のみ“精密組版”して data を書き換える
-        # data_obj = await page.evaluate(TYPESET_JS, {"data": data_obj})
-
-        # ★ここが重要：DATA注入 → render呼び出し
         await page.evaluate(
             """(data) => {
                 window.__DATA__ = data;
                 if (typeof window.__render === "function") window.__render();
             }""",
-            data_obj  # ← evaluateに渡すのは object が安全（文字列直埋めより事故らない）
+            data_obj,
         )
 
-        # render完了フラグを待つ（render内で data-ready=1 が立つ）
         await page.wait_for_selector('html[data-ready="1"]', timeout=30000)
         await page.wait_for_selector(".wrap", timeout=30000)
+
+        # 念のため余白系を潰す
+        await page.evaluate("""
+        () => {
+            document.documentElement.style.margin = "0";
+            document.body.style.margin = "0";
+            document.body.style.padding = "0";
+            const wrap = document.querySelector(".wrap");
+            if (wrap) {
+                wrap.style.margin = "0";
+                wrap.style.display = "block";
+            }
+        }
+        """)
 
         wrap = page.locator(".wrap")
 
@@ -4802,18 +4827,39 @@ async def render_png(payload: DesignJSON, out_path: Path, debug_html_path: Path)
             raise RuntimeError(f"wrap bounding box not ready; wrote {debug_html_path}")
 
         box = await wrap.bounding_box()
-        h = min(int(box["height"]), MAX_HEIGHT)
+        if not box:
+            raise RuntimeError("wrap bounding box is None")
 
-        await page.set_viewport_size({"width": 600, "height": max(h, 1)})
-        await wrap.screenshot(
-    path=str(out_path),
-    type="jpeg",
-    quality=100  # 0〜100（PNGには無い）
-)
+        clip_x = math.floor(box["x"])
+        clip_y = math.floor(box["y"])
+        clip_w = math.ceil(box["width"])
+        clip_h = min(math.ceil(box["height"]), MAX_HEIGHT)
 
+        print(f"wrap bounding box: {box}")
+        print(f"clip: x={clip_x}, y={clip_y}, w={clip_w}, h={clip_h}")
 
+        await page.set_viewport_size({
+            "width": max(clip_x + clip_w, 1),
+            "height": max(clip_y + clip_h, 1),
+        })
+
+        await page.screenshot(
+            path=str(out_path),
+            type="jpeg",
+            quality=100,
+            clip={
+                "x": clip_x,
+                "y": clip_y,
+                "width": clip_w,
+                "height": clip_h,
+            },
+        )
+
+        # Chromium の 1px 余り対策
+        trim_last_pixel(str(out_path))
+
+        await context.close()
         await browser.close()
-
 
 
 

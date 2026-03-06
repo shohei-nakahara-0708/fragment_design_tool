@@ -47,10 +47,14 @@ text-rendering: optimizeLegibility;
 
 
     .wrap {
-      width: 600px;
-      box-sizing: border-box;
-      background: #fff;
-    }
+  width: 600px;
+  box-sizing: border-box;
+  background: #fff;
+  display: block;
+  overflow: hidden;
+  position: relative;
+}
+    
 
     /* ====== TOP HERO (green banner) ====== */
     .hero {
@@ -340,7 +344,6 @@ font-size: 20px;
     /* ====== CTA ====== */
     .cta-wrap {
      margin-top: 27px;
-    margin-bottom: 40px;
     display: flex;
     justify-content: center;
     flex-direction: column;
@@ -351,14 +354,21 @@ font-size: 20px;
 
     /* ====== FOOTER ====== */
     .footer {
-      font-family: "Invention JP";
-font-weight: bold;
-font-size: 12px;
-text-align: left;
-color: #fff;
-padding: 9px 25px;
-background-color: #5AB746;
-white-space: pre-line;
+
+      position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 100%;
+
+font-family: "Invention JP";
+  font-weight: bold;
+  font-size: 12px;
+  line-height: 14px;
+  padding: 8px 25px;
+  color: #fff;
+  background-color: #5AB746;
+  white-space: pre-line;
+  box-sizing: border-box;
     }
 
     /* helpers */
@@ -395,12 +405,14 @@ white-space: pre-line;
 .pill, .role-pill { background: var(--theme-pill); }
 .talk-title { color: var(--theme-talk); }
 .footer { background-color: var(--theme-footer); }
-
+svg {
+  display: block;
+}
   </style>
 </head>
 
 <body>
-  <div class="wrap">
+  <div id="wrap" class="wrap">
     <!-- HERO -->
     <div class="hero">
       <div class="hero-inner">
@@ -417,7 +429,7 @@ white-space: pre-line;
       </div>
     </div>
     
-    <h1 class="hero-title" id="heroTitle">お昼のGLP-1 Webセミナー in Aprilお昼のGLP-1 Webセミナー in Aprilお昼のGLP-1 Webセミナー in Aprilお昼のGLP-1 Webセミナー in Aprilお昼のGLP-1 Webセミナー in April</h1>
+    <h1 class="hero-title" id="heroTitle"></h1>
 
 
     
@@ -429,7 +441,7 @@ white-space: pre-line;
         <div class="info-row">
           <div class="pill">日時</div>
           <div>
-            <div class="info-main info-main-date" id="eventDatetime"><span class="bg-text" id="eventDatetimeYear">2026</span>年<span class="bg-text"  id="eventDatetimeMonth">3</span>月<span class="bg-text"  id="eventDatetimeDay">15</span>日<span class="ml-3">(</span><span class="bg-text"  id="eventDatetimeDayOfWeek"></span>)<span id="eventDatetimeTime">20:00~21:00</span></div>
+            <div class="info-main info-main-date" id="eventDatetime"><span class="bg-text" id="eventDatetimeYear"></span>年<span class="bg-text"  id="eventDatetimeMonth"></span>月<span class="bg-text"  id="eventDatetimeDay"></span>日<span class="ml-3">(</span><span class="bg-text"  id="eventDatetimeDayOfWeek"></span>)<span id="eventDatetimeTime"></span></div>
           </div>
         </div>
 
@@ -456,23 +468,6 @@ white-space: pre-line;
 
       <!-- TALKS -->
       <div class="talks" id="talks">
-        <div class="talk-row">
-          <div class="talk-title-wrap">
-            <div class="time">19:00~<br>19:30</div>
-            <div class="talk-title">心・腎合併症を見据えた糖尿病治療〜G
-LP-1受容体作動薬の有効利用を考える〜心・腎合併症を見据えた糖尿病治療〜G
-LP-1受容体作動薬の有効利用を考える〜心・腎合併症を見据えた糖尿病治療〜G
-LP-1受容体作動薬の有効利用を考える〜</div>
-          </div>
-          
-          <div class="talk-info">
-            <div class="role-pill">演者</div>
-            <div>
-              <div class="talk-speaker"><span class="talk-speaker-main"></span><span id="talkHonorificTitle"></span></div>
-              <div class="talk-aff"></div>
-            </div>
-          </div>
-        </div>
       </div>
 
   
@@ -501,6 +496,7 @@ LP-1受容体作動薬の有効利用を考える〜</div>
 
   <!-- FOOTER -->
     <div class="footer" id="footerText">主催：MSD株式会社</div>
+    </div>
 
   <script>
     function esc(s) {
@@ -773,18 +769,7 @@ LP-1受容体作動薬の有効利用を考える〜</div>
        const unit = document.getElementById("unitText");
        unit.textContent = d.unit ? String(d.unit) : "";
 
-       if (d.unit) {
-        // const marginBottom = 40 - unit.offsetHeight - 10;
-         const cta = document.getElementById("cta");
-         unit.style.marginTop = "5px";
-          cta.style.marginBottom = "25px";
-        //  if (marginBottom >= 20) {
-        //    cta.style.marginBottom = marginBottom + "px";
-        //  }else{
-        //     cta.style.marginBottom = "20px";
-        //  }
-     
-       } 
+       
 
       // footer（主催があればそれを使う）
       const footer = document.getElementById("footerText");
@@ -841,6 +826,26 @@ LP-1受容体作動薬の有効利用を考える〜</div>
         talksEl.appendChild(empty);
       }
 
+
+      let h = 40; // 余白分を先に確保
+
+      if (d.unit) {
+     
+        const cta = document.getElementById("cta");
+        unit.style.marginTop = "5px";
+        h = 25;
+
+      } 
+
+      const wrap = document.getElementById("wrap");
+     
+
+      if (wrap && footer) {
+        const fh = Math.ceil(footer.getBoundingClientRect().height) + h;
+        wrap.style.paddingBottom = `${fh}px`;
+      }
+
+     
       // render_png 側で待つためのフラグ
       document.documentElement.setAttribute("data-ready", "1");
     };
