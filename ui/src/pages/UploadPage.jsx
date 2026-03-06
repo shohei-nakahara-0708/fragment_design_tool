@@ -246,13 +246,6 @@ const ui = {
     cursor: "pointer",
   },
 
-  progressCard: {
-    marginTop: 10,
-    background: "#fff",
-    border: "1px solid rgba(226,232,240,0.95)",
-    borderRadius: 12,
-    padding: 10,
-  },
 
   tableCard: {
     background: "rgba(255,255,255,0.9)",
