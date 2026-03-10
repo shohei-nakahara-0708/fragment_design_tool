@@ -2525,6 +2525,9 @@ def looks_like_format_value(s: str) -> bool:
         or s2.startswith("Web")
     )
 
+
+
+
 def extract_event_title_lines_from_blocks(blocks: List[TextBlock]) -> List[str]:
     if not blocks:
         return []
@@ -2533,12 +2536,43 @@ def extract_event_title_lines_from_blocks(blocks: List[TextBlock]) -> List[str]:
     min_top, max_top = min(tops), max(tops)
     mid_top = min_top + (max_top - min_top) * 0.35  # 上1/3
 
+    def looks_like_date_title_block(s: str) -> bool:
+        s0 = normalize_space(s)
+        s1 = re.sub(r"\s+", "", s0)
+
+        # 典型: 2026年 5月19日(火), 2026年\n5月19日(火)
+        if re.search(r"\d{4}年\d{1,2}月\d{1,2}日", s1):
+            return True
+
+        # 年と月日が改行で分かれているケース
+        if re.search(r"\d{4}年", s1) and re.search(r"\d{1,2}月\d{1,2}日", s1):
+            return True
+
+        # 曜日つき
+        if re.search(r"\d{1,2}月\d{1,2}日[（(][月火水木金土日][)）]", s1):
+            return True
+
+        # 時間だけ大きく出るケースも一応除外
+        if re.fullmatch(r"\d{1,2}:\d{2}[~〜～\-－]\d{1,2}:\d{2}", s1):
+            return True
+
+        return False
+
     def kw_norm(s: str) -> str:
         return re.sub(r"\s+", "", s)
 
     def is_title_excluded(s: str) -> bool:
         k = kw_norm(s)
-        return any(x in k for x in ["主催", "共催", "座長", "演者", "演題", "会場", "形式", "PROGRAM"])
+
+        # 単独ラベルだけ除外
+        if k in {"主催", "共催", "座長", "演者", "演題", "会場", "形式", "日時", "PROGRAM"}:
+            return True
+
+        # これは強めに除外してよい
+        if "共催" in k or "主催" in k:
+            return True
+
+        return False
 
     def contains_japanese(s: str) -> bool:
         return bool(re.search(r"[ぁ-んァ-ン一-龯]", s))
@@ -2558,13 +2592,35 @@ def extract_event_title_lines_from_blocks(blocks: List[TextBlock]) -> List[str]:
         if m:
             s = s[: m.start()].rstrip()
         return s.strip()
+    
+    def title_head_score(b: TextBlock) -> tuple:
+        s = normalize_space(b.text)
+        dt_penalty = 1 if looks_like_date_title_block(s) else 0
+        # penalty が小さい方が優先、次にフォント、次に上側
+        return (dt_penalty, -(b.max_font_pt or 0), b.top)
+
+    def clean_title_text(s: str) -> str:
+        s = normalize_space(s)
+
+        # 改行区切りで末尾ラベルを落とす
+        parts = [x.strip() for x in str(s).split("\n") if x.strip()]
+        while parts and parts[-1] in {"日時", "会場", "座長", "演者", "演題", "開催形式"}:
+            parts.pop()
+
+        s = " ".join(parts)
+
+        # 念のため末尾にぶら下がった単独ラベルも落とす
+        s = re.sub(r"\s*(日時|会場|座長|演者|演題|開催形式)\s*$", "", s)
+
+        return s.strip()
+    
 
     cand = []
     for b in blocks:
         s = normalize_space(b.text)
         if not s:
             continue
-        if looks_like_datetime_text(s) or looks_like_format_value(s) or looks_like_body_text_for_title(s):
+        if looks_like_datetime_text(s) or looks_like_date_title_block(s) or looks_like_format_value(s) or looks_like_body_text_for_title(s):
             continue
         if is_title_excluded(s):
             continue
@@ -2579,7 +2635,8 @@ def extract_event_title_lines_from_blocks(blocks: List[TextBlock]) -> List[str]:
         return [normalize_space(b0.text)]
 
     # head（タイトル本体）
-    head = sorted(cand, key=lambda b: ((b.max_font_pt or 0), -b.top), reverse=True)[0]
+    # head = sorted(cand, key=lambda b: ((b.max_font_pt or 0), -b.top), reverse=True)[0]
+    head = sorted(cand, key=title_head_score)[0]
     head_text = normalize_space(head.text)
 
     # head が英語っぽいなら “混ざり” を切る
@@ -2599,6 +2656,7 @@ def extract_event_title_lines_from_blocks(blocks: List[TextBlock]) -> List[str]:
     lines: List[str] = []
     for b in near:
         s = normalize_space(b.text)
+        s = clean_title_text(b.text)
         if not s:
             continue
         if looks_like_datetime_text(s) or looks_like_format_value(s) or looks_like_body_text_for_title(s):
