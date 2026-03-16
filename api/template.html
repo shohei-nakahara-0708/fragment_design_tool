@@ -128,6 +128,95 @@ text-rendering: optimizeLegibility;
       margin-top: 5px;
     }
 
+
+    .info-main-date {
+  font-family: "Invention JP";
+  font-weight: bold;
+  font-size: 18px;
+  text-align: left;
+  color: #000;
+  line-height: 1.2;
+
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.info-main-date .bg-text {
+  font-size: 23px;
+}
+
+
+#eventDatetime-row {
+  align-items: flex-start;
+}
+
+#eventDateWrap {
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+#eventDatetimeRight {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+#eventDatetimeTimeWrap {
+  margin-left: 3px;
+  min-width: 0;
+}
+
+#eventDatetimeTime {
+  display: block;
+}
+
+#eventDatetimeTimeNote {
+  margin-left: 5px;
+  font-size: 14px;
+  line-height: 1.2;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
+}
+
+#eventDatetimeYear {
+  margin-right: 3px;
+}
+
+#eventDatetimeMonth {
+  margin: 0 3px;
+}
+
+#eventDatetimeDay {
+  margin: 0 3px;
+}
+
+/* datetime_time_newline = true の時 */
+.info-main-date.is-newline {
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.info-main-date.is-newline #eventDatetimeRight {
+  margin-top: 4px;
+}
+
+.info-main-date.is-newline #eventDatetimeTimeWrap {
+  margin-left: 0;
+}
+
+.info-main-date.is-newline #eventDatetimeTimeNote {
+  margin-left: 0;
+}
+
+.info-row.is-newline {
+  align-items: center;
+}
+
     .pill {
       display: inline-flex;
       align-items: center;
@@ -166,44 +255,10 @@ font-size: 14px;
   margin-left: -0.02em;
 }
 
-    .info-main {
-     font-family: "Invention JP";
-font-weight: bold;
-font-size: 18px;
-text-align: left;
-color: #000;
-
-    }
-
-    .info-main-date {
-      font-family: "Invention JP";
-      font-weight: bold;
-      font-size: 18px;
-      text-align: left;
-      color: #000;
-      line-height: 1.2;
-    }
-
-    .info-main-date .bg-text {
-      font-size: 23px;
-    }
-
-    #eventDatetimeYear {
-      margin-right: 3px;
-    }
-
-    #eventDatetimeMonth {
-     margin: 0 3px;
-    }
 
 
-    #eventDatetimeDay {
-      margin: 0 3px;
-    }
+ 
 
-    #eventDatetimeTime{
-      margin-left: 3px;
-    }
 
  
 
@@ -216,7 +271,7 @@ color: #000;
 
        #eventChairName{
       font-size: 20px;
-      margin-right: 7px;
+      margin-right: 5px;
     }
 
     .info-sub small {
@@ -326,7 +381,7 @@ color: #000;
 
         .talk-speaker-main {
 font-size: 20px;
-      margin-right: 7px;
+      margin-right: 5px;
     }
 
     .talk-aff {
@@ -343,7 +398,7 @@ font-size: 20px;
 
     /* ====== CTA ====== */
     .cta-wrap {
-     margin-top: 27px;
+     margin-top: 25px;
     display: flex;
     justify-content: center;
     flex-direction: column;
@@ -408,6 +463,11 @@ white-space: pre-line;
 svg {
   display: block;
 }
+
+
+
+
+
   </style>
 </head>
 
@@ -438,12 +498,23 @@ svg {
     <div class="sheet">
       <!-- INFO -->
       <div class="info">
-        <div class="info-row">
-          <div class="pill">日時</div>
-          <div>
-            <div class="info-main info-main-date" id="eventDatetime"><span class="bg-text" id="eventDatetimeYear"></span>年<span class="bg-text"  id="eventDatetimeMonth"></span>月<span class="bg-text"  id="eventDatetimeDay"></span>日<span class="ml-3">(</span><span class="bg-text"  id="eventDatetimeDayOfWeek"></span>)<span id="eventDatetimeTime"></span></div>
+    <div id="eventDatetime-row" class="info-row">
+      <div class="pill">日時</div>
+      <div>
+        <div class="info-main info-main-date" id="eventDatetime">
+          <div id="eventDateWrap">
+            <span class="bg-text" id="eventDatetimeYear"></span>年<span class="bg-text" id="eventDatetimeMonth"></span>月<span class="bg-text" id="eventDatetimeDay"></span>日<span class="ml-3">(</span><span class="bg-text" id="eventDatetimeDayOfWeek"></span>)
+          </div>
+    
+          <div id="eventDatetimeRight">
+            <div id="eventDatetimeTimeWrap">
+              <span id="eventDatetimeTime"></span>
+            </div>
+            <div id="eventDatetimeTimeNote"></div>
           </div>
         </div>
+      </div>
+    </div>
 
   
 
@@ -456,7 +527,7 @@ svg {
 
 
         <div class="info-row info-row-name" id="chairRow">
-          <div class="pill">座長</div>
+          <div id="eventChairLabel" class="pill">座長</div>
           <div>
             <div class="info-sub info-main-chair"><span id="eventChairName"></span><span id="eventChairHonorificTitle"></span></div>
             <div class="info-sub"><small id="eventChairAff"></small></div>
@@ -696,29 +767,32 @@ svg {
       const parts = d.datetime_parts || parseJapaneseDatetimeParts(d.datetime);
 
       const newline = !!d.datetime_time_newline;
+      (function applyDatetimeLayout() {
+        const newline = !!d.datetime_time_newline;
 
-      (function applyDatetimeNewline() {
-        const timeEl = document.getElementById("eventDatetimeTime");
-        if (!timeEl) return;
+        const eventDatetimeRow = document.getElementById("eventDatetime-row");
+        const eventDatetime = document.getElementById("eventDatetime");
+        const eventDatetimeTimeNote = document.getElementById("eventDatetimeTimeNote");
 
-        const brId = "eventDatetimeBr";
-        const existingBr = document.getElementById(brId);
+        if (!eventDatetimeRow || !eventDatetime || !eventDatetimeTimeNote) return;
 
-        if (newline) {
-          // br が無ければ timeEl の直前に挿入
-          if (!existingBr) {
-            const br = document.createElement("br");
-            br.id = brId;
-            timeEl.parentNode.insertBefore(br, timeEl);
-           
-          }
-           timeEl.style.marginLeft = "0"; // 改行するなら左の余白いらない
-          // 改行時は左の余白いらない
+        // いったんリセット
+        eventDatetime.classList.remove("is-newline");
+        eventDatetimeRow.classList.remove("is-newline");
+        eventDatetimeTimeNote.innerHTML = "";
+
+        // note
+        if (d.datetime_note) {
+          setHtmlWithBr("eventDatetimeTimeNote", d.datetime_note);
+          eventDatetimeTimeNote.style.display = "";
         } else {
-          // br があれば消す
-          if (existingBr) existingBr.remove();
-          // 横並び時は少し空けたいなら
+          eventDatetimeTimeNote.style.display = "none";
+        }
 
+        // 改行パターン
+        if (newline) {
+          eventDatetime.classList.add("is-newline");
+          eventDatetimeRow.classList.add("is-newline");
         }
       })();
 
@@ -743,6 +817,22 @@ svg {
         setText("eventDatetimeTime", d.datetime ? String(d.datetime) : "");
       }
 
+    
+
+       if (d.datetime_note) {
+
+         setHtmlWithBr("eventDatetimeTimeNote", d.datetime_note);
+
+         const eventDatetimeTimeNote = document.getElementById("eventDatetimeTimeNote");
+
+         const baseSize = Number(d.datetime_note_font_size || 14); // 全体の基本サイズ
+         if (Number.isFinite(baseSize)) eventDatetimeTimeNote.style.fontSize = baseSize + "px";
+
+          const baseLeft = Number(d.datetime_note_left || 5); // 左位置の基本値
+         if (Number.isFinite(baseLeft)) eventDatetimeTimeNote.style.marginLeft = baseLeft + "px";
+
+       }
+
 
       // document.getElementById("eventDatetime").textContent =
       //   d.datetime ? String(d.datetime) : "";
@@ -757,6 +847,8 @@ svg {
       const chairName = (c.name_display || "").trim();
       const chairAff = (c.affiliation || "").trim();
 
+      const chairRole = (c.role || "").trim();
+
       if (!chairName && !chairAff) {
         chairRow.classList.add("hidden");
       } else {
@@ -764,7 +856,16 @@ svg {
         document.getElementById("eventChairName").textContent = chairName ? `${chairName}` : "";
         document.getElementById("eventChairAff").textContent = chairAff || "";
         document.getElementById("eventChairHonorificTitle").textContent = c.honorific_title || "";
+        document.getElementById("eventChairLabel").textContent = chairRole || "座長";
+
+        if (chairRole.toLowerCase() === "総合司会") {
+         const chairRole = document.getElementById("eventChairLabel");
+          chairRole.classList.add("pill2");
+        }else {
+          const chairRole = document.getElementById("eventChairLabel");
+          chairRole.classList.remove("pill2");
       }
+    }
 
        const unit = document.getElementById("unitText");
        unit.textContent = d.unit ? String(d.unit) : "";

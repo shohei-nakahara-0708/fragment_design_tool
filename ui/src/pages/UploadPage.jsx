@@ -799,7 +799,7 @@ const progress = useMemo(() => {
                 <div>
                   <input
                     value={r.eventId}
-                    disabled={uploading}
+                    disabled={uploading || r.status === "ok"}
                     onChange={(e) => setEventId(r.id, e.target.value)}
                     placeholder="例: EM0000-00000000"
                     style={ui.input(invalid, uploading)}
@@ -829,9 +829,12 @@ const progress = useMemo(() => {
         </div>
 
         {/* footer tips */}
-        <div style={{ marginTop: 10, fontSize: 12, color: "#64748b", lineHeight: 1.6 }}>
-          ・event_id は必須（未入力があると生成できません）<br />
-          ・同名ファイルが複数あってもOK（ここでは重複排除していません）
+            <div style={{ marginTop: 10, fontSize: 12, color: "#64748b", lineHeight: 1.6 }}>
+              ※本ツールはAIによる自動解析を行っています。<br/>
+・PPTX → PDF の順で解析精度が低下する可能性があります。<br/>
+・画像化されたPDFや、他形式から変換されたPPTXファイルなどテキストデータが破損している場合、精度が著しく低下することがあります。<br/>
+生成結果の正確性は保証されません。<br/> 
+必ず内容を確認・編集のうえ出力してください。
         </div>
         </>
         )}

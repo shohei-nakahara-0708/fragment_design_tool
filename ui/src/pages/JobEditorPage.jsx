@@ -246,7 +246,19 @@ function ensureBaseDefaults(j) {
 const ChairEditor = React.memo(function ChairEditor({ chair, updateAtPath }) {
   const c = chair || {};
   return (
-    <Card title="座長">
+    <Card title={c.role}>
+      <Field label="役職">
+            <Control
+              as="select"
+              value={c.role || ""}
+              onChange={(e) => updateAtPath(["chair", "role"], e.target.value)}
+            >
+              <option value="">-- 選択してください --</option>
+              <option value="座長">座長</option>
+              <option value="総合司会">総合司会</option>
+            </Control>
+          </Field>
+
       <Field label="名前">
         <Control
           value={c.name_display || ""}
@@ -777,7 +789,7 @@ export default function JobEditorPage() {
 
           <div style={ui.grid2}>
             <div>
-              <Field label="イベントタイトル" help="改行で行分割（event_title_lines）">
+              <Field label="イベントタイトル" help="改行で行分割">
                 <Control
                   as="textarea"
                   rows={4}
@@ -788,7 +800,7 @@ export default function JobEditorPage() {
             </div>
 
             <div>
-              <Field label="ベース文字サイズ" help="heroTitle の基本サイズ（例: 30）">
+              <Field label="ベース文字サイズ" help="イベントタイトル の基本サイズ（例: 30）">
                 <Control
                   type="number"
                   value={json.title_font_size || 30}
@@ -862,7 +874,7 @@ export default function JobEditorPage() {
               }}
             />
 
-            <label style={ui.badge(!!json.datetime_time_newline ? "green" : "gray")}>
+             <label style={ui.badge(!!json.datetime_time_newline ? "green" : "gray")}>
               <input
                 type="checkbox"
                 checked={!!json.datetime_time_newline}
@@ -870,6 +882,50 @@ export default function JobEditorPage() {
               />
               時間を改行表示
             </label>
+
+
+              <Field label="注釈" help="日時の下に小さめの文字で表示される行。改行も可能。例: 各講演35分（Q&A含む）など">
+              <Control
+              as="textarea"
+              rows={2}
+              style={{ width: 220 }}
+              placeholder="例:※各講演35分 (Q&A含む)"
+              value={json.datetime_note || ""}
+              onChange={(e) => updateAtPath(["datetime_note"], e.target.value)}
+            />
+            </Field>
+            
+            {json.datetime_note ? (
+               <div style={ui.grid2}>
+              <div>
+
+                <Field label="注釈の文字サイズ" help="注釈の基本サイズ（例: 14）">
+                <Control
+                  type="number"
+                  value={json.datetime_note_font_size || 14}
+                  onChange={(e) => updateAtPath(["datetime_note_font_size"], Number(e.target.value))}
+                />
+              </Field>
+            
+              
+            </div>
+              
+            <div>
+              <Field label="注釈の左の余白" help="注釈の左位置の余白（例: 5）">
+                <Control
+                  type="number"
+                  value={json.datetime_note_left || 5}
+                  onChange={(e) => updateAtPath(["datetime_note_left"], Number(e.target.value))}
+                />
+              </Field>
+            </div>
+          </div>
+            ) : null}
+            
+            
+          
+
+           
           </div>
 
           {/* <div style={{ marginTop: 10 }}>

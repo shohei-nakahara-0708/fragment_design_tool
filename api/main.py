@@ -179,7 +179,7 @@ TYPESET_JS = r"""
     }
 
     // 3) Dash separator: prefer " space-dash-space "
-    const dashRe = /([\-–—−－])/;  // まずダッシュを見つける
+    const dashRe = /([\–—−－])/;  // まずダッシュを見つける
 const m = dashRe.exec(s);
 if (m && m.index > 0) {
   const dashPos = m.index;
@@ -187,6 +187,21 @@ if (m && m.index > 0) {
   const dashChar = s[dashPos];
   const rest = s.slice(dashPos + 1).trim();
   const b = (dashChar + rest).trimStart(); // 2行目は dash から（"-当院に…"）
+  if (a && b) return [a, b];
+}
+
+
+idx = s.indexOf("（");
+if (idx > 0) {
+  const a = s.slice(0, idx).trimEnd();
+  const b = s.slice(idx).trimStart(); // 2行目は必ず「（」から
+  if (a && b) return [a, b];
+}
+
+idx = s.indexOf("(");
+if (idx > 0) {
+  const a = s.slice(0, idx).trimEnd();
+  const b = s.slice(idx).trimStart(); // 2行目は必ず「(」から
   if (a && b) return [a, b];
 }
 
@@ -313,6 +328,13 @@ if (m && m.index > 0) {
     data.event_title = evLines.join("\n");
   }
 
+  if (data.chair) {
+  const chairAffRaw = String(data.chair.affiliation ?? "");
+  const chairAffText = norm(chairAffRaw);
+  const chairAffLines = wrapPx(chairAffText, affMax, affStyle, 3, false);
+  data.chair.affiliation = chairAffLines.join("\n");
+}
+
   // ---- talks title lines + affiliation wrap ----
   if (Array.isArray(data.talks)) {
     data.talks = data.talks.map((t) => {
@@ -372,6 +394,7 @@ class Talk(BaseModel):
 
 
 class Chair(BaseModel):
+    role: str = ""
     name: str = ""
     name_display: str = ""
     affiliation: str = ""
@@ -385,6 +408,9 @@ class DesignJSON(BaseModel):
     datetime: str = ""
     datetime_parts: Optional[DatetimeParts] = None
     datetime_time_newline: bool = False  # datetime_parts.time を改行するか
+    datetime_note: str = ""
+    datetime_note_font_size: int = 14
+    datetime_note_left: int = 5  # datetime_note の左位置
     organizer: str = ""
     chair: Chair = Chair()
     talks: List[Talk] = Field(default_factory=list)
@@ -1110,6 +1136,8 @@ def _ensure_datetime_parts(parts):
         time=getattr(parts, "time", "") or "",
     )
 
+    
+
 def fill_datetime_parts(payload, blocks=None):
     def pget(obj, key, default=None):
         if isinstance(obj, dict):
@@ -1791,13 +1819,49 @@ def normalize_key(s: str) -> str:
     return s
 
 
+ROLE_PREFIXES = [
+    "総合司会", "司会", "総合座長", "座長", "Moderator", "Chairperson", "Chair",
+]
+
+
+def strip_role_prefix(s: str) -> str:
+    x = normalize_space(s or "").replace("\n", "")
+    changed = True
+    while changed and x:
+        changed = False
+        for p in ROLE_PREFIXES:
+            if x.startswith(p):
+                x = x[len(p):].strip()
+                changed = True
+    return x
+
+
+def detect_chair_role(text: str) -> str:
+    s = normalize_space(text or "").replace("\n", "")
+    if not s:
+        return ""
+    for p in ["総合司会", "司会", "総合座長", "座長", "Moderator", "Chairperson", "Chair"]:
+        if p in s:
+            return p
+    return ""
+
+
+def normalize_person_name(s: str) -> str:
+    x = strip_role_prefix(s)
+    x = normalize_space(x).replace("先生", "").strip()
+    x = x.replace("　", " ")
+    x = x.replace(" ", "")
+    return x
+
+
+def normalize_person_display(s: str) -> str:
+    x = strip_role_prefix(s)
+    x = normalize_space(x).replace("先生", "").replace("\n", " ").strip()
+    return add_space_to_jp_name(x)
+
+
 def norm_name(s: str) -> str:
-    s = normalize_space(s).replace("先生", "").strip()
-    s = s.replace("　", " ")
-    s = s.replace(" ", "")
-    return s
-
-
+    return normalize_person_name(s)
 def split_tilde_subtitle_lines(line: str) -> List[str]:
     """
     1行内の ~...~ / ～...～ を「別行扱い」にする
@@ -1993,14 +2057,16 @@ def normalize_for_render(payload: DesignJSON) -> DesignJSON:
     if hasattr(payload, "event_title_lines") and payload.event_title_lines:
         payload.event_title = join_lines(payload.event_title_lines)
 
-    # ★座長ラベルの掃除（「座長：」が name に残るのを防ぐ）
+    # ★chair ラベルの掃除（role は別フィールドへ）
     if getattr(payload, "chair", None):
+        if not getattr(payload.chair, "role", ""):
+            payload.chair.role = detect_chair_role((getattr(payload.chair, "name", "") or "") + " " + (getattr(payload.chair, "name_display", "") or ""))
         if getattr(payload.chair, "name", ""):
-            payload.chair.name = normalize_space(payload.chair.name).replace("座長", "").replace("：", "").replace(":", "").strip()
-            payload.chair.name = add_space_to_jp_name(payload.chair.name)
+            payload.chair.name = normalize_person_name(payload.chair.name)
         if getattr(payload.chair, "name_display", ""):
-            payload.chair.name_display = normalize_space(payload.chair.name_display).replace("座長", "").replace("：", "").replace(":", "").strip()
-            payload.chair.name_display = add_space_to_jp_name(payload.chair.name_display)
+            payload.chair.name_display = normalize_person_display(payload.chair.name_display)
+        elif getattr(payload.chair, "name", ""):
+            payload.chair.name_display = add_space_to_jp_name(payload.chair.name)
 
     # talk title 合成（titleフィールドが存在する時だけ代入）
     for t in (payload.talks or []):
@@ -3906,8 +3972,14 @@ def build_ai_prompt(
   - 例: "2026年5月21日（木） 18:00～19:10"
   - 時間が抽出できない場合のみ、日付だけでも可（例: "2026年5月21日（木）"）
   - 形式/配信方法/会場などは絶対に混ぜない
+- datetime_note は datetime（開催日・全体時間）の近くにある注釈のみ入れる
+    - 例: "※各講演35分 (Q&A含む)"
+    - 「※」で始まる短い注釈が日時ブロックの近傍にある場合のみ採用する
+    - 形式/視聴方法/注意事項/参加方法/脚注本文は datetime_note に入れない
+    - 根拠が薄い場合は空文字
 - organizer は主催の会社名（抽出データにある場合のみ）
-- chair は座長
+- chair は司会・総合司会・座長・総合座長など進行役
+- chair.role には役職名を入れる（例: "座長", "総合座長", "司会", "総合司会"）。不明なら空
 - talks は1〜4件、順序はスライドの登場順（top/left順）
 - 空のtalkは禁止（title_lines/speaker/timeが全て空の要素を作らない）
 - event_title_lines / talk.title_lines は改行を保持して配列で返す（統合しない）
@@ -3915,6 +3987,9 @@ def build_ai_prompt(
 - talk.speaker は speaker_map のキーから選ぶ。不明なら空
 - talk.affiliation は speaker_map[talk.speaker] をそのまま使用（推測禁止）
 - talk.time は「その講演ブロック近傍に明示された時間」のみ使用する
+- talk.title_lines は必ず抽出ブロック(text)内の文字列から作る
+- 抽出ブロックに存在しない文章を生成してはいけない
+- speaker名から講演タイトルを推測してはいけない
 - 全体の開催時間(datetime)を talk.time に使ってはいけない
 - 「先生」はspeakerから除去する（例：河 良崇 先生 → 河良崇）
 - talksは「講演1/2/3...」アンカー付近（座標的に近いブロック）から構成すること
@@ -3936,8 +4011,9 @@ def build_ai_prompt(
   "event_title_lines": ["string"],
   "event_title": "string",
   "datetime": "string",
+  "datetime_note": "string",
   "organizer": "string",
-  "chair": {{"name":"string","affiliation":"string"}},
+  "chair": {{"role":"string","name":"string","affiliation":"string"}},
   "talks": [
     {{"time":"string","title_lines":["string"],"speaker":"string","affiliation":"string"}}
   ],
@@ -3993,8 +4069,12 @@ async def ai_refine_json(
     refined.event_title = "\n".join(refined.event_title_lines).strip() if refined.event_title_lines else normalize_space(refined.event_title)
 
     refined.datetime = normalize_space(refined.datetime)
+    refined.datetime_note = normalize_space(refined.datetime_note)
     refined.organizer = normalize_space(refined.organizer)
-    refined.chair.name = norm_name(refined.chair.name)
+    refined.chair.role = normalize_space(getattr(refined.chair, "role", ""))
+    refined.chair.name = normalize_person_name(refined.chair.name)
+    if getattr(refined.chair, "name_display", ""):
+        refined.chair.name_display = normalize_person_display(refined.chair.name_display)
     refined.chair.affiliation = normalize_space(refined.chair.affiliation)
 
     for t in refined.talks:
@@ -4006,8 +4086,91 @@ async def ai_refine_json(
 
     refined = postprocess_refined(refined, speaker_map, time_candidates)
 
+    DATETIME_NOTE_PAT = re.compile(r"^[※\*]\s*.+")
     DATE_PAT = re.compile(r"(20\d{2}年\s*\d{1,2}月\s*\d{1,2}日(?:\s*（[^）]+）)?)")
     TIME_RANGE_PAT2 = re.compile(r"(\d{1,2}:\d{2}\s*[～〜\-ー~]\s*\d{1,2}:\d{2})")
+
+    def extract_datetime_note_from_blocks(blocks: List[TextBlock]) -> str:
+        if not blocks:
+            return ""
+
+        def norm(s: str) -> str:
+            return normalize_space(s or "")
+
+        # 1) まず datetime 候補ブロックを探す
+        datetime_blocks: List[TextBlock] = []
+        for b in blocks:
+            txt = norm(b.text)
+            txt2 = normalize_time_colon(txt)
+
+            has_date = bool(DATE_PAT.search(txt))
+            has_time = bool(TIME_RANGE_PAT2.search(txt2))
+            has_datetime_label = "日時" in txt
+
+            # 日付 or 時間 or 日時ラベルを含むものを候補に
+            if has_date or has_time or has_datetime_label:
+                datetime_blocks.append(b)
+
+        if not datetime_blocks:
+            return ""
+
+        # 2) ※注釈候補を探す
+        note_candidates: List[TextBlock] = []
+        for b in blocks:
+            txt = norm(b.text)
+
+            if not DATETIME_NOTE_PAT.match(txt):
+                continue
+
+            # 長すぎる注意書きは除外
+            if len(txt) > 60:
+                continue
+
+            # 複数行の長文注意書きは除外
+            if "\n" in txt and len(txt.splitlines()) >= 3:
+                continue
+
+            # よくある注意本文を除外
+            ng_keywords = [
+                "ご視聴", "事前参加", "旅費", "ご了承ください", "担当者へご連絡",
+                "医療従事者", "学生", "ご参加はご遠慮"
+            ]
+            if any(k in txt for k in ng_keywords):
+                continue
+
+            note_candidates.append(b)
+
+        if not note_candidates:
+            return ""
+
+        # 3) datetimeブロック近傍の note をスコアリング
+        best_text = ""
+        best_score = None
+
+        for note in note_candidates:
+            note_txt = norm(note.text)
+
+            for dt in datetime_blocks:
+                dx = abs(note.left - dt.left)
+                dy = abs(note.top - dt.top)
+
+                # 下にある注釈をやや優先
+                below_bonus = 0 if note.top >= dt.top else 200000
+
+                # 遠すぎるものは除外
+                if dy > 1200000:
+                    continue
+                if dx > 5000000:
+                    continue
+
+                score = dy + dx * 0.15 + below_bonus
+
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_text = note_txt
+
+        return best_text
+    
 
     def extract_datetime_from_blocks_v2(blocks: List[TextBlock]) -> str:
         lines = [normalize_space(x) for x in blocks_to_lines(blocks) if normalize_space(x)]
@@ -4067,6 +4230,12 @@ async def ai_refine_json(
     # ルールで取れてるなら AI の datetime は上書き（＝揺れが消える）
     if rule_dt:
         refined.datetime = normalize_space(rule_dt)
+
+    rule_dt_note = extract_datetime_note_from_blocks(blocks)
+    if rule_dt_note:
+        refined.datetime_note = normalize_space(rule_dt_note)
+    else:
+        refined.datetime_note = normalize_space(refined.datetime_note)
 
     if not refined.organizer:
         refined.organizer = extract_organizer_from_blocks(blocks)
@@ -4191,7 +4360,7 @@ def parse_blocks_to_design_json(blocks: List[TextBlock]) -> DesignJSON:
         event_title=event_title,
         datetime=normalize_space(dt),
         organizer=normalize_space(org),
-        chair=Chair(name=chair.name, name_display=chair.name_display, affiliation=chair.affiliation),
+        chair=Chair(role=chair.role, name=chair.name, name_display=chair.name_display, affiliation=chair.affiliation),
         talks=talks[:4],
         warnings=sorted(set(warnings)),
         confidence=confidence,
@@ -4292,12 +4461,12 @@ TIME_RANGE_PAT = re.compile(
     r"\d{1,2}[:：]\d{2}\s*[~\-–—−－〜～]\s*\d{1,2}[:：]\d{2}"
 )
 
-ROLE_PAT = re.compile(r"(演者|座長)")
+ROLE_PAT = re.compile(r"(演者|総合司会|司会|総合座長|座長)")
 
 def clean_speaker_text(s: str) -> str:
     s = str(s or "")
     s = TIME_RANGE_PAT.sub("", s)      # 時間帯を除去
-    s = ROLE_PAT.sub("", s)            # 演者/座長を除去
+    s = ROLE_PAT.sub("", s)            # 演者/司会/座長系を除去
     s = re.sub(r"\s+", " ", s).strip()
 
     # 漢字間の変なスペースは潰す（前 田潤 → 前田潤）
@@ -4701,6 +4870,8 @@ def normalize_speaker_display(payload: DesignJSON) -> DesignJSON:
     if getattr(payload, "chair", None):
         ch = payload.chair
         if (ch.name or "").strip():
+            if not (ch.role or "").strip():
+                ch.role = detect_chair_role((ch.name_display or "") + " " + (ch.name or ""))
             if not (ch.name_display or "").strip():
                 ch.name_display = add_space_to_jp_name(ch.name)
 

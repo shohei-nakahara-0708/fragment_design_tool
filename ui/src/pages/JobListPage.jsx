@@ -825,7 +825,6 @@ export default function JobListPage() {
             style={{
               fontWeight: 900,
               fontSize: 16,
-              whiteSpace: "nowrap",
               overflow: "hidden",
               textOverflow: "ellipsis",
             }}
@@ -874,7 +873,7 @@ export default function JobListPage() {
                     </div>
         </div>
 
-        <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ display: "flex", gap: 10,flex:1,whiteSpace: "nowrap", justifyContent: "flex-end", alignItems: "center" }}>
           <button
             style={{
               padding: "10px 14px",
