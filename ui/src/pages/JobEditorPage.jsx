@@ -756,7 +756,7 @@ export default function JobEditorPage() {
                   ← 一覧へ
                 </Link>
               </div>
-              <div style={ui.h2}>編集: {(json.event_title_lines || []).join("")}_{json.event_id || ""}</div>
+              <div style={ui.h2}>編集: {json.event_id || ""}_{(json.event_title_lines || []).join("")}</div>
             </div>
           }
           right={<span style={ui.badge(statusTone)}>{statusText}</span>}
