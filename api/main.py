@@ -179,29 +179,49 @@ TYPESET_JS = r"""
     }
 
     // 3) Dash separator: prefer " space-dash-space "
-    const dashRe = /([\–—−－])/;  // まずダッシュを見つける
+const dashRe = /([\-–—−－])/;
 const m = dashRe.exec(s);
 if (m && m.index > 0) {
   const dashPos = m.index;
-  const a = s.slice(0, dashPos).trimEnd();
-  const dashChar = s[dashPos];
-  const rest = s.slice(dashPos + 1).trim();
-  const b = (dashChar + rest).trimStart(); // 2行目は dash から（"-当院に…"）
+  const a = s.slice(0, dashPos + 1).trimEnd(); // ← ハイフンを前行に残す
+  const b = s.slice(dashPos + 1).trimStart();
   if (a && b) return [a, b];
 }
 
+const shouldIgnoreParenSubtitle = (s, idx) => {
+  const open = s[idx];
+  const close = open === "（" ? "）" : ")";
+
+  const endIdx = s.indexOf(close, idx + 1);
+  if (endIdx === -1) return false;
+
+  const inside = s.slice(idx + 1, endIdx).trim();
+
+  // よくある短い注記は改行しない
+  const ignoreWords = new Set([
+    "仮", "予定", "案", "再", "改", "新", "案1", "案2", "案3"
+  ]);
+
+  if (ignoreWords.has(inside)) return true;
+
+  // かなり短い括弧注記は改行しない
+  if (inside.length <= 2) return true;
+
+  return false;
+};
+
 
 idx = s.indexOf("（");
-if (idx > 0) {
+if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
   const a = s.slice(0, idx).trimEnd();
-  const b = s.slice(idx).trimStart(); // 2行目は必ず「（」から
+  const b = s.slice(idx).trimStart();
   if (a && b) return [a, b];
 }
 
 idx = s.indexOf("(");
-if (idx > 0) {
+if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
   const a = s.slice(0, idx).trimEnd();
-  const b = s.slice(idx).trimStart(); // 2行目は必ず「(」から
+  const b = s.slice(idx).trimStart();
   if (a && b) return [a, b];
 }
 
@@ -438,7 +458,7 @@ class TimeCand:
 
 # ---------------- Utilities ----------------
 BREAK_CHARS = ["／", "/", "・", " ", "　", "～", "~", "-", "－", "—", "–", "（", "(", "）", ")", "、", "。", ":", "："]
-DROP_AT_BREAK = set(["-", "－", "—", "–"])
+DROP_AT_BREAK = set(["－", "—", "–"])
 
 EMU_PER_PT = 12700
 
@@ -1965,6 +1985,11 @@ def normalize_organizer(org: str) -> str:
 
 KANJI_NAME_PAT = re.compile(r"^[\u4E00-\u9FFF]{2,6}$")
 
+ONE_CHAR_LASTNAMES = {
+    "森", "林", "原", "堀", "関", "郭", "秦", "東", "西", "南", "北",
+    "辻", "堤", "岸", "今", "岡", "萩", "星", "楊", "呉", "文", "李"
+}
+
 def add_space_to_jp_name(name: str) -> str:
     raw = str(name or "")
     s = raw.replace("\u3000", " ").strip()
@@ -1974,14 +1999,17 @@ def add_space_to_jp_name(name: str) -> str:
     # すでに「2塊」っぽい（改行/空白）なら、それを尊重
     parts = [p for p in re.split(r"\s+", s) if p]
     if len(parts) >= 2:
-        # 「座長」「先生」など混ざってる可能性があるので軽く掃除
         joined = "".join(parts)
         joined = re.sub(r"^(座長|演者|司会|講師|:|：)\s*", "", joined)
         joined = re.sub(r"(先生)\s*$", "", joined)
-        # 元のpartsから再構成（姓/名っぽく2つに寄せる）
-        # 例: ["阿部","弘太郎"] をそのまま使う
-        if len(parts[0]) >= 1 and len(parts[1]) >= 1:
-            return f"{parts[0]} {parts[1]}"
+
+        # 先頭が役職だけなら次を姓名として使う
+        clean_parts = [re.sub(r"^(座長|演者|司会|講師|:|：)\s*", "", p) for p in parts]
+        clean_parts = [re.sub(r"(先生)\s*$", "", p) for p in clean_parts]
+        clean_parts = [p for p in clean_parts if p]
+
+        if len(clean_parts) >= 2 and len(clean_parts[0]) >= 1 and len(clean_parts[1]) >= 1:
+            return f"{clean_parts[0]} {clean_parts[1]}"
 
     # 以降はスペース無しの本体で推定
     core = re.sub(r"\s+", "", s)
@@ -1995,14 +2023,19 @@ def add_space_to_jp_name(name: str) -> str:
     n = len(core)
     if n <= 2:
         return core
+
+    # 1文字姓の救済
+    if n >= 3 and core[0] in ONE_CHAR_LASTNAMES:
+        return core[:1] + " " + core[1:]
+
     if n == 3:
         return core[:2] + " " + core[2:]      # 前田 潤
     if n == 4:
         return core[:2] + " " + core[2:]      # 山田 太郎
     if n == 5:
-        return core[:2] + " " + core[2:]      # 阿部 弘太郎（2+3 を優先）
+        return core[:2] + " " + core[2:]      # 阿部 弘太郎
     if n == 6:
-        return core[:3] + " " + core[3:]      # 佐々木 健太郎 など
+        return core[:3] + " " + core[3:]      # 佐々木 健太郎
     return core
 
 def now_iso() -> str:
@@ -3288,6 +3321,7 @@ def _extract_name_anywhere(s: str) -> str:
             continue
         filtered.append(t)
     return (filtered[-1] if filtered else cands[-1]).strip()
+    
 
 def split_speaker_affiliation_fuzzy(s: str) -> tuple[str, str]:
     s = normalize_space(s or "")
@@ -3319,6 +3353,43 @@ def split_speaker_affiliation_fuzzy(s: str) -> tuple[str, str]:
         return name, aff
 
     return "", s
+
+SPEAKER_ROLE_WORDS = [
+    "教授", "特任教授", "准教授", "特任准教授",
+    "講師", "特任講師", "助教", "特任助教",
+    "医長", "部長", "院長", "副院長", "センター長", "主任"
+]
+
+def extract_role_name_block(text: str) -> tuple[str, str]:
+    lines = [normalize_space(x) for x in str(text or "").split("\n") if normalize_space(x)]
+    if not lines:
+        return "", ""
+
+    # 2行: 講師 / 森啓一郎先生
+    if len(lines) >= 2 and lines[0] in SPEAKER_ROLE_WORDS and "先生" in lines[1]:
+        return lines[0], normalize_space(lines[1]).replace("先生", "").strip()
+
+    # 1行: 講師 森啓一郎先生
+    one = normalize_space(" ".join(lines))
+    for role in SPEAKER_ROLE_WORDS:
+        m = re.match(rf"^{re.escape(role)}\s*(.+?)先生$", one)
+        if m:
+            return role, normalize_space(m.group(1))
+
+    return "", ""
+
+
+def append_role_to_affiliation(affiliation: str, role: str) -> str:
+    aff = normalize_space(affiliation or "")
+    role = normalize_space(role or "")
+    if not role:
+        return aff
+    if not aff:
+        return role
+    if role in aff:
+        return aff
+    return f"{aff} {role}".strip()
+
 
 def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]) -> List[Talk]:
     """
@@ -3355,6 +3426,12 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             return False
         if is_time_line(s):
             return False
+
+        # 役職 + 氏名ブロックは affiliation 扱いしない
+        role2, name2 = extract_role_name_block(s)
+        if role2 and name2:
+            return False
+
         return any(k in s for k in [
             "病院", "クリニック", "医院", "診療所", "大学", "センター", "機構", "総合病院",
             "内科", "外科", "部", "科",
@@ -3635,9 +3712,27 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             speaker = ""
             affiliation = ""
             aff_candidates: List[str] = []
+            pending_role = ""
 
             for j, s in enumerate(seg_lines):
                 k = normalize_key(s)
+                print("ROLE_CHECK", repr(s), "=>", extract_role_name_block(s))
+
+                role2, name2 = extract_role_name_block(s)
+                if role2 and name2:
+                    if not speaker:
+                        speaker = norm_name(name2)
+                    pending_role = role2
+                    continue
+
+                # if not speaker:
+                #     role2, name2 = extract_role_name_block(s)
+                #     if role2 and name2:
+                #         speaker = norm_name(name2)
+                #         pending_role = role2
+                #         if role2 not in aff_candidates:
+                #             aff_candidates.append(role2)
+                #         continue
 
                 if not title_lines and "演題" in k:
                     t = strip_label(["演題", "演題:", "演題："], s)
@@ -3670,11 +3765,16 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
 
                 # 「演者」ラベルが無いテンプレ用：名前っぽい行
                 if not speaker and looks_like_name_line(s):
-                    sp2, aff2 = split_speaker_affiliation_fuzzy(s)
-                    if sp2:
-                        speaker = norm_name(sp2)
-                        if not affiliation and aff2 and is_aff_line(aff2):
-                            affiliation = aff2
+                    role2, name2 = extract_role_name_block(s)
+                    if role2 and name2:
+                        speaker = norm_name(name2)
+                        pending_role = role2
+                    else:
+                        sp2, aff2 = split_speaker_affiliation_fuzzy(s)
+                        if sp2:
+                            speaker = norm_name(sp2)
+                            if not affiliation and aff2 and is_aff_line(aff2):
+                                affiliation = aff2
 
                 if is_aff_line(s):
                     # affiliation候補として積む前に、末尾人名が付いてたら分離
@@ -3704,6 +3804,12 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             if speaker and not affiliation:
                 affiliation = aff_from_speaker_map(speaker)
 
+            if pending_role:
+                affiliation = append_role_to_affiliation(affiliation, pending_role)
+
+            print(affiliation)
+
+          
             # タイトル fallback: 「演題」ラベルが無いテンプレ用
             if not title_lines:
                 for s in seg_lines:
@@ -4905,6 +5011,79 @@ def prune_talks_heuristic_only(payload: DesignJSON) -> DesignJSON:
     payload.warnings = sorted(set((payload.warnings or []) + ["talks_pruned_heuristic_only"]))
     return payload
 
+
+def append_vm_role_to_affiliations(payload, vm_rows: list[dict]) -> None:
+    if not vm_rows:
+        return
+
+    def norm_key(s: str) -> str:
+        return normalize_space(s or "").replace(" ", "").replace("　", "")
+
+    def get_data(row: dict) -> dict:
+        if isinstance(row, dict) and "data" in row and isinstance(row["data"], dict):
+            return row["data"]
+        return row if isinstance(row, dict) else {}
+
+    def merge_aff_role(affiliation: str, role: str) -> str:
+        aff = normalize_space(affiliation or "")
+        role = normalize_space(role or "")
+        if not role:
+            return aff
+        if not aff:
+            return role
+        if role in aff:
+            return aff
+        return f"{aff} {role}".strip()
+
+    # 医師名ベース index
+    vm_by_name: dict[str, dict] = {}
+    chair_candidates: list[dict] = []
+
+    for row in vm_rows:
+        d = get_data(row)
+
+        doctor = norm_key(d.get("案内状掲載 医師名", ""))
+        role = normalize_space(d.get("案内状掲載 役職", "") or "")
+        row_role = normalize_space(d.get("役職", "") or "")
+
+        if doctor:
+            vm_by_name[doctor] = d
+
+        if row_role in {"座長", "総合座長", "司会", "総合司会"}:
+            chair_candidates.append(d)
+
+    # talks
+    for t in getattr(payload, "talks", []) or []:
+        sp = norm_key(getattr(t, "speaker", ""))
+        if not sp:
+            continue
+
+        vm = vm_by_name.get(sp)
+        if not vm:
+            continue
+
+        role = normalize_space(vm.get("案内状掲載 役職", "") or "")
+        if role:
+            t.affiliation = merge_aff_role(getattr(t, "affiliation", ""), role)
+
+    # chair
+    chair = getattr(payload, "chair", None)
+    if chair:
+        chair_name = norm_key(getattr(chair, "name", ""))
+        if chair_name:
+            vm = vm_by_name.get(chair_name)
+            if not vm:
+                # 保険: 役職列が座長系のものから名前一致を探す
+                for d in chair_candidates:
+                    if norm_key(d.get("案内状掲載 医師名", "")) == chair_name:
+                        vm = d
+                        break
+
+            if vm:
+                role = normalize_space(vm.get("案内状掲載 役職", "") or "")
+                if role:
+                    chair.affiliation = merge_aff_role(getattr(chair, "affiliation", ""), role)
+
 async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_blocks_path: Optional[Path] = None) -> DesignJSON:
     """PPTX優先。VMは精度を上げるヒントとして blocks からの拾い直しにのみ使用し、欠損時のみVMで補完する。"""
     blocks = extract_blocks_any(pptx_path, first_only=True)
@@ -4949,6 +5128,10 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
         refined = prune_talks_heuristic_only(refined)
         
     print("after VM hint application:")
+    print(refined)
+
+    append_vm_role_to_affiliations(refined, vm_rows)
+    print("after VM role append:")
     print(refined)
 
 
