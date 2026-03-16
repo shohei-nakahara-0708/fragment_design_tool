@@ -179,7 +179,7 @@ TYPESET_JS = r"""
     }
 
     // 3) Dash separator: prefer " space-dash-space "
-const dashRe = /([\-–—−－])/;
+const dashRe = /([\–—−－])/;
 const m = dashRe.exec(s);
 if (m && m.index > 0) {
   const dashPos = m.index;
@@ -5011,49 +5011,22 @@ def prune_talks_heuristic_only(payload: DesignJSON) -> DesignJSON:
     payload.warnings = sorted(set((payload.warnings or []) + ["talks_pruned_heuristic_only"]))
     return payload
 
-
-def append_vm_role_to_affiliations(payload, vm_rows: list[dict]) -> None:
-    if not vm_rows:
+def append_vm_role_to_talk_affiliation(payload, vm_rows: list[dict]) -> None:
+    if not vm_rows or not getattr(payload, "talks", None):
         return
 
     def norm_key(s: str) -> str:
         return normalize_space(s or "").replace(" ", "").replace("　", "")
 
-    def get_data(row: dict) -> dict:
-        if isinstance(row, dict) and "data" in row and isinstance(row["data"], dict):
-            return row["data"]
-        return row if isinstance(row, dict) else {}
-
-    def merge_aff_role(affiliation: str, role: str) -> str:
-        aff = normalize_space(affiliation or "")
-        role = normalize_space(role or "")
-        if not role:
-            return aff
-        if not aff:
-            return role
-        if role in aff:
-            return aff
-        return f"{aff} {role}".strip()
-
-    # 医師名ベース index
-    vm_by_name: dict[str, dict] = {}
-    chair_candidates: list[dict] = []
-
-    for row in vm_rows:
-        d = get_data(row)
-
+    # 医師名ベースで VM を引けるようにする
+    vm_by_name = {}
+    for r in vm_rows:
+        d = r if isinstance(r, dict) and "data" not in r else (r.get("data") or {})
         doctor = norm_key(d.get("案内状掲載 医師名", ""))
-        role = normalize_space(d.get("案内状掲載 役職", "") or "")
-        row_role = normalize_space(d.get("役職", "") or "")
-
         if doctor:
             vm_by_name[doctor] = d
 
-        if row_role in {"座長", "総合座長", "司会", "総合司会"}:
-            chair_candidates.append(d)
-
-    # talks
-    for t in getattr(payload, "talks", []) or []:
+    for t in payload.talks:
         sp = norm_key(getattr(t, "speaker", ""))
         if not sp:
             continue
@@ -5063,26 +5036,14 @@ def append_vm_role_to_affiliations(payload, vm_rows: list[dict]) -> None:
             continue
 
         role = normalize_space(vm.get("案内状掲載 役職", "") or "")
-        if role:
-            t.affiliation = merge_aff_role(getattr(t, "affiliation", ""), role)
+        if not role:
+            continue
 
-    # chair
-    chair = getattr(payload, "chair", None)
-    if chair:
-        chair_name = norm_key(getattr(chair, "name", ""))
-        if chair_name:
-            vm = vm_by_name.get(chair_name)
-            if not vm:
-                # 保険: 役職列が座長系のものから名前一致を探す
-                for d in chair_candidates:
-                    if norm_key(d.get("案内状掲載 医師名", "")) == chair_name:
-                        vm = d
-                        break
+        aff = normalize_space(getattr(t, "affiliation", "") or "")
+        if role and role not in aff:
+            t.affiliation = f"{aff} {role}".strip() if aff else role
 
-            if vm:
-                role = normalize_space(vm.get("案内状掲載 役職", "") or "")
-                if role:
-                    chair.affiliation = merge_aff_role(getattr(chair, "affiliation", ""), role)
+
 
 async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_blocks_path: Optional[Path] = None) -> DesignJSON:
     """PPTX優先。VMは精度を上げるヒントとして blocks からの拾い直しにのみ使用し、欠損時のみVMで補完する。"""
@@ -5130,7 +5091,7 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
     print("after VM hint application:")
     print(refined)
 
-    append_vm_role_to_affiliations(refined, vm_rows)
+    append_vm_role_to_talk_affiliation(refined, vm_rows)
     print("after VM role append:")
     print(refined)
 
