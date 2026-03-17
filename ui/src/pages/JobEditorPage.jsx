@@ -1,14 +1,15 @@
-import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import { Link, useParams } from "react-router-dom";
 
 /**
  * ✅ この編集画面は以下を満たします
  * - 右のPreviewは sticky + スクロール枠
  * - 0.5秒デバウンスでリアルタイムレンダ（autoRender ON）
- * - /render へ { jobId, design } をPOST（※サーバ側 RenderReq に合わせて）
- * - hero の applyOverridesToLines 用に title_overrides を編集できる（配列追加/削除）
- * - talks も同じ仕組みで talk.title_overrides を編集できる
- * - datetime_parts と datetime の同期、timeはtextareaで改行OK
+ * - /render へ { jobId, design } をPOST
+ * - title_overrides / talk.title_overrides を編集可能
+ * - datetime_parts と datetime の同期
+ * - 必須項目未入力時に赤枠表示
+ * - Save & Render時にバリデーション
  */
 
 const API_BASE = import.meta.env.VITE_API_BASE || "";
@@ -21,7 +22,7 @@ function tryParseJson(text) {
   }
 }
 
-/** ---------- UI primitives (no deps) ---------- **/
+/** ---------- UI ---------- **/
 const ui = {
   page: {
     display: "grid",
@@ -41,6 +42,7 @@ const ui = {
     fontWeight: 900,
     cursor: "pointer",
   },
+
   leftCol: { display: "grid", gap: 12, alignContent: "start" },
   rightCol: {
     display: "grid",
@@ -50,6 +52,7 @@ const ui = {
     top: 16,
     height: "calc(100vh - 32px)",
   },
+
   card: {
     background: "#fff",
     border: "1px solid #e7e7e7",
@@ -57,10 +60,17 @@ const ui = {
     padding: 14,
     boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
   },
-  headerRow: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12,marginBottom: 8 },
+  headerRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 12,
+    marginBottom: 8,
+  },
   h2: { margin: "6px 0 0", fontSize: 18, fontWeight: 800, letterSpacing: 0.2 },
   h3: { margin: 0, fontSize: 13, fontWeight: 800, color: "#222" },
   muted: { fontSize: 12, color: "#666" },
+
   badge: (tone = "gray") => {
     const base = {
       display: "inline-flex",
@@ -94,6 +104,11 @@ const ui = {
     outline: "none",
     background: "#fff",
     boxSizing: "border-box",
+  },
+  controlError: {
+    border: "1px solid #ef4444",
+    background: "#fff7f7",
+    boxShadow: "0 0 0 3px rgba(239,68,68,0.08)",
   },
   textarea: { resize: "vertical" },
 
@@ -154,6 +169,11 @@ const ui = {
 
   divider: { height: 1, background: "#eee", margin: "12px 0" },
   softBox: { border: "1px dashed #ddd", borderRadius: 12, padding: 12, background: "#fcfcfc" },
+  errorText: {
+    fontSize: 12,
+    color: "#dc2626",
+    fontWeight: 700,
+  },
 };
 
 const styles = {
@@ -167,11 +187,12 @@ const styles = {
   },
 };
 
-function Control({ as = "input", style, ...props }) {
+function Control({ as = "input", invalid = false, style, ...props }) {
   const Tag = as;
   const merged = {
     ...ui.controlBase,
     ...(as === "textarea" ? ui.textarea : {}),
+    ...(invalid ? ui.controlError : null),
     ...style,
   };
   return <Tag style={merged} {...props} />;
@@ -220,13 +241,10 @@ function ensureBaseDefaults(j) {
     };
   }
 
-  if (!next.chair) next.chair = { name_display: "", affiliation: "" };
+  if (!next.chair) next.chair = { role: "", name_display: "", affiliation: "", honorific_title: "先生" };
   if (!Array.isArray(next.talks)) next.talks = [];
-
-  // hero override (applyOverridesToLines の入力)
   if (!Array.isArray(next.title_overrides)) next.title_overrides = [];
 
-  // talks override
   next.talks = next.talks.map((t) => ({
     time: t?.time ?? "",
     title: t?.title ?? "",
@@ -234,30 +252,76 @@ function ensureBaseDefaults(j) {
     speaker: t?.speaker ?? "",
     speaker_display: t?.speaker_display ?? "",
     affiliation: t?.affiliation ?? "",
-      honorific_title: t?.honorific_title ?? "",
-    // ここが追加ポイント
+    honorific_title: t?.honorific_title ?? "先生",
     title_overrides: Array.isArray(t?.title_overrides) ? t.title_overrides : [],
   }));
 
   return next;
 }
 
+function isBlank(v) {
+  return v == null || String(v).trim() === "";
+}
+
+function hasAnyLine(lines) {
+  return Array.isArray(lines) && lines.some((x) => !isBlank(x));
+}
+
+function validateJob(json) {
+  const e = {};
+
+  if (!json) return e;
+
+  if (!hasAnyLine(json.event_title_lines)) {
+    e.event_title_lines = "イベントタイトルは必須です";
+  }
+
+  if (isBlank(json.region)) {
+    e.region = "VP/PH/ONC は必須です";
+  }
+
+  if (isBlank(json.datetime_parts?.year)) e.datetime_year = "年は必須です";
+  if (isBlank(json.datetime_parts?.month)) e.datetime_month = "月は必須です";
+  if (isBlank(json.datetime_parts?.day)) e.datetime_day = "日は必須です";
+  if (isBlank(json.datetime_parts?.dow)) e.datetime_dow = "曜日は必須です";
+  if (isBlank(json.datetime_parts?.time)) e.datetime_time = "時間は必須です";
+
+  // if (isBlank(json.chair?.role)) e.chair_role = "役職は必須です";
+  // if (isBlank(json.chair?.name_display)) e.chair_name_display = "名前は必須です";
+  // if (isBlank(json.chair?.affiliation)) e.chair_affiliation = "所属は必須です";
+
+  if (!Array.isArray(json.talks) || json.talks.length === 0) {
+    e.talks = "講演を1件以上入力してください";
+  } else {
+    json.talks.forEach((t, i) => {
+      // if (isBlank(t?.time)) e[`talk_${i}_time`] = "時間は必須です";
+      if (!hasAnyLine(t?.title_lines)) e[`talk_${i}_title_lines`] = "タイトルは必須です";
+      if (isBlank(t?.speaker_display)) e[`talk_${i}_speaker_display`] = "演者は必須です";
+      if (isBlank(t?.affiliation)) e[`talk_${i}_affiliation`] = "所属は必須です";
+    });
+  }
+
+  return e;
+}
+
 /** ---------- Editors ---------- **/
-const ChairEditor = React.memo(function ChairEditor({ chair, updateAtPath }) {
+const ChairEditor = React.memo(function ChairEditor({ chair, updateAtPath, errors }) {
   const c = chair || {};
   return (
-    <Card title={c.role}>
+    <Card title={c.role || "座長 / 総合司会"}>
       <Field label="役職">
-            <Control
-              as="select"
-              value={c.role || ""}
-              onChange={(e) => updateAtPath(["chair", "role"], e.target.value)}
-            >
-              <option value="">-- 選択してください --</option>
-              <option value="座長">座長</option>
-              <option value="総合司会">総合司会</option>
-            </Control>
-          </Field>
+        <Control
+          as="select"
+          
+          value={c.role || ""}
+          onChange={(e) => updateAtPath(["chair", "role"], e.target.value)}
+        >
+          <option value="">-- 選択してください --</option>
+          <option value="座長">座長</option>
+          <option value="総合司会">総合司会</option>
+        </Control>
+     
+      </Field>
 
       <Field label="名前">
         <Control
@@ -265,20 +329,20 @@ const ChairEditor = React.memo(function ChairEditor({ chair, updateAtPath }) {
           onChange={(e) => updateAtPath(["chair", "name_display"], e.target.value)}
         />
       </Field>
-       <Field label="敬称">
-            <Control
-              as="select"
-              value={c.honorific_title || ""}
-              onChange={(e) => updateAtPath(["chair", "honorific_title"], e.target.value)}
-            >
-              <option value="">-- 選択してください --</option>
-              <option value="先生">先生</option>
-              <option value="様">様</option>
+
+      <Field label="敬称">
+        <Control
+          as="select"
+          value={c.honorific_title || ""}
+          onChange={(e) => updateAtPath(["chair", "honorific_title"], e.target.value)}
+        >
+          <option value="">-- 選択してください --</option>
+          <option value="先生">先生</option>
+          <option value="様">様</option>
           <option value="さん">さん</option>
           <option value=""></option>
-            </Control>
-          </Field>
-
+        </Control>
+      </Field>
 
       <Field label="所属">
         <Control
@@ -298,7 +362,7 @@ function OverrideRow({ o, onChange, onDelete, labelPrefix = "" }) {
   return (
     <div style={{ ...ui.softBox, padding: 10 }}>
       <div style={ui.headerRow}>
-        <div style={{ fontWeight: 800, fontSize: 12 }}>{labelPrefix} 装飾指定</div>
+        <div style={{ fontWeight: 800, fontSize: 12 }}>{labelPrefix}装飾指定</div>
         <button type="button" onClick={onDelete} style={ui.btn("danger")}>
           削除
         </button>
@@ -313,13 +377,6 @@ function OverrideRow({ o, onChange, onDelete, labelPrefix = "" }) {
           onChange={(e) => set("index", e.target.value === "" ? null : Number(e.target.value))}
         />
 
-        {/* <div style={ui.muted}>target</div>
-        <Control
-          value={o?.target ?? ""}
-          placeholder="部分一致（例: ～肺炎球菌ワクチン）"
-          onChange={(e) => set("target", e.target.value)}
-        /> */}
-
         <div style={ui.muted}>フォントサイズ</div>
         <Control
           type="number"
@@ -327,21 +384,6 @@ function OverrideRow({ o, onChange, onDelete, labelPrefix = "" }) {
           placeholder="例: 28"
           onChange={(e) => set("font_size", e.target.value === "" ? null : Number(e.target.value))}
         />
-
-        {/* <div style={ui.muted}>font_weight</div>
-        <Control
-          type="number"
-          value={o?.font_weight ?? ""}
-          placeholder="例: 700"
-          onChange={(e) => set("font_weight", e.target.value === "" ? null : Number(e.target.value))}
-        /> */}
-
-        {/* <div style={ui.muted}>color</div>
-        <Control
-          value={o?.color ?? ""}
-          placeholder="#4b8d41"
-          onChange={(e) => set("color", e.target.value)}
-        /> */}
 
         <div style={ui.muted}>letter_spacing</div>
         <Control
@@ -358,18 +400,7 @@ function OverrideRow({ o, onChange, onDelete, labelPrefix = "" }) {
           placeholder="例: 35"
           onChange={(e) => set("line_height", e.target.value === "" ? null : Number(e.target.value))}
         />
-{/* 
-        <div style={ui.muted}>font_family</div>
-        <Control
-          value={o?.font_family ?? ""}
-          placeholder='例: "Invention JP"'
-          onChange={(e) => set("font_family", e.target.value)}
-        /> */}
       </div>
-
-      {/* <div style={{ marginTop: 8, fontSize: 11, color: "#777" }}>
-        index があれば index 優先。無ければ target（部分一致）で適用。
-      </div> */}
     </div>
   );
 }
@@ -402,8 +433,6 @@ const HeroOverridesEditor = React.memo(function HeroOverridesEditor({ json, upda
         </button>
       }
     >
-     
-
       {arr.length === 0 ? <div style={{ ...ui.muted, marginTop: 8 }}>まだ指定された装飾はありません。</div> : null}
 
       <div style={{ display: "grid", gap: 10, marginTop: 10 }}>
@@ -421,7 +450,7 @@ const HeroOverridesEditor = React.memo(function HeroOverridesEditor({ json, upda
   );
 });
 
-const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath }) {
+const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath, errors }) {
   const arr = Array.isArray(talks) ? talks : [];
   const setTalkField = (idx, key, value) => updateAtPath(["talks", idx, key], value);
 
@@ -436,7 +465,7 @@ const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath }) {
         speaker_display: "",
         affiliation: "",
         title_overrides: [],
-          honorific_title: "先生",
+        honorific_title: "先生",
       },
     ];
     updateAtPath(["talks"], next);
@@ -450,7 +479,7 @@ const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath }) {
   const addTalkOverride = (idx) => {
     const cur = arr[idx] || {};
     const curOv = Array.isArray(cur.title_overrides) ? cur.title_overrides : [];
-    const nextOv = [...curOv, { index: null, target: "", font_size: 25,  color: "" }];
+    const nextOv = [...curOv, { index: null, target: "", font_size: 25, color: "" }];
     setTalkField(idx, "title_overrides", nextOv);
   };
 
@@ -469,10 +498,6 @@ const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath }) {
     setTalkField(talkIdx, "title_overrides", nextOv);
   };
 
-
-
-  
-
   return (
     <Card
       title="講演"
@@ -483,6 +508,7 @@ const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath }) {
       }
     >
       {arr.length === 0 ? <div style={ui.muted}>講演がありません。右上から追加できます。</div> : null}
+      {errors.talks ? <div style={{ ...ui.errorText, marginTop: 8 }}>{errors.talks}</div> : null}
 
       {arr.map((t, idx) => (
         <div key={idx} style={{ marginTop: 12 }}>
@@ -495,47 +521,61 @@ const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath }) {
             </div>
 
             <Field label="時間" help="例: 19:00〜19:20">
-              <Control value={t.time || ""} onChange={(e) => setTalkField(idx, "time", e.target.value)} />
+              <Control
+               
+                value={t.time || ""}
+                onChange={(e) => setTalkField(idx, "time", e.target.value)}
+              />
+             
             </Field>
 
             <Field label="タイトル" help="改行で行分割">
               <Control
                 as="textarea"
                 rows={3}
+                invalid={!!errors[`talk_${idx}_title_lines`]}
                 value={(t.title_lines || []).join("\n")}
                 onChange={(e) => setTalkField(idx, "title_lines", e.target.value.split("\n"))}
               />
+              {errors[`talk_${idx}_title_lines`] ? <div style={ui.errorText}>{errors[`talk_${idx}_title_lines`]}</div> : null}
             </Field>
 
             <Field label="演者">
               <Control
+                invalid={!!errors[`talk_${idx}_speaker_display`]}
                 value={t.speaker_display || ""}
                 onChange={(e) => setTalkField(idx, "speaker_display", e.target.value)}
               />
+              {errors[`talk_${idx}_speaker_display`] ? (
+                <div style={ui.errorText}>{errors[`talk_${idx}_speaker_display`]}</div>
+              ) : null}
             </Field>
 
             <Field label="敬称">
-            <Control
-              as="select"
-              value={t.honorific_title || ""}
-              onChange={(e) => setTalkField(idx, "honorific_title", e.target.value)}
-            >
-              <option value="">-- 選択してください --</option>
-              <option value="先生">先生</option>
-              <option value="様">様</option>
-          <option value="さん">さん</option>
-          <option value=""></option>
-            </Control>
+              <Control
+                as="select"
+                value={t.honorific_title || ""}
+                onChange={(e) => setTalkField(idx, "honorific_title", e.target.value)}
+              >
+                <option value="">-- 選択してください --</option>
+                <option value="先生">先生</option>
+                <option value="様">様</option>
+                <option value="さん">さん</option>
+                <option value=""></option>
+              </Control>
             </Field>
-            
-         
+
             <Field label="所属">
               <Control
                 as="textarea"
                 rows={2}
+                invalid={!!errors[`talk_${idx}_affiliation`]}
                 value={t.affiliation || ""}
                 onChange={(e) => setTalkField(idx, "affiliation", e.target.value)}
               />
+              {errors[`talk_${idx}_affiliation`] ? (
+                <div style={ui.errorText}>{errors[`talk_${idx}_affiliation`]}</div>
+              ) : null}
             </Field>
 
             <div style={ui.divider} />
@@ -575,9 +615,10 @@ export default function JobEditorPage() {
   const [json, setJson] = useState(null);
   const [busy, setBusy] = useState(false);
   const [previewBuster, setPreviewBuster] = useState(Date.now());
-  const [errors, setErrors] = useState({}); // reserved (JSON textarea使うなら)
+  const [errors, setErrors] = useState({});
+  const [submitTried, setSubmitTried] = useState(false);
 
-  // --- realtime ---
+  // realtime
   const [autoRender, setAutoRender] = useState(true);
   const debounceRef = useRef(null);
   const lastSentRef = useRef("");
@@ -585,8 +626,6 @@ export default function JobEditorPage() {
   const pendingRef = useRef(false);
 
   useEffect(() => {
-    const API_BASE = import.meta.env.VITE_API_BASE || "";
-
     fetch(`${API_BASE}/job/${jobId}`)
       .then((r) => r.json())
       .then((d) => {
@@ -595,114 +634,121 @@ export default function JobEditorPage() {
       });
   }, [jobId]);
 
-  const saveRender = async (payload) => {
-    if (!payload) return;
-    if (Object.keys(errors).length > 0) return;
+ const saveRender = async (payload, { validate = true } = {}) => {
+  if (!payload) return;
 
-    if (inFlightRef.current) {
-      pendingRef.current = true;
-      return;
-    }
+  const nextErrors = validateJob(payload);
+  setErrors(nextErrors);
 
-    const s = JSON.stringify(payload);
-    if (s === lastSentRef.current) return;
-
-    inFlightRef.current = true;
-    setBusy(true);
-    try {
-     
-      const r = await fetch(`${API_BASE}/render`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jobId, design: payload }), // ← サーバの RenderReq に合わせて
-      });
-      if (!r.ok) throw new Error("render failed");
-      lastSentRef.current = s;
-      setPreviewBuster(Date.now());
-    } finally {
-      setBusy(false);
-      inFlightRef.current = false;
-
-      if (pendingRef.current) {
-        pendingRef.current = false;
-        Promise.resolve().then(() => {
-          setJson((cur) => {
-            if (cur) saveRender(cur);
-            return cur;
-          });
-        });
-      }
-    }
-  };
-
-    async function downloadWithFilename(url, filename) {
-  
-  const r = await fetch(`${API_BASE}${url}`, { cache: "no-store" });
-  if (!r.ok) throw new Error(`download failed: ${r.status} ${await r.text()}`);
-  const blob = await r.blob();
-  const a = document.createElement("a");
-  const objectUrl = URL.createObjectURL(blob);
-  a.href = objectUrl;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(objectUrl);
-  }
-  
-
-  const downloadBlob = (blob, filename) => {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-};
-
-
-  const getFilenameFromDisposition = (disposition) => {
-  // Content-Disposition: attachment; filename="xxx.zip"
-  if (!disposition) return null;
-  const m = /filename\*=UTF-8''([^;]+)|filename="([^"]+)"/i.exec(disposition);
-  const raw = (m && (m[1] || m[2])) ? (m[1] || m[2]) : null;
-  if (!raw) return null;
-  try {
-    return decodeURIComponent(raw);
-  } catch {
-    return raw;
-  }
-};
-
-  const exportOneZip = async (jobId, filename) => {
-  const API_BASE = import.meta.env.VITE_API_BASE || "";
-
-  const r = await fetch(`${API_BASE}/export/${encodeURIComponent(jobId)}.zip`);
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    alert(`export failed: ${r.status}\n${t}`);
+  if (validate && Object.keys(nextErrors).length > 0) {
+    setSubmitTried(true);
     return;
   }
 
-  const blob = await r.blob();
-  const cd = r.headers.get("Content-Disposition");
-  const suggested = getFilenameFromDisposition(cd);
-  // const filename = suggested || filename || `export_${jobId}.zip`;
+  if (inFlightRef.current) {
+    pendingRef.current = true;
+    return;
+  }
 
-  downloadBlob(blob, filename);
+  const s = JSON.stringify(payload);
+  if (s === lastSentRef.current) return;
+
+  inFlightRef.current = true;
+  setBusy(true);
+  try {
+    const r = await fetch(`${API_BASE}/render`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobId, design: payload }),
+    });
+    if (!r.ok) throw new Error("render failed");
+    lastSentRef.current = s;
+    setPreviewBuster(Date.now());
+  } finally {
+    setBusy(false);
+    inFlightRef.current = false;
+
+    if (pendingRef.current) {
+      pendingRef.current = false;
+      Promise.resolve().then(() => {
+        setJson((cur) => {
+          if (cur) saveRender(cur, { validate: false });
+          return cur;
+        });
+      });
+    }
+  }
 };
 
-  useEffect(() => {
-    if (!json || !autoRender) return;
-    if (Object.keys(errors).length > 0) return;
+  async function downloadWithFilename(url, filename) {
+    const r = await fetch(`${API_BASE}${url}`, { cache: "no-store" });
+    if (!r.ok) throw new Error(`download failed: ${r.status} ${await r.text()}`);
+    const blob = await r.blob();
+    const a = document.createElement("a");
+    const objectUrl = URL.createObjectURL(blob);
+    a.href = objectUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(objectUrl);
+  }
 
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => saveRender(json), 500);
-    return () => debounceRef.current && clearTimeout(debounceRef.current);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [json, autoRender, errors]);
+  const downloadBlob = (blob, filename) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const getFilenameFromDisposition = (disposition) => {
+    if (!disposition) return null;
+    const m = /filename\*=UTF-8''([^;]+)|filename="([^"]+)"/i.exec(disposition);
+    const raw = m && (m[1] || m[2]) ? m[1] || m[2] : null;
+    if (!raw) return null;
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
+  };
+
+  const exportOneZip = async (jobId, filename) => {
+    const r = await fetch(`${API_BASE}/export/${encodeURIComponent(jobId)}.zip`);
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      alert(`export failed: ${r.status}\n${t}`);
+      return;
+    }
+
+    const blob = await r.blob();
+    const cd = r.headers.get("Content-Disposition");
+    const suggested = getFilenameFromDisposition(cd);
+    downloadBlob(blob, suggested || filename);
+  };
+
+  useEffect(() => {
+    if (!submitTried || !json) return;
+    setErrors(validateJob(json));
+  }, [json, submitTried]);
+
+useEffect(() => {
+  if (!json || !autoRender) return;
+
+  if (debounceRef.current) clearTimeout(debounceRef.current);
+  debounceRef.current = setTimeout(() => {
+    const s = JSON.stringify(json);
+    if (s !== lastSentRef.current) {
+      saveRender(json, { validate: false });
+    }
+  }, 500);
+
+  return () => debounceRef.current && clearTimeout(debounceRef.current);
+}, [json, autoRender]);
 
   const updateAtPath = useCallback((path, value) => {
     setJson((prev) => {
@@ -734,15 +780,15 @@ export default function JobEditorPage() {
   if (!json) return <div style={{ padding: 16 }}>loading...</div>;
 
   const dt = json.datetime_parts || { year: "", month: "", day: "", dow: "", time: "" };
+
   const rebuildDatetime = (parts) => {
     if (!parts.year || !parts.month || !parts.day) return "";
-    // time は textarea なので改行もあり得る → そのまま連結
     return `${parts.year}年${parts.month}月${parts.day}日（${parts.dow || ""}）${parts.time || ""}`;
   };
 
   const hasJsonErrors = Object.keys(errors).length > 0;
   const statusTone = hasJsonErrors ? "red" : busy ? "blue" : autoRender ? "green" : "gray";
-  const statusText = hasJsonErrors ? "JSON error" : busy ? "Rendering..." : autoRender ? "Auto" : "Manual";
+  const statusText = hasJsonErrors ? "必須項目未入力" : busy ? "Rendering..." : autoRender ? "Auto" : "Manual";
 
   return (
     <div style={ui.page}>
@@ -756,7 +802,9 @@ export default function JobEditorPage() {
                   ← 一覧へ
                 </Link>
               </div>
-              <div style={ui.h2}>編集: {json.event_id || ""}_{(json.event_title_lines || []).join("")}</div>
+              <div style={ui.h2}>
+                編集: {json.event_id || ""}_{(json.event_title_lines || []).join("")}
+              </div>
             </div>
           }
           right={<span style={ui.badge(statusTone)}>{statusText}</span>}
@@ -767,9 +815,6 @@ export default function JobEditorPage() {
               リアルタイム反映（0.5s）
             </label>
 
-            <div style={ui.muted}>
-              {hasJsonErrors ? "エラーを修正すると自動反映が再開します。" : "変更を検知してプレビュー更新します。"}
-            </div>
           </div>
         </Card>
 
@@ -777,6 +822,7 @@ export default function JobEditorPage() {
           <Field label="VP/PH/ONC">
             <Control
               as="select"
+              invalid={!!errors.region}
               value={json.region || ""}
               onChange={(e) => updateAtPath(["region"], e.target.value)}
             >
@@ -785,6 +831,7 @@ export default function JobEditorPage() {
               <option value="PH">PH</option>
               <option value="ONC">ONC</option>
             </Control>
+            {errors.region ? <div style={ui.errorText}>{errors.region}</div> : null}
           </Field>
 
           <div style={ui.grid2}>
@@ -793,9 +840,11 @@ export default function JobEditorPage() {
                 <Control
                   as="textarea"
                   rows={4}
+                  invalid={!!errors.event_title_lines}
                   value={(json.event_title_lines || []).join("\n")}
                   onChange={(e) => updateAtPath(["event_title_lines"], e.target.value.split("\n"))}
                 />
+                {errors.event_title_lines ? <div style={ui.errorText}>{errors.event_title_lines}</div> : null}
               </Field>
             </div>
 
@@ -817,6 +866,7 @@ export default function JobEditorPage() {
           <div style={ui.row}>
             <Control
               style={{ width: 100 }}
+              invalid={!!errors.datetime_year}
               placeholder="2026"
               value={dt.year}
               onChange={(e) => {
@@ -828,6 +878,7 @@ export default function JobEditorPage() {
 
             <Control
               style={{ width: 80 }}
+              invalid={!!errors.datetime_month}
               placeholder="3"
               value={dt.month}
               onChange={(e) => {
@@ -839,6 +890,7 @@ export default function JobEditorPage() {
 
             <Control
               style={{ width: 80 }}
+              invalid={!!errors.datetime_day}
               placeholder="6"
               value={dt.day}
               onChange={(e) => {
@@ -852,6 +904,7 @@ export default function JobEditorPage() {
 
             <Control
               style={{ width: 70 }}
+              invalid={!!errors.datetime_dow}
               placeholder="水"
               value={dt.dow}
               onChange={(e) => {
@@ -866,6 +919,7 @@ export default function JobEditorPage() {
               as="textarea"
               rows={2}
               style={{ width: 220 }}
+              invalid={!!errors.datetime_time}
               placeholder="19:00~20:20（改行もOK）"
               value={dt.time}
               onChange={(e) => {
@@ -874,7 +928,7 @@ export default function JobEditorPage() {
               }}
             />
 
-             <label style={ui.badge(!!json.datetime_time_newline ? "green" : "gray")}>
+            <label style={ui.badge(!!json.datetime_time_newline ? "green" : "gray")}>
               <input
                 type="checkbox"
                 checked={!!json.datetime_time_newline}
@@ -883,73 +937,64 @@ export default function JobEditorPage() {
               時間を改行表示
             </label>
 
-
-              <Field label="注釈" help="日時の下に小さめの文字で表示される行。改行も可能。例: 各講演35分（Q&A含む）など">
-              <Control
-              as="textarea"
-              rows={2}
-              style={{ width: 220 }}
-              placeholder="例:※各講演35分 (Q&A含む)"
-              value={json.datetime_note || ""}
-              onChange={(e) => updateAtPath(["datetime_note"], e.target.value)}
-            />
-            </Field>
-            
-            {json.datetime_note ? (
-               <div style={ui.grid2}>
-              <div>
-
-                <Field label="注釈の文字サイズ" help="注釈の基本サイズ（例: 14）">
-                <Control
-                  type="number"
-                  value={json.datetime_note_font_size || 14}
-                  onChange={(e) => updateAtPath(["datetime_note_font_size"], Number(e.target.value))}
-                />
-              </Field>
-            
-              
-            </div>
-              
-            <div>
-              <Field label="注釈の左の余白" help="注釈の左位置の余白（例: 5）">
-                <Control
-                  type="number"
-                  value={json.datetime_note_left || 5}
-                  onChange={(e) => updateAtPath(["datetime_note_left"], Number(e.target.value))}
-                />
-              </Field>
-            </div>
-          </div>
-            ) : null}
-            
-            
-          
-
-           
-          </div>
-
-          {/* <div style={{ marginTop: 10 }}>
-            <Field label="時間の表示テキスト（上書き）" help="template側で datetime_time_text を使う想定。改行はそのまま反映。">
+            <Field label="注釈" help="日時の下に小さめの文字で表示される行。改行も可能。例: 各講演35分（Q&A含む）など">
               <Control
                 as="textarea"
                 rows={2}
-                value={json.datetime_time_text || ""}
-                placeholder="例: 19:00~20:20\n（入室 18:50〜）"
-                onChange={(e) => updateAtPath(["datetime_time_text"], e.target.value)}
+                style={{ width: 220 }}
+                placeholder="例:※各講演35分 (Q&A含む)"
+                value={json.datetime_note || ""}
+                onChange={(e) => updateAtPath(["datetime_note"], e.target.value)}
               />
             </Field>
-          </div> */}
+
+            {json.datetime_note ? (
+              <div style={ui.grid2}>
+                <div>
+                  <Field label="注釈の文字サイズ" help="注釈の基本サイズ（例: 14）">
+                    <Control
+                      type="number"
+                      value={json.datetime_note_font_size || 14}
+                      onChange={(e) => updateAtPath(["datetime_note_font_size"], Number(e.target.value))}
+                    />
+                  </Field>
+                </div>
+
+                <div>
+                  <Field label="注釈の左の余白" help="注釈の左位置の余白（例: 5）">
+                    <Control
+                      type="number"
+                      value={json.datetime_note_left || 5}
+                      onChange={(e) => updateAtPath(["datetime_note_left"], Number(e.target.value))}
+                    />
+                  </Field>
+                </div>
+              </div>
+            ) : null}
+          </div>
+
+          {errors.datetime_year ||
+          errors.datetime_month ||
+          errors.datetime_day ||
+          errors.datetime_dow ||
+          errors.datetime_time ? (
+            <div style={{ ...ui.errorText, marginTop: 10 }}>
+              {[errors.datetime_year, errors.datetime_month, errors.datetime_day, errors.datetime_dow, errors.datetime_time]
+                .filter(Boolean)
+                .join(" / ")}
+            </div>
+          ) : null}
         </Card>
 
-        <ChairEditor chair={json.chair} updateAtPath={updateAtPath} />
-        <TalksEditor talks={json.talks} updateAtPath={updateAtPath} />
+        <ChairEditor chair={json.chair} updateAtPath={updateAtPath} errors={errors} />
+        <TalksEditor talks={json.talks} updateAtPath={updateAtPath} errors={errors} />
 
         <Card title="その他">
           <Field label="取得単位">
             <Control as="textarea" rows={2} value={json.unit || ""} onChange={(e) => updateAtPath(["unit"], e.target.value)} />
           </Field>
 
-          <Field label="主催/共催" help='例: 主催：MSD株式会社'>
+          <Field label="主催/共催" help="例: 主催：MSD株式会社">
             <Control
               as="textarea"
               value={json.organizer || ""}
@@ -961,61 +1006,69 @@ export default function JobEditorPage() {
           <div style={ui.divider} />
 
           <button
-            disabled={busy || hasJsonErrors}
+            disabled={busy}
             onClick={() => saveRender(json)}
             style={{
               ...ui.btn("primary"),
               width: "100%",
-              opacity: busy || hasJsonErrors ? 0.6 : 1,
-              cursor: busy || hasJsonErrors ? "not-allowed" : "pointer",
+              opacity: busy ? 0.6 : 1,
+              cursor: busy ? "not-allowed" : "pointer",
             }}
           >
-            {hasJsonErrors ? "Fix JSON errors to Save" : busy ? "Rendering..." : "Save & Render"}
+            {busy ? "Rendering..." : "Save & Render"}
           </button>
+
+          {hasJsonErrors ? (
+            <div style={{ ...ui.errorText, marginTop: 10 }}>
+              必須項目が未入力です。赤枠の項目を入力してください。
+            </div>
+          ) : null}
         </Card>
       </div>
 
       {/* Right */}
       <div style={ui.rightCol}>
-
-        
-        
         <Card
           title="Preview"
           right={
-             <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <div style={{ fontSize: 14, color: "#64748b", width: "100%", paddingTop: 8 }}>Download</div>
 
-                       <div style={{ fontSize: 14, color: "#64748b",width: "100%", paddingTop: 8 }}>
-                                Download
-          </div>
+              <button
+                style={ui.smallBtn2}
+                onClick={async () => {
+                  const eventIdLike = json.event_id || jobId || "event";
+                  const filename = `${eventIdLike}_招聘.jpg`;
+                  const url = `/download/${jobId}.jpg?t=${encodeURIComponent(previewBuster)}`;
+                  await downloadWithFilename(url, filename);
+                }}
+              >
+                JPG
+              </button>
 
-                              <button style={ui.smallBtn2} onClick={async () => {
-                                  const eventIdLike = json.event_id || jobId || "event";
-                                  const filename = `${eventIdLike}_招聘.jpg`;
-                                  const url = `/download/${jobId}.jpg?t=${encodeURIComponent(previewBuster)}`;
-                                  await downloadWithFilename(url, filename);
-                                }}>
-                                JPG
-                              </button> 
+              <button
+                style={ui.smallBtn2}
+                onClick={async () => {
+                  const eventIdLike = json.event_id || jobId || "event";
+                  const filename = `${eventIdLike}_backup.json`;
+                  const url = `/debug/${jobId}/latest.json?t=${encodeURIComponent(previewBuster)}`;
+                  await downloadWithFilename(url, filename);
+                }}
+              >
+                JSON
+              </button>
 
-                               <button style={ui.smallBtn2} onClick={async () => {
-                                  const eventIdLike = json.event_id || jobId || "event";
-                                  const filename = `${eventIdLike}_backup.json`;
-                                  const url = `/debug/${jobId}/latest.json?t=${encodeURIComponent(previewBuster)}`;
-                                  await downloadWithFilename(url, filename);
-                                }}>
-                                JSON
-                              </button> 
-
-
-                              <button style={ui.smallBtn2} onClick={async () => {
-                                 const eventIdLike = json.event_id || jobId || "event";
-                                  const filename = `${eventIdLike}_export.zip`;
-                                  await exportOneZip(jobId,filename);
-                                }}>
-                                まとめてダウンロード
-                              </button> 
-        </div>
+              <button
+                style={ui.smallBtn2}
+                onClick={async () => {
+                  const eventIdLike = json.event_id || jobId || "event";
+                  const filename = `${eventIdLike}_export.zip`;
+                  await exportOneZip(jobId, filename);
+                }}
+              >
+                まとめてダウンロード
+              </button>
+            </div>
           }
         >
           <div style={styles.previewFrame}>
@@ -1026,14 +1079,6 @@ export default function JobEditorPage() {
             />
           </div>
         </Card>
-
-        {/* <Card title="メモ" right={<span style={ui.badge("gray")}>tips</span>}>
-          <div style={{ fontSize: 12, color: "#666", lineHeight: 1.6 }}>
-            <div>• hero/talks の部分装飾は override でやる（index or target）</div>
-            <div>• template側は applyOverridesToLines(...) で HTML を作って innerHTML に入れる</div>
-            <div>• autoRender は 0.5秒デバウンス</div>
-          </div>
-        </Card> */}
       </div>
     </div>
   );

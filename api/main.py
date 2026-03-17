@@ -422,7 +422,7 @@ class Talk(BaseModel):
 
 
 class Chair(BaseModel):
-    role: str = ""
+    role: str = "座長"
     name: str = ""
     name_display: str = ""
     affiliation: str = ""
@@ -1885,7 +1885,7 @@ def normalize_person_name(s: str) -> str:
 def normalize_person_display(s: str) -> str:
     x = strip_role_prefix(s)
     x = normalize_space(x).replace("先生", "").replace("\n", " ").strip()
-    return add_space_to_jp_name(x)
+    return build_speaker_display(x)
 
 
 def norm_name(s: str) -> str:
@@ -1993,25 +1993,112 @@ def normalize_organizer(org: str) -> str:
 
 KANJI_NAME_PAT = re.compile(r"^[\u4E00-\u9FFF]{2,6}$")
 
+COMMON_LASTNAMES = {
+    # 上位頻出
+    "佐藤","鈴木","高橋","田中","伊藤","渡辺","山本","中村","小林","加藤",
+    "吉田","山田","佐々木","山口","松本","井上","木村","林","清水","山崎",
+    "森","阿部","池田","橋本","山下","石川","中島","前田","藤田","後藤",
+    "小川","岡田","長谷川","村上","近藤","石井","斉藤","坂本","遠藤","青木",
+    "藤井","西村","福田","太田","三浦","岡本","松田","中川","中野","原田",
+    "小野","田村","竹内","金子","和田","中山","石田","上田","森田","原",
+    "酒井","工藤","横山","宮崎","宮本","内田","高木","安藤","谷口","大野",
+    "今井","丸山","高田","藤本","武田","村田","上野","杉山","増田","小島",
+    "大塚","平野","菅原","久保","松井","千葉","岩崎","桜井","木下","野口",
+    "松尾","野村","菊地","佐野","杉本","新井","浜田","市川","古川","小松",
+    "高野","水野","吉川","島田","小山","大西","西田","西川","土屋","飯田",
+    "渡部","川口","関","川村","永井","齋藤","本田","佐久間","松岡","山中",
+    "川上","北村","西山","五十嵐","福島","安田","平田","中田","川崎","飯塚",
+    "荒木","河野","田口","星野","岡崎","荒井","大久保","浅野","野田","松下",
+    "小池","山内","中西","篠原","須藤","広瀬","吉岡","長田","本間","川島",
+    "藤原","熊谷","片山","小沢","成田","宮田","大橋","石原","岡","富田",
+    "大島","大谷","西岡","児玉","馬場","矢野","田辺","秋山","松浦","堀",
+    "大川","宮下","吉村","岩田","奥田","松原","栗原","大石","中井","尾崎",
+    "横田","岡村","三宅","松村","岩本","菊池","早川","吉野","中谷","片岡",
+    "内藤","中尾","奥村","松永","望月","岩下","福井","村井","大森","片桐",
+    "石橋","黒田","堀内","大竹","大場","高山","宮内","西本","矢島","川田",
+    "松崎","徳永","川辺","平山","大沢","吉沢","横井","奥野","柳沢","大村",
+    "宮原","三好","大島","藤川","北川","川端","本多","福本","石塚","古田",
+    "長尾","永田","江口","杉浦","高井","大山","神田","森本","土井","水谷",
+    "小倉","柴田","山岸","川合","三輪","西尾","谷","村松","高岡","白石",
+    "大槻","小泉","坂井","岸本","松山","安部","宮川","岩井","金田","藤岡",
+    "大崎","岡野","杉田","島崎","浜口","村山","黒川","中沢","江藤","武藤",
+    "上原","津田","大内","森山","菅野","高見","柴山","坂田","矢口","川本",
+    "坂上","石黒","高松","石野","黒木","大原","宮崎","木原","宮沢","島村",
+    "松谷","平井","今村","吉本","石垣","川原","小関","宮沢","西谷","杉原",
+
+    # 医療系でよく出る拡張（重要）
+    "石和田","田邉","渡邊","齊藤","齋藤","髙橋","髙田","髙木","髙野",
+    "長谷部","長谷川","佐々木","小笠原","宇都宮","上野山","久保田",
+    "川井田","川井","川瀬","川原田","西條","西條","西脇","西尾",
+    "森下","森川","森岡","森口","森山","森元",
+    "林田","林原","林本","林崎",
+    "石川","石原","石橋","石山","石丸",
+    "藤田","藤原","藤村","藤野","藤沢","藤岡","藤本",
+    "高橋","高木","高田","高野","高山","高岡","高井",
+}
+
+def split_name_by_dictionary(name: str) -> str:
+    core = norm_name(name)
+    if not core:
+        return ""
+
+    # 最大4文字まででマッチ（長い姓優先）
+    for i in range(min(4, len(core)), 0, -1):
+        last = core[:i]
+        if last in COMMON_LASTNAMES:
+            if i < len(core):
+                return f"{last} {core[i:]}"
+            return core
+
+    return ""
+
 ONE_CHAR_LASTNAMES = {
     "森", "林", "原", "堀", "関", "郭", "秦", "東", "西", "南", "北",
     "辻", "堤", "岸", "今", "岡", "萩", "星", "楊", "呉", "文", "李"
 }
 
-def add_space_to_jp_name(name: str) -> str:
+COMMON_GIVEN_3_SUFFIXES = {
+    "一郎", "二郎", "三郎", "四郎", "五郎",
+    "太郎", "次郎",
+    "子", "美", "香", "菜", "奈", "乃", "江", "恵"
+}
+
+def _looks_like_one_char_lastname_case(core: str) -> bool:
+    """
+    4文字名を 1+3 にしてよさそうかを雑に判定
+    例:
+      森啓一郎 -> True
+      西田育功 -> False
+    """
+    if len(core) != 4:
+        return False
+
+    if core[0] not in ONE_CHAR_LASTNAMES:
+        return False
+
+    given = core[1:]  # 3文字
+
+    # 典型: 啓一郎 / 健太郎 / 恒一郎 みたいに末尾2文字がよくある名の終わり
+    if given[1:] in COMMON_GIVEN_3_SUFFIXES:
+        return True
+
+    # 1文字目が「啓/健/裕/智/和/直/信/良/洋/雅/孝/祐/雄/達/亮」あたりで
+    # かつ末尾が 郎 のようなケースを救う
+    if given.endswith("郎"):
+        return True
+
+    return False
+
+
+def build_speaker_display(name: str) -> str:
     raw = str(name or "")
     s = raw.replace("\u3000", " ").strip()
     if not s:
         return ""
 
-    # すでに「2塊」っぽい（改行/空白）なら、それを尊重
+    # すでに空白ありなら尊重
     parts = [p for p in re.split(r"\s+", s) if p]
     if len(parts) >= 2:
-        joined = "".join(parts)
-        joined = re.sub(r"^(座長|演者|司会|講師|:|：)\s*", "", joined)
-        joined = re.sub(r"(先生)\s*$", "", joined)
-
-        # 先頭が役職だけなら次を姓名として使う
         clean_parts = [re.sub(r"^(座長|演者|司会|講師|:|：)\s*", "", p) for p in parts]
         clean_parts = [re.sub(r"(先生)\s*$", "", p) for p in clean_parts]
         clean_parts = [p for p in clean_parts if p]
@@ -2019,12 +2106,10 @@ def add_space_to_jp_name(name: str) -> str:
         if len(clean_parts) >= 2 and len(clean_parts[0]) >= 1 and len(clean_parts[1]) >= 1:
             return f"{clean_parts[0]} {clean_parts[1]}"
 
-    # 以降はスペース無しの本体で推定
     core = re.sub(r"\s+", "", s)
     core = re.sub(r"^(座長|演者|司会|講師|:|：)", "", core)
     core = re.sub(r"(先生)$", "", core)
 
-    # CJK以外が混じるなら無理に分割しない
     if not all(("\u3040" <= ch <= "\u30ff") or ("\u4e00" <= ch <= "\u9fff") or (ch == "々") for ch in core):
         return core
 
@@ -2032,19 +2117,43 @@ def add_space_to_jp_name(name: str) -> str:
     if n <= 2:
         return core
 
-    # 1文字姓の救済
-    if n >= 3 and core[0] in ONE_CHAR_LASTNAMES:
-        return core[:1] + " " + core[1:]
-
     if n == 3:
-        return core[:2] + " " + core[2:]      # 前田 潤
+        return core[:2] + " " + core[2:]
+
     if n == 4:
-        return core[:2] + " " + core[2:]      # 山田 太郎
+        # 1文字姓救済は条件付き
+        if _looks_like_one_char_lastname_case(core):
+            return core[:1] + " " + core[1:]
+        return core[:2] + " " + core[2:]
+
     if n == 5:
-        return core[:2] + " " + core[2:]      # 阿部 弘太郎
+        return core[:2] + " " + core[2:]
+
     if n == 6:
-        return core[:3] + " " + core[3:]      # 佐々木 健太郎
+        return core[:3] + " " + core[3:]
+
     return core
+
+def build_speaker_display(name: str) -> str:
+    core = norm_name(name)
+    if not core:
+        return ""
+
+    # ① 辞書
+    v = split_name_by_dictionary(core)
+    if v:
+        return v
+
+    # ② fallback（既存ロジック）
+    return build_speaker_display(core)
+
+def extend_lastname_dict_from_vm(vm_rows):
+    for row in vm_rows:
+        d = row["data"] if isinstance(row, dict) and "data" in row else row
+        name = norm_name(d.get("案内状掲載 医師名", ""))
+        if len(name) >= 2:
+            COMMON_LASTNAMES.add(name[:2])
+            COMMON_LASTNAMES.add(name[:3])
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -2107,7 +2216,7 @@ def normalize_for_render(payload: DesignJSON) -> DesignJSON:
         if getattr(payload.chair, "name_display", ""):
             payload.chair.name_display = normalize_person_display(payload.chair.name_display)
         elif getattr(payload.chair, "name", ""):
-            payload.chair.name_display = add_space_to_jp_name(payload.chair.name)
+            payload.chair.name_display = build_speaker_display(payload.chair.name)
 
     # talk title 合成（titleフィールドが存在する時だけ代入）
     for t in (payload.talks or []):
@@ -3064,14 +3173,14 @@ def ensure_display_fields(payload: DesignJSON) -> DesignJSON:
     if getattr(payload, "chair", None):
         c = payload.chair
         if (getattr(c, "name", "") or "").strip() and not (getattr(c, "name_display", "") or "").strip():
-            c.name_display = add_space_to_jp_name(c.name) or c.name
+            c.name_display = build_speaker_display(c.name) or c.name
 
     # talks
     for t in (payload.talks or []):
         # speaker_display を必ず作る（speaker優先）
         sp = (getattr(t, "speaker", "") or "").strip()
         if sp and not (getattr(t, "speaker_display", "") or "").strip():
-            t.speaker_display = add_space_to_jp_name(sp) or sp
+            t.speaker_display = build_speaker_display(sp) or sp
 
         # speaker が空で display だけある場合は speaker を作る（逆補完）
         disp = (getattr(t, "speaker_display", "") or "").strip()
@@ -3210,7 +3319,7 @@ def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
         if key and key in joined:
             return Chair(
                 name=key,
-                name_display=add_space_to_jp_name(key),
+                name_display=build_speaker_display(key),
                 affiliation=normalize_space(aff),
             )
 
@@ -4421,7 +4530,7 @@ def postprocess_refined(refined: DesignJSON, speaker_map: Dict[str, str], time_c
 
         sp = norm_name(t.speaker)
         t.speaker = sp
-        t.speaker_display = add_space_to_jp_name(t.speaker)
+        t.speaker_display = build_speaker_display(t.speaker)
 
         # if sp in speaker_map:
         #     t.affiliation = speaker_map[sp] or ""
@@ -4450,7 +4559,7 @@ def postprocess_refined(refined: DesignJSON, speaker_map: Dict[str, str], time_c
     refined.talks = cleaned[:4]
 
     if refined.chair.name and not refined.chair.name_display:
-        refined.chair.name_display = add_space_to_jp_name(refined.chair.name)
+        refined.chair.name_display = build_speaker_display(refined.chair.name)
 
     
     return refined
@@ -4606,8 +4715,8 @@ def clean_speaker_text(s: str) -> str:
     # 漢字間の変なスペースは潰す（前 田潤 → 前田潤）
     s = re.sub(r"(?<=[一-龥])\s+(?=[一-龥])", "", s)
 
-    # 最後に姓名スペースを付け直す（あなたの add_space_to_jp_name を使う）
-    s = add_space_to_jp_name(s)
+    # 最後に姓名スペースを付け直す（あなたの build_speaker_display を使う）
+    s = build_speaker_display(s)
     return s
 
 
@@ -4998,7 +5107,7 @@ def normalize_speaker_display(payload: DesignJSON) -> DesignJSON:
         if (t.speaker or "").strip():
             # speaker_display が空 or 不正なら再生成
             if not (t.speaker_display or "").strip():
-                t.speaker_display = add_space_to_jp_name(t.speaker)
+                t.speaker_display = build_speaker_display(t.speaker)
 
     # chair も同様
     if getattr(payload, "chair", None):
@@ -5007,7 +5116,7 @@ def normalize_speaker_display(payload: DesignJSON) -> DesignJSON:
             if not (ch.role or "").strip():
                 ch.role = detect_chair_role((ch.name_display or "") + " " + (ch.name or ""))
             if not (ch.name_display or "").strip():
-                ch.name_display = add_space_to_jp_name(ch.name)
+                ch.name_display = build_speaker_display(ch.name)
 
     return payload
 
@@ -5162,20 +5271,21 @@ def trim_last_pixel(path: str):
 
 
 async def render_png_bytes(payload: DesignJSON) -> tuple[bytes, str]:
-    global _cached_template
+    global _cached_template, _browser
+
     if _cached_template is None:
         _cached_template = TEMPLATE_PATH.read_text(encoding="utf-8")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = await browser.new_context(
-            viewport=BASE_VIEWPORT,
-            device_scale_factor=1,
-        )
-        page = await context.new_page()
+    if _browser is None:
+        raise RuntimeError("Playwright browser is not initialized")
 
+    context = await _browser.new_context(
+        viewport=BASE_VIEWPORT,
+        device_scale_factor=1,
+    )
+    page = await context.new_page()
+
+    try:
         page.on("pageerror", lambda e: print("[pageerror]", e))
         page.on("console", lambda m: print("[console]", m.type, m.text))
 
@@ -5250,11 +5360,10 @@ async def render_png_bytes(payload: DesignJSON) -> tuple[bytes, str]:
         )
 
         html = await page.content()
+        return jpg_bytes, html
 
+    finally:
         await context.close()
-        await browser.close()
-
-    return jpg_bytes, html
 
 async def render_png(payload: DesignJSON, out_path: Path, debug_html_path: Path):
     global _cached_template
@@ -5533,7 +5642,7 @@ app.mount("/fonts", StaticFiles(directory=str(APP_DIR / "fonts")), name="fonts")
 
 @app.on_event("startup")
 async def startup():
-    global _cached_template
+    global _cached_template, _pw, _browser
 
     init_db()
 
@@ -5546,13 +5655,37 @@ async def startup():
     if browsers_path:
         Path(browsers_path).mkdir(parents=True, exist_ok=True)
 
+    # Playwright を1回だけ起動して使い回す
+    _pw = await async_playwright().start()
+    _browser = await _pw.chromium.launch(
+        args=["--no-sandbox", "--disable-dev-shm-usage"],
+    )
+
     # Ensure Chromium exists
     # try:
     #     subprocess.check_call(["python", "-m", "playwright", "install", "chromium"])
     # except Exception as e:
     #     raise RuntimeError(f"Playwright install failed: {e}")
 
+@app.on_event("shutdown")
+async def shutdown():
+    global _browser, _pw
 
+    try:
+        if _browser is not None:
+            await _browser.close()
+    except Exception as e:
+        print("[shutdown browser close error]", e)
+    finally:
+        _browser = None
+
+    try:
+        if _pw is not None:
+            await _pw.stop()
+    except Exception as e:
+        print("[shutdown playwright stop error]", e)
+    finally:
+        _pw = None
 
 
 def _sse(event: str, data: dict) -> str:
@@ -6234,14 +6367,14 @@ async def export_zip(req: ExportReq, background_tasks: BackgroundTasks):
                 z.writestr(f"{base}_招聘.jpg", jpg_bytes)
                 added += 1
 
-                # latest.json も必要なら Storage から取得
-                if req.includeJson:
-                    try:
-                        json_bytes = download_storage_file(f"{job_id}/latest.json")
-                        z.writestr(f"{base}_backup.json", json_bytes)
-                    except HTTPException:
-                        # json が無い個体は jpg だけ入れて続行
-                        pass
+                # # latest.json も必要なら Storage から取得
+                # if req.includeJson:
+                #     try:
+                #         json_bytes = download_storage_file(f"{job_id}/latest.json")
+                #         z.writestr(f"{base}_backup.json", json_bytes)
+                #     except HTTPException:
+                #         # json が無い個体は jpg だけ入れて続行
+                #         pass
 
             except HTTPException:
                 # preview.jpg が無い job はスキップ
