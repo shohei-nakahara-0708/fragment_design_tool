@@ -941,7 +941,7 @@ useEffect(() => {
               <Control
                 as="textarea"
                 rows={2}
-                style={{ width: 220 }}
+                style={{ width: "100%" }}
                 placeholder="例:※各講演35分 (Q&A含む)"
                 value={json.datetime_note || ""}
                 onChange={(e) => updateAtPath(["datetime_note"], e.target.value)}
@@ -960,15 +960,15 @@ useEffect(() => {
                   </Field>
                 </div>
 
-                <div>
-                  <Field label="注釈の左の余白" help="注釈の左位置の余白（例: 5）">
+                {/* <div>
+                  <Field label="注釈の左の余白" help="注釈の左位置の余白（例: 3）">
                     <Control
                       type="number"
-                      value={json.datetime_note_left || 5}
+                      value={json.datetime_note_left || 3}
                       onChange={(e) => updateAtPath(["datetime_note_left"], Number(e.target.value))}
                     />
                   </Field>
-                </div>
+                </div> */}
               </div>
             ) : null}
           </div>

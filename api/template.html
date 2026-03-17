@@ -174,7 +174,7 @@ text-rendering: optimizeLegibility;
 }
 
 #eventDatetimeTimeNote {
-  margin-left: 5px;
+  margin-left: 3px;
   font-size: 14px;
   line-height: 1.2;
   min-width: 0;
@@ -509,7 +509,7 @@ svg {
     
           <div id="eventDatetimeRight">
             <div id="eventDatetimeTimeWrap">
-              <span id="eventDatetimeTime">2222</span>
+              <span id="eventDatetimeTime"></span>
             </div>
             <div id="eventDatetimeTimeNote"></div>
           </div>
@@ -829,8 +829,8 @@ svg {
          const baseSize = Number(d.datetime_note_font_size || 14); // 全体の基本サイズ
          if (Number.isFinite(baseSize)) eventDatetimeTimeNote.style.fontSize = baseSize + "px";
 
-          const baseLeft = Number(d.datetime_note_left || 5); // 左位置の基本値
-         if (Number.isFinite(baseLeft)) eventDatetimeTimeNote.style.marginLeft = baseLeft + "px";
+        //   const baseLeft = Number(d.datetime_note_left || 5); // 左位置の基本値
+        //  if (Number.isFinite(baseLeft)) eventDatetimeTimeNote.style.marginLeft = baseLeft + "px";
 
        }
 
