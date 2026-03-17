@@ -20,3 +20,5 @@ psycopg[binary]
 PyMuPDF
 
 python-multipart
+
+requests

@@ -12,8 +12,8 @@ from typing import List, Optional, Dict, Any, Literal, Tuple
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body,Form, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse,StreamingResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body,Form, BackgroundTasks,Request,Response
+from fastapi.responses import FileResponse, JSONResponse,StreamingResponse,RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -48,10 +48,18 @@ import math
 
 from PIL import Image
 
+import mimetypes
+import requests
+
+
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "")
+
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "jobs")
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -1840,7 +1848,7 @@ def normalize_key(s: str) -> str:
 
 
 ROLE_PREFIXES = [
-    "総合司会", "司会", "総合座長", "座長", "Moderator", "Chairperson", "Chair",
+    "総合司会", "座長"
 ]
 
 
@@ -1860,7 +1868,7 @@ def detect_chair_role(text: str) -> str:
     s = normalize_space(text or "").replace("\n", "")
     if not s:
         return ""
-    for p in ["総合司会", "司会", "総合座長", "座長", "Moderator", "Chairperson", "Chair"]:
+    for p in ["総合司会", "座長"]:
         if p in s:
             return p
     return ""
@@ -4084,9 +4092,11 @@ def build_ai_prompt(
     - 形式/視聴方法/注意事項/参加方法/脚注本文は datetime_note に入れない
     - 根拠が薄い場合は空文字
 - organizer は主催の会社名（抽出データにある場合のみ）
-- chair は司会・総合司会・座長・総合座長など進行役
-- chair.role には役職名を入れる（例: "座長", "総合座長", "司会", "総合司会"）。不明なら空
-- talks は1〜4件、順序はスライドの登場順（top/left順）
+- chair は総合司会か座長の進行役
+- chair.role には役職名を入れる（例: "座長", "総合司会"）。不明なら座長
+- chair.roleは基本的に座長が入るが、総合司会がいる場合のみそちらを優先するイメージ
+  - chair.roleが総合座長なら座長になる(基本的に座長のテキストが優先)
+- talks は1〜4件、順序はスライドの登場順（top/left）
 - 空のtalkは禁止（title_lines/speaker/timeが全て空の要素を作らない）
 - event_title_lines / talk.title_lines は改行を保持して配列で返す（統合しない）
 - 1行内の ~...~ / ～...～ は必ず別行（別要素）扱いにする
@@ -4128,6 +4138,19 @@ def build_ai_prompt(
 }}
 """
 
+def normalize_chair_role(role: str) -> str:
+    r = normalize_space(role or "")
+    r = r.replace("\n", "").replace(" ", "")
+
+    # 総合司会だけ特別扱い
+    if r == "総合司会":
+        return "総合司会"
+
+    # それ以外の司会/座長系は全部「座長」
+    if any(x in r for x in ["座長", "司会"]):
+        return "座長"
+
+    return r
 
 async def ai_refine_json(
     blocks: List[TextBlock],
@@ -4156,6 +4179,10 @@ async def ai_refine_json(
 
     async with httpx.AsyncClient(timeout=AI_TIMEOUT) as client:
         r = await client.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=body)
+        try:
+            print("error json=", r.json())
+        except Exception:
+            print("error text=", r.text)
         r.raise_for_status()
         data = r.json()
 
@@ -4178,6 +4205,7 @@ async def ai_refine_json(
     refined.datetime_note = normalize_space(refined.datetime_note)
     refined.organizer = normalize_space(refined.organizer)
     refined.chair.role = normalize_space(getattr(refined.chair, "role", ""))
+    refined.chair.role = normalize_chair_role(refined.chair.role)
     refined.chair.name = normalize_person_name(refined.chair.name)
     if getattr(refined.chair, "name_display", ""):
         refined.chair.name_display = normalize_person_display(refined.chair.name_display)
@@ -4567,7 +4595,7 @@ TIME_RANGE_PAT = re.compile(
     r"\d{1,2}[:：]\d{2}\s*[~\-–—−－〜～]\s*\d{1,2}[:：]\d{2}"
 )
 
-ROLE_PAT = re.compile(r"(演者|総合司会|司会|総合座長|座長)")
+ROLE_PAT = re.compile(r"(演者|総合司会|座長)")
 
 def clean_speaker_text(s: str) -> str:
     s = str(s or "")
@@ -5133,6 +5161,101 @@ def trim_last_pixel(path: str):
         img.save(path, quality=100)
 
 
+async def render_png_bytes(payload: DesignJSON) -> tuple[bytes, str]:
+    global _cached_template
+    if _cached_template is None:
+        _cached_template = TEMPLATE_PATH.read_text(encoding="utf-8")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = await browser.new_context(
+            viewport=BASE_VIEWPORT,
+            device_scale_factor=1,
+        )
+        page = await context.new_page()
+
+        page.on("pageerror", lambda e: print("[pageerror]", e))
+        page.on("console", lambda m: print("[console]", m.type, m.text))
+
+        await page.goto(TEMPLATE_PATH.resolve().as_uri(), wait_until="domcontentloaded")
+        await page.evaluate("() => document.fonts && document.fonts.ready")
+
+        data_json = (
+            payload.model_dump_json()
+            if hasattr(payload, "model_dump_json")
+            else payload.json(ensure_ascii=False)
+        )
+        data_obj = json.loads(data_json)
+
+        await page.evaluate(
+            """(data) => {
+                window.__DATA__ = data;
+                if (typeof window.__render === "function") window.__render();
+            }""",
+            data_obj,
+        )
+
+        await page.wait_for_selector('html[data-ready="1"]', timeout=30000)
+        await page.wait_for_selector(".wrap", timeout=30000)
+
+        await page.evaluate("""
+        () => {
+            document.documentElement.style.margin = "0";
+            document.body.style.margin = "0";
+            document.body.style.padding = "0";
+            const wrap = document.querySelector(".wrap");
+            if (wrap) {
+                wrap.style.margin = "0";
+                wrap.style.display = "block";
+            }
+        }
+        """)
+
+        wrap = page.locator(".wrap")
+
+        for _ in range(60):
+            box = await wrap.bounding_box()
+            if box and box["height"] and box["height"] > 10:
+                break
+            await page.wait_for_timeout(100)
+        else:
+            html = await page.content()
+            raise RuntimeError("wrap bounding box not ready")
+
+        box = await wrap.bounding_box()
+        if not box:
+            raise RuntimeError("wrap bounding box is None")
+
+        clip_x = math.floor(box["x"])
+        clip_y = math.floor(box["y"])
+        clip_w = math.ceil(box["width"])
+        clip_h = min(math.ceil(box["height"]), MAX_HEIGHT)
+
+        await page.set_viewport_size({
+            "width": max(clip_x + clip_w, 1),
+            "height": max(clip_y + clip_h, 1),
+        })
+
+        jpg_bytes = await page.screenshot(
+            type="jpeg",
+            quality=100,
+            clip={
+                "x": clip_x,
+                "y": clip_y,
+                "width": clip_w,
+                "height": clip_h,
+            },
+        )
+
+        html = await page.content()
+
+        await context.close()
+        await browser.close()
+
+    return jpg_bytes, html
+
 async def render_png(payload: DesignJSON, out_path: Path, debug_html_path: Path):
     global _cached_template
     if _cached_template is None:
@@ -5236,6 +5359,162 @@ async def render_png(payload: DesignJSON, out_path: Path, debug_html_path: Path)
 
 
 
+def guess_content_type(path: Path) -> str:
+    ctype, _ = mimetypes.guess_type(str(path))
+    return ctype or "application/octet-stream"
+
+
+def upload_to_storage(local_path: Path, remote_path: str, upsert: bool = True):
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{remote_path}"
+
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Content-Type": guess_content_type(local_path),
+        "x-upsert": "true" if upsert else "false",
+    }
+
+    with local_path.open("rb") as f:
+        res = requests.post(url, headers=headers, data=f)
+
+    if not res.ok:
+        raise RuntimeError(f"storage upload failed: {res.status_code} {res.text}")
+
+    return res.json()
+
+
+def upload_bytes_to_storage(
+    data: bytes,
+    remote_path: str,
+    content_type: str,
+    upsert: bool = True,
+):
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{remote_path}"
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Content-Type": content_type,
+        "x-upsert": "true" if upsert else "false",
+        "Cache-Control": "no-cache",
+    }
+
+    res = requests.post(url, headers=headers, data=data, timeout=60)
+    if not res.ok:
+        raise RuntimeError(f"storage upload failed: {res.status_code} {res.text}")
+    return res.json()
+
+
+def upload_json_to_storage(data: dict, remote_path: str, upsert: bool = True):
+    raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return upload_bytes_to_storage(
+        raw,
+        remote_path=remote_path,
+        content_type="application/json; charset=utf-8",
+        upsert=upsert,
+    )
+
+
+def upload_text_to_storage(text: str, remote_path: str, content_type: str, upsert: bool = True):
+    return upload_bytes_to_storage(
+        text.encode("utf-8"),
+        remote_path=remote_path,
+        content_type=content_type,
+        upsert=upsert,
+    )
+
+def download_storage_file(remote_path: str) -> bytes:
+    url = get_public_url(remote_path)
+    r = requests.get(url, timeout=30)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=404, detail=f"storage file not found: {remote_path}")
+    return r.content
+
+def get_public_url(remote_path: str) -> str:
+    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{remote_path}"
+
+def download_storage_json(remote_path: str) -> dict:
+    url = get_public_url(remote_path)
+    r = requests.get(url, timeout=10)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=404, detail="job json not found")
+    return r.json()
+
+def delete_storage_files(paths: list[str]):
+    if not paths:
+        return
+
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}"
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Content-Type": "application/json",
+    }
+
+    # Supabase Storage delete は「paths の配列」で消す
+    res = requests.delete(
+        url,
+        headers=headers,
+        json={"prefixes": paths},  # ← ここは環境によって paths ではなく prefixes でなく files list endpoint差異あり得る
+        timeout=30,
+    )
+
+    if not res.ok:
+        raise RuntimeError(f"storage delete failed: {res.status_code} {res.text}")
+
+def storage_paths(job_id: str) -> dict:
+    return {
+        "preview": f"{job_id}/preview.jpg",
+        "json": f"{job_id}/latest.json",
+        "debug_blocks": f"{job_id}/debug_blocks.json",
+        "debug_html": f"{job_id}/debug.html",
+    }
+
+
+def upload_required_assets(
+    job_id: str,
+    payload_dict: dict,
+    jpg_bytes: bytes,
+):
+    sp = storage_paths(job_id)
+
+    # 必須
+    upload_bytes_to_storage(
+        jpg_bytes,
+        sp["preview"],
+        content_type="image/jpeg",
+        upsert=True,
+    )
+
+    upload_json_to_storage(
+        payload_dict,
+        sp["json"],
+        upsert=True,
+    )
+
+
+def upload_optional_assets(
+    job_id: str,
+    debug_html: Optional[str] = None,
+    debug_blocks_path: Optional[Path] = None,
+):
+    sp = storage_paths(job_id)
+
+    # 任意
+    if debug_html:
+        upload_text_to_storage(
+            debug_html,
+            sp["debug_html"],
+            content_type="text/html; charset=utf-8",
+            upsert=True,
+        )
+
+    if debug_blocks_path and debug_blocks_path.exists():
+        upload_to_storage(
+            debug_blocks_path,
+            sp["debug_blocks"],
+            upsert=True,
+        )
+
 # ---------------- App ----------------
 app = FastAPI(title="PPTX → JSON → HTML → jpg (Keep Newlines + Split ~...~)")
 
@@ -5268,10 +5547,10 @@ async def startup():
         Path(browsers_path).mkdir(parents=True, exist_ok=True)
 
     # Ensure Chromium exists
-    try:
-        subprocess.check_call(["python", "-m", "playwright", "install", "chromium"])
-    except Exception as e:
-        raise RuntimeError(f"Playwright install failed: {e}")
+    # try:
+    #     subprocess.check_call(["python", "-m", "playwright", "install", "chromium"])
+    # except Exception as e:
+    #     raise RuntimeError(f"Playwright install failed: {e}")
 
 
 
@@ -5410,7 +5689,11 @@ async def upload_batch_stream(
                 p = job_paths(job_id)
 
                 try:
-                    payload = await pptx_to_json_vm_hint(in_path, vm_rows, debug_blocks_path=p.get("debug_blocks"))
+                    payload = await pptx_to_json_vm_hint(
+                        in_path,
+                        vm_rows,
+                        debug_blocks_path=p.get("debug_blocks"),
+                    )
                     payload = normalize_for_render(payload)
                     payload = post_format_design_initial(payload)
                     payload = await apply_precise_typeset_initial(payload)
@@ -5420,21 +5703,69 @@ async def upload_batch_stream(
                     payload.unit = presence_rows[0].get("取得単位：フラグメントデザインへの内容記載", "")
                     payload.event_id = event_id
 
-                    payload.talks = sorted(payload.talks or [], key=lambda x: _time_start_minutes(getattr(x, "time", "")))
-                    p["json"].write_text(dump_json(payload), encoding="utf-8")
-                    await render_png(payload, p["jpg"], p["debug_html"])
+                    payload.talks = sorted(
+                        payload.talks or [],
+                        key=lambda x: _time_start_minutes(getattr(x, "time", ""))
+                    )
+
+                    payload_dict = (
+                        payload.model_dump(exclude_none=True)
+                        if hasattr(payload, "model_dump")
+                        else json.loads(payload.json(ensure_ascii=False))
+                    )
+
+                    jpg_bytes, debug_html = await render_png_bytes(payload)
+
+                    # 必須アップロード
+                    upload_required_assets(
+                        job_id,
+                        payload_dict=payload_dict,
+                        jpg_bytes=jpg_bytes,
+                    )
+
+                    # 任意アップロード
+                    upload_optional_assets(
+                        job_id,
+                        debug_html=debug_html,
+                        debug_blocks_path=p.get("debug_blocks"),
+                    )
+
+                    # debug_blocks 一時ファイル削除
+                    if p.get("debug_blocks") and p["debug_blocks"].exists():
+                        p["debug_blocks"].unlink(missing_ok=True)
 
                     upsert_job_ok(job_id, filename, payload, session_id, event_id)
 
-                    out.append({"filename": filename, "jobId": job_id, "ok": True})
-                    yield _sse("item_done", {"index": i, "filename": filename, "ok": True, "jobId": job_id})
+                    out.append({
+                        "filename": filename,
+                        "jobId": job_id,
+                        "ok": True,
+                    })
+                    yield _sse("item_done", {
+                        "index": i,
+                        "filename": filename,
+                        "ok": True,
+                        "jobId": job_id,
+                    })
 
                 except Exception as e:
                     tb = traceback.format_exc()
                     print("[upload/batch error]", filename, job_id)
                     print(tb)
-                    out.append({"filename": filename, "jobId": job_id, "ok": False, "error": str(e)})
-                    yield _sse("item_done", {"index": i, "filename": filename, "ok": False, "jobId": job_id, "error": str(e)})
+
+                    out.append({
+                        "filename": filename,
+                        "jobId": job_id,
+                        "ok": False,
+                        "error": str(e),
+                    })
+                    yield _sse("item_done", {
+                        "index": i,
+                        "filename": filename,
+                        "ok": False,
+                        "jobId": job_id,
+                        "error": str(e),
+                    })
 
             ok_count = sum(1 for r in out if r.get("ok"))
             yield _sse("done", {"sessionId": session_id, "count": ok_count, "results": out})
@@ -5443,6 +5774,11 @@ async def upload_batch_stream(
             tb = traceback.format_exc()
             print(tb)
             yield _sse("fatal", {"message": str(e)})
+        finally:
+            try:
+                shutil.rmtree(session_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     return StreamingResponse(
         gen(),
@@ -5454,250 +5790,15 @@ async def upload_batch_stream(
         },
     )
 
-@app.post("/upload/batch")
-async def upload_batch(
-    files: List[UploadFile] = File(...),
-    eventIds: List[str] = Form(...),  # filesと同じ順
-):
-    session_id = new_session_id()
-
-    if not files:
-        raise HTTPException(400, "files is empty")
-    if len(eventIds) != len(files):
-        raise HTTPException(400, f"eventIds length mismatch: {len(eventIds)} != {len(files)}")
-
-    # ---- Spreadsheet open (once) ----
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    credentials = get_gsa_credentials(scope)
-    gc = gspread.authorize(credentials)
-
-    SPREADSHEET_KEY = "1hiV0Ve2cnYyrPkBuZcZIcLWeAnJ-ucNiB0P4owZpXug"
-    workbook = gc.open_by_key(SPREADSHEET_KEY)
-
-    # ---- sheets ----
-    PRESENCE_SHEETS = ["VM(GWET)", "VM(例外)", "VM(本社)"]
-    VM_SHEET = "演題演者（VM）"
-
-    PRESENCE_HEADER_ROW = 2
-    VM_HEADER_ROW = 1  # ←VMが1行ヘッダなら1。あなたの現状は2が多そうなので2推奨
-
-    PRESENCE_ID_COL = "システムID"
-    VM_PRESENCE_ID_COL = "講演会ID"  # フォールバック
-
-    # # ---- build presence index (once) ----
-    # presence_index = preload_system_id_index(
-    #     workbook,
-    #     PRESENCE_SHEETS,
-    #     header_row=PRESENCE_HEADER_ROW,
-    #     id_col_name=PRESENCE_ID_COL,
-    # )
-
-    # # ---- build VM index (once) ----
-    # vm_index = None
-    # vm_index_err = None
-    # try:
-    #     vm_index = build_system_id_to_rows(
-    #             workbook,
-    #             sheet_name=VM_SHEET,
-    #             header_row=VM_HEADER_ROW,
-    #             id_col_name=VM_PRESENCE_ID_COL,
-    #         )
-    #     vm_index_err = None
-    
-    # except Exception as e:
-    #     vm_index_err = e
-        
-
-    # if vm_index is None:
-    #     raise HTTPException(
-    #         status_code=500,
-    #         detail={"code": "vm_sheet_index_failed", "message": str(vm_index_err)},
-    #     )
-
-    # ---- まず全件チェック＆データ取得（1件でもNGなら422）----
-    # 0) precheck（pptx / event_id）
-    valid_event_ids = []
-    precheck = [None] * len(files)
-    for i, f in enumerate(files):
-        filename = f.filename or f"file_{i}"
-        if not filename.lower().endswith(".pptx") and not filename.lower().endswith(".pdf"):
-            precheck[i] = {"ok": False, "error": "not_supported_file"}
-            continue
-        eid = (eventIds[i] or "").strip()
-        if not eid:
-            precheck[i] = {"ok": False, "error": "event_id_required"}
-            continue
-        precheck[i] = {"ok": True}
-        valid_event_ids.append(eid)
-
-    ws_map = _retry_gspread(lambda: {ws.title: ws for ws in workbook.worksheets()})
-
-    # 1) presence+VM を一括取得（ここが速度の肝）
-    presence_rows_by_event, vm_rows_by_event, _ = batch_fetch_system_and_vm_rows(
-        workbook,
-        ws_map=ws_map,
-        event_ids=valid_event_ids,
-        presence_sheets=PRESENCE_SHEETS,
-        presence_header_row=PRESENCE_HEADER_ROW,
-        presence_id_col=PRESENCE_ID_COL,                 # "システムID"
-        vm_sheet=VM_SHEET,
-        vm_header_row=VM_HEADER_ROW,
-        vm_id_col_candidates=["講演会ID"],  # あなたのVMは講演会IDっぽいので先に
-        col_end="N",  # 申請日(A)〜演題(N) までなら N でOK
-    )
-
-    print("================= batch fetch done =================")
-    print(presence_rows_by_event)
-    print('---------------------------------------------------')
-
-    results = [None] * len(files)
-    presence_rows_by_file_index = [None] * len(files)
-    vm_rows_by_file_index = [None] * len(files)
-
-    # 2) files順に合わせて、申請日でVMを絞る
-    
-    def _parse_ymd(s: str):
-        m = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", str(s or ""))
-        if not m:
-            return None
-        y, mo, d = map(int, m.groups())
-        return (y, mo, d)
-    # 2) files順に合わせて…
-    for i, f in enumerate(files):
-        filename = f.filename or f"file_{i}"
-        if not precheck[i]["ok"]:
-            results[i] = {"filename": filename, "ok": False, "error": precheck[i]["error"]}
-            continue
-        eid = (eventIds[i] or "").strip()
-        presence_rows = presence_rows_by_event.get(eid, [])
-        if not presence_rows:
-            results[i] = {"filename": filename, "ok": False, "error": "event_id_not_found"}
-            continue
-        presence_last = max(presence_rows, key=lambda r: int(r.get("_row") or 0))
-        presence_apply_day = _parse_ymd((presence_last.get("申請日") or "").strip())
-        # VMは任意
-        vm_rows_all = vm_rows_by_event.get(eid, [])  # ← 全量
-        vm_rows = []
-        if vm_rows_all:
-            vm_by_day: dict[tuple[int,int,int] | None, list[dict]] = {}
-            for r in vm_rows_all:
-                k = _parse_ymd((r.get("申請日") or "").strip())
-                vm_by_day.setdefault(k, []).append(r)
-            # 1) presenceと同日
-            vm_rows = vm_by_day.get(presence_apply_day, [])
-            # 2) フォールバック
-            if not vm_rows:
-                days = sorted([d for d in vm_by_day.keys() if d is not None])
-                if days:
-                    if presence_apply_day is not None:
-                        le = [d for d in days if d <= presence_apply_day]
-                        pick = le[-1] if le else days[-1]
-                    else:
-                        pick = days[-1]
-                    vm_rows = vm_by_day[pick]
-        presence_rows_by_file_index[i] = presence_rows
-        vm_rows_by_file_index[i] = vm_rows
-        results[i] = {"filename": filename, "ok": True}
-
-    failed = [r for r in results if r and not r.get("ok")]
-    if failed:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "batch_failed",
-                "message": "1件以上のファイルでエラーが発生しました",
-                "results": results,
-            },
-        )
-
-    # ---- ここから生成（全件OKのときだけ）----
-    out: List[Dict[str, Any]] = []
-
-    for i, f in enumerate(files):
-        filename = f.filename or f"file_{i}"
-        event_id = (eventIds[i] or "").strip()
-
-        vm_rows = vm_rows_by_file_index[i] or []
-        presence_rows = presence_rows_by_file_index[i] or []
-        # presence_best = pick_best_presence_row(presence_rows)  # 1つに絞るなら
-        print('--------------------------------')
-        print(f'batch] processing{vm_rows}')
-        print(f"[batch] processing file {i}: {presence_rows}, event_id={event_id}")
-        print('--------------------------------')
-        job_id = uuid.uuid4().hex
-        p = job_paths(job_id)
-
-        try:
-            # p["pptx"].write_bytes(await f.read())
-
-
-            suffix = Path(filename).suffix.lower()  # ".pptx" or ".pdf"
-            in_path = p["dir"] / f"input{suffix}"
-            in_path.write_bytes(await f.read())
-            
-
-            payload = await pptx_to_json_vm_hint(in_path, vm_rows, debug_blocks_path=p.get("debug_blocks"))
-            print(f"[batch] parsed json: {payload}")
-            payload = normalize_for_render(payload)
-            payload = post_format_design_initial(payload)
-            payload = await apply_precise_typeset_initial(payload)
-            print(f"[batch] normalized json: {payload}")
-            payload = fill_datetime_parts(payload)
-            payload = ensure_display_fields(payload)
-            
-            print(f"[batch] vm corrected json: {payload}")
-
-            # ★3シート側の値も payload / DB に入れる（どっちでも）
-            # 例: payloadに埋め込む
-            # try:
-            #     payload.meta = getattr(payload, "meta", {}) or {}
-            #     payload.meta["presence_rows"] = presence_rows
-            #     # payload.meta["presence_best"] = presence_best
-            # except Exception:
-            #     # payloadがdictならこちら
-            #     if isinstance(payload, dict):
-            #         payload.setdefault("meta", {})
-            #         payload["meta"]["presence_rows"] = presence_rows
-            #         # payload["meta"]["presence_best"] = presence_best
-
-            payload.region = presence_rows[0]["VP/PH/ONC"] if presence_rows else ""
-            payload.unit = presence_rows[0]["取得単位：フラグメントデザインへの内容記載"] if presence_rows else ""
-            payload.event_id = event_id
-            payload.talks = sorted(payload.talks or [], key=lambda x: _time_start_minutes(getattr(x, "time", "")))
-
-            p["json"].write_text(dump_json(payload), encoding="utf-8")
-            await render_png(payload, p["jpg"], p["debug_html"])
-            
-            print(f"[batch] payload{payload}") 
-
-            # DBにも保存したいなら upsert_job_ok の引数拡張 or payload内metaで保存
-            upsert_job_ok(job_id, filename, payload, session_id, event_id)
-
-            out.append({"filename": filename, "jobId": job_id, "ok": True})
-
-        except Exception as e:
-            tb = traceback.format_exc()
-            print("[upload/batch error]", filename, job_id)
-            print(tb)
-            out.append({"filename": filename, "jobId": job_id, "ok": False, "error": str(e)})
-
-    ok_count = sum(1 for r in out if r.get("ok"))
-    return {"sessionId": session_id, "count": ok_count, "results": out}
-
 
 @app.post("/render")
 async def render(req: RenderReq):
-    p = job_paths(req.jobId)
-
-    # --- DB: lock/メタ取得 ---
     with db_connect() as con:
         row = con.execute(
             "SELECT locked, filename, session_id, event_id FROM jobs WHERE job_id=%s",
             (req.jobId,),
         ).fetchone()
+
     if not row:
         raise HTTPException(404, "job not found")
 
@@ -5708,20 +5809,39 @@ async def render(req: RenderReq):
     session_id = row.get("session_id") or ""
     event_id = row.get("event_id") or ""
 
-    payload = req.design  # DesignJSON (Pydantic)
+    payload = req.design
 
-    # --- ファイル保存（従来通り）---
-    p["json"].write_text(dump_json(payload), encoding="utf-8")
-    await render_png(payload, p["jpg"], p["debug_html"])
+    payload_dict = (
+        payload.model_dump(exclude_none=True)
+        if hasattr(payload, "model_dump")
+        else json.loads(payload.json(ensure_ascii=False))
+    )
 
-    # --- DB upsert（Supabase版 upsert_job_ok を呼ぶ想定）---
+    jpg_bytes, debug_html = await render_png_bytes(payload)
+
+    try:
+        # 必須アップロード
+        upload_required_assets(
+            req.jobId,
+            payload_dict=payload_dict,
+            jpg_bytes=jpg_bytes,
+        )
+
+        # 任意アップロード
+        upload_optional_assets(
+            req.jobId,
+            debug_html=debug_html,
+        )
+
+    except Exception as e:
+        print("[storage upload error][/render]", req.jobId, e)
+        raise HTTPException(500, f"storage upload failed: {e}")
+
     upsert_job_ok(req.jobId, filename, payload, session_id, event_id)
 
-    # --- response ---
-    data = payload.model_dump(exclude_none=True) if hasattr(payload, "model_dump") else json.loads(payload.json(ensure_ascii=False))
     return JSONResponse({
         "jobId": req.jobId,
-        "json": data,
+        "json": payload_dict,
         "warnings": getattr(payload, "warnings", None),
         "previewUrl": f"/preview/{req.jobId}.jpg",
         "downloadUrl": f"/download/{req.jobId}.jpg",
@@ -5748,11 +5868,10 @@ async def restore_from_json_batch(files: list[UploadFile] = File(...)):
         raise HTTPException(400, "files is empty")
 
     session_id = new_session_id()
-
     results = []
+
     for f in files:
         job_id = uuid.uuid4().hex
-        p = job_paths(job_id)
         try:
             raw = await f.read()
             text = raw.decode("utf-8")
@@ -5760,19 +5879,31 @@ async def restore_from_json_batch(files: list[UploadFile] = File(...)):
 
             payload = DesignJSON.model_validate(data)
 
-            # 保存
-            p["json"].write_text(dump_json(payload), encoding="utf-8")
+            payload_dict = (
+                payload.model_dump(exclude_none=True)
+                if hasattr(payload, "model_dump")
+                else json.loads(payload.json(ensure_ascii=False))
+            )
 
-            # 復元→再レンダ（あなたのモデル名に合わせて）
-            # payload = Payload.model_validate(data)
-            # payload = normalize_for_render(payload)
-            # payload = post_format_design_initial(payload)
-            # payload = await apply_precise_typeset_initial(payload)
-            # payload = ensure_display_fields(payload)
+            jpg_bytes, debug_html = await render_png_bytes(payload)
 
-            
+            try:
+                # 必須
+                upload_required_assets(
+                    job_id,
+                    payload_dict=payload_dict,
+                    jpg_bytes=jpg_bytes,
+                )
 
-            await render_png(payload, p["jpg"], p["debug_html"])
+                # 任意
+                upload_optional_assets(
+                    job_id,
+                    debug_html=debug_html,
+                )
+
+            except Exception as e:
+                print("[storage upload error][/jobs/restore/batch]", job_id, e)
+                raise HTTPException(500, f"storage upload failed: {e}")
 
             event_id = getattr(payload, "event_id", "") or ""
             upsert_job_ok(job_id, f.filename or "restore.json", payload, session_id, event_id)
@@ -5784,6 +5915,7 @@ async def restore_from_json_batch(files: list[UploadFile] = File(...)):
                 "eventId": getattr(payload, "event_id", None),
                 "previewUrl": f"/preview/{job_id}.jpg",
             })
+
         except Exception as e:
             print("[restore/batch error]", f.filename, job_id)
             print(traceback.format_exc())
@@ -5795,7 +5927,12 @@ async def restore_from_json_batch(files: list[UploadFile] = File(...)):
             })
 
     ok_count = sum(1 for r in results if r.get("ok"))
-    return JSONResponse({"ok": True, "count": ok_count, "results": results,"sessionId": session_id})
+    return JSONResponse({
+        "ok": True,
+        "count": ok_count,
+        "results": results,
+        "sessionId": session_id,
+    })
 
 
 @app.get("/jobs")
@@ -5903,130 +6040,114 @@ class JobPatch(BaseModel):
 async def get_job(job_id: str):
     p = job_paths(job_id)
 
-    # 1) まずファイル
+    # 1) ローカル json 優先
     if p["json"].exists():
         data = json.loads(p["json"].read_text(encoding="utf-8"))
         return JSONResponse({"jobId": job_id, "json": data})
 
-    # 2) ファイルが無い場合：DBに存在するか確認（存在しないなら404）
+    # 2) DBに存在確認
     with db_connect() as con:
-        row = con.execute("SELECT job_id FROM jobs WHERE job_id=%s", (job_id,)).fetchone()
+        row = con.execute(
+            "SELECT job_id FROM jobs WHERE job_id=%s",
+            (job_id,)
+        ).fetchone()
+
     if not row:
         raise HTTPException(status_code=404, detail="job not found")
 
-    # # 3) DBにはあるがファイルが無い → 409とかで「再生成して」系にするのが親切
-    # raise HTTPException(status_code=409, detail="job exists but json file is missing")
+    # 3) Storage fallback
+    try:
+        data = download_storage_json(f"{job_id}/latest.json")
+        return JSONResponse({"jobId": job_id, "json": data})
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=404, detail="job json not found")
 
 
 
 @app.get("/preview/{job_id}.jpg")
-async def preview(job_id: str):
-    p = job_paths(job_id)
-    if not p["jpg"].exists():
-        raise HTTPException(status_code=404, detail="preview not found")
-    return FileResponse(p["jpg"], media_type="image/jpg")
+async def preview(job_id: str, request: Request):
+    sp = storage_paths(job_id)
+    public_url = get_public_url(sp["preview"])
 
-def _resolve_event_id(job_id: str, p: dict) -> str:
-    event_id = job_id
+    qs = str(request.url.query or "").strip()
+    if qs:
+        sep = "&" if "?" in public_url else "?"
+        public_url = f"{public_url}{sep}{qs}"
 
-    # 1) jsonから
-    if p["json"].exists():
-        try:
-            data = json.loads(p["json"].read_text(encoding="utf-8"))
-            event_id = (data.get("event_id") or data.get("eventId") or job_id).strip()
-        except Exception:
-            pass
-    else:
-        # 2) DBから（フォールバック）
-        try:
-            with db_connect() as con:
-                row = con.execute("SELECT event_id FROM jobs WHERE job_id=%s", (job_id,)).fetchone()
-            if row and (row.get("event_id") or "").strip():
-                event_id = row["event_id"].strip()
-        except Exception:
-            pass
-
-    return event_id or job_id
+    return RedirectResponse(url=public_url, status_code=307)
 
 
 @app.get("/export/{job_id}.zip")
-async def export_zip(job_id: str):
-    p = job_paths(job_id)
+async def export_zip_single(job_id: str, background_tasks: BackgroundTasks):
+    event_id = resolve_event_id(job_id)
+    sp = storage_paths(job_id)
 
-    jpg_path: Path = p["jpg"]
-    json_path: Path = p["json"]
+    jpg_bytes = download_storage_file(sp["preview"])
+    json_bytes = download_storage_file(sp["json"])
 
-    if not jpg_path.exists():
-        raise HTTPException(404, "preview not found")
-    if not json_path.exists():
-        raise HTTPException(404, "latest.json not found")
-
-    event_id = _resolve_event_id(job_id, p)
-
-    # zip の中のファイル名
-    jpg_name = f"{event_id}_招聘.jpg"
-    json_name = f"{event_id}_backup.json"
-
-    # 一時zipを作って返す（OS temp）
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
     tmp_path = Path(tmp.name)
     tmp.close()
 
-    try:
-        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            z.write(jpg_path, arcname=jpg_name)
-            z.write(json_path, arcname=json_name)
+    with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr(f"{event_id}_招聘.jpg", jpg_bytes)
+        z.writestr(f"{event_id}_backup.json", json_bytes)
 
-        zip_filename = f"{event_id}_export.zip"
-        return FileResponse(tmp_path, media_type="application/zip", filename=zip_filename)
-
-    finally:
-        # FileResponse は送信後に読むので、ここで消すと壊れる。
-        # ✅ なので即削除はしない。代わりに「後で掃除」する方が安全。
-        # ひとまず残してOK（/var/data や /tmp を定期清掃）
-        pass
+    background_tasks.add_task(lambda: os.remove(tmp_path) if tmp_path.exists() else None)
+    return FileResponse(
+        tmp_path,
+        media_type="application/zip",
+        filename=f"{event_id}_export.zip",
+    )
 
 @app.get("/download/{job_id}.jpg")
-async def download(job_id: str):
-    p = job_paths(job_id)
-    file_path = p["jpg"]
-    if not file_path.exists():
-        raise HTTPException(404, "preview not found")
+async def download(job_id: str, background_tasks: BackgroundTasks):
+    event_id = resolve_event_id(job_id)
+    sp = storage_paths(job_id)
 
-    event_id = job_id
-
-    # 1) jsonから
-    if p["json"].exists():
-        try:
-            data = json.loads(p["json"].read_text(encoding="utf-8"))
-            event_id = (data.get("event_id") or data.get("eventId") or job_id).strip()
-        except Exception:
-            pass
-    else:
-        # 2) DBから（フォールバック）
-        with db_connect() as con:
-            row = con.execute("SELECT event_id FROM jobs WHERE job_id=%s", (job_id,)).fetchone()
-        if row and (row.get("event_id") or "").strip():
-            event_id = row["event_id"].strip()
-
+    jpg_bytes = download_storage_file(sp["preview"])
     filename = f"{event_id}_招聘.jpg"
-    return FileResponse(file_path, media_type="image/jpeg", filename=filename)
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    tmp_path = Path(tmp.name)
+    tmp.write(jpg_bytes)
+    tmp.close()
+
+    background_tasks.add_task(lambda: os.remove(tmp_path) if tmp_path.exists() else None)
+
+    return FileResponse(
+        tmp_path,
+        media_type="image/jpeg",
+        filename=filename,
+    )
 
 @app.get("/debug/{job_id}/latest.json")
-async def debug_latest(job_id: str):
-    p = job_paths(job_id)
-    if not p["json"].exists():
-        raise HTTPException(status_code=404, detail="debug blocks not found")
-    return FileResponse(p["json"], media_type="application/json")
+async def debug_latest(job_id: str, request: Request):
+    sp = storage_paths(job_id)
+    public_url = get_public_url(sp["json"])
+
+    qs = str(request.url.query or "").strip()
+    if qs:
+        sep = "&" if "?" in public_url else "?"
+        public_url = f"{public_url}{sep}{qs}"
+
+    return RedirectResponse(url=public_url, status_code=307)
 
 
 
 @app.get("/debug/{job_id}/blocks.json")
-async def debug_blocks(job_id: str):
-    p = job_paths(job_id)
-    if not p["debug_blocks"].exists():
-        raise HTTPException(status_code=404, detail="debug blocks not found")
-    return FileResponse(p["debug_blocks"], media_type="application/json")
+async def debug_blocks(job_id: str, request: Request):
+    sp = storage_paths(job_id)
+    public_url = get_public_url(sp["debug_blocks"])
+
+    qs = str(request.url.query or "").strip()
+    if qs:
+        sep = "&" if "?" in public_url else "?"
+        public_url = f"{public_url}{sep}{qs}"
+
+    return RedirectResponse(url=public_url, status_code=307)
 
 
 
@@ -6036,30 +6157,18 @@ async def debug_blocks(job_id: str):
 # 選択ジョブのPNGをまとめてZIP（納品用）
 # ------------------------------------------------------------
 def resolve_event_id(job_id: str) -> str:
-    p = job_paths(job_id)
-    event_id = job_id
+    try:
+        with db_connect() as con:
+            row = con.execute(
+                "SELECT event_id FROM jobs WHERE job_id=%s",
+                (job_id,),
+            ).fetchone()
+        if row and (row.get("event_id") or "").strip():
+            return sanitize_basename(row["event_id"].strip())
+    except Exception:
+        pass
 
-    # 1) JSON優先
-    if p["json"].exists():
-        try:
-            data = json.loads(p["json"].read_text(encoding="utf-8"))
-            event_id = (data.get("event_id") or data.get("eventId") or job_id).strip()
-        except Exception:
-            pass
-    else:
-        # 2) DBフォールバック
-        try:
-            with db_connect() as con2:
-                row = con2.execute(
-                    "SELECT event_id FROM jobs WHERE job_id=%s",
-                    (job_id,),
-                ).fetchone()
-            if row and (row.get("event_id") or "").strip():
-                event_id = row["event_id"].strip()
-        except Exception:
-            pass
-
-    return sanitize_basename(event_id or job_id)
+    return sanitize_basename(job_id)
 
 def sanitize_basename(s: str) -> str:
     s = (s or "").strip()
@@ -6098,68 +6207,62 @@ async def export_zip(req: ExportReq, background_tasks: BackgroundTasks):
     export_id = f"export_{int(time.time())}_{uuid.uuid4().hex}"
     zip_path = EXPORT_DIR / f"{export_id}.zip"
 
-    used = {}
-    added = 0
+    def pick_base(job_id: str, used_names: dict[str, int]) -> str:
+        # eventId を最優先
+        base0 = resolve_event_id(job_id)
 
-    def pick_base(job_id: str) -> str:
-        p = job_paths(job_id)
-
-        # 1) jobId / filename は従来通り
-        if req.nameMode == "jobId":
-            base0 = job_id
-        elif req.nameMode == "filename":
-            base0 = (mp.get(job_id) or job_id)
-        elif req.nameMode == "eventId":
-            # 2) eventId 優先（json → DB）
-            event_id = job_id
-            if p["json"].exists():
-                try:
-                    data = json.loads(p["json"].read_text(encoding="utf-8"))
-                    event_id = (data.get("event_id") or data.get("eventId") or job_id).strip()
-                except Exception:
-                    pass
-            else:
-                try:
-                    with db_connect() as con2:
-                        row = con2.execute("SELECT event_id FROM jobs WHERE job_id=%s", (job_id,)).fetchone()
-                    if row and (row.get("event_id") or "").strip():
-                        event_id = row["event_id"].strip()
-                except Exception:
-                    pass
-            base0 = event_id or job_id
-        else:
-            base0 = job_id
+        # fallback
+        if not base0:
+            base0 = mp.get(job_id) or job_id
 
         base0 = sanitize_basename(base0)
 
-        # 同名衝突回避
-        used[base0] = used.get(base0, 0) + 1
-        return base0 if used[base0] == 1 else f"{base0} ({used[base0]})"
+        # 重複対応
+        used_names[base0] = used_names.get(base0, 0) + 1
+        return base0 if used_names[base0] == 1 else f"{base0} ({used_names[base0]})"
 
-    used = {}
+    used_names: dict[str, int] = {}
+    added = 0
+
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for job_id in req.jobIds:
-            p = job_paths(job_id)
+            try:
+                base = pick_base(job_id, used_names)
 
-            if not p["jpg"].exists():
+                # preview.jpg は Storage から取得
+                jpg_bytes = download_storage_file(f"{job_id}/preview.jpg")
+                z.writestr(f"{base}_招聘.jpg", jpg_bytes)
+                added += 1
+
+                # latest.json も必要なら Storage から取得
+                if req.includeJson:
+                    try:
+                        json_bytes = download_storage_file(f"{job_id}/latest.json")
+                        z.writestr(f"{base}_backup.json", json_bytes)
+                    except HTTPException:
+                        # json が無い個体は jpg だけ入れて続行
+                        pass
+
+            except HTTPException:
+                # preview.jpg が無い job はスキップ
+                continue
+            except Exception as e:
+                print("[jobs/export.zip error]", job_id, e)
                 continue
 
-            base0 = resolve_event_id(job_id)
+    if added == 0:
+        if zip_path.exists():
+            os.remove(zip_path)
+        raise HTTPException(404, "no exportable jobs found")
 
-            used[base0] = used.get(base0, 0) + 1
-            base = base0 if used[base0] == 1 else f"{base0} ({used[base0]})"
-
-            z.write(p["jpg"], arcname=f"{base}_招聘.jpg")
-
-            if req.includeJson and p["json"].exists():
-                z.write(p["json"], arcname=f"{base}_backup.json")
-
-    # 送信後にzip削除（溜まり続けない）
+    # 送信後にzip削除
     background_tasks.add_task(lambda: os.remove(zip_path) if zip_path.exists() else None)
 
-    # zipファイル名（DL時）
-    dl_name = "export.zip"
-    return FileResponse(str(zip_path), media_type="application/zip", filename=dl_name)
+    return FileResponse(
+        str(zip_path),
+        media_type="application/zip",
+        filename="export.zip",
+    )
 
 
 
@@ -6167,34 +6270,50 @@ class JobDeleteReq(BaseModel):
     delete_files: bool = True
     force: bool = False  # lockedでも消したい場合だけTrue
 
+def delete_storage_file(remote_path: str):
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{remote_path}"
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    }
+
+    res = requests.delete(url, headers=headers, timeout=30)
+    if res.status_code not in (200, 204, 404):
+        raise RuntimeError(f"storage delete failed: {res.status_code} {res.text}")
+
+
 @app.delete("/job/{job_id}")
 async def delete_job(job_id: str, req: JobDeleteReq = JobDeleteReq()):
-    # まずDBを確認
     with db_connect() as con:
         row = con.execute(
             "SELECT locked FROM jobs WHERE job_id=%s",
             (job_id,),
         ).fetchone()
+
         if not row:
             raise HTTPException(404, "job not found")
 
         if bool(row.get("locked")) and not req.force:
             raise HTTPException(400, "This job is locked.")
 
-        # DB削除
         con.execute("DELETE FROM jobs WHERE job_id=%s", (job_id,))
 
-    # ファイル削除（任意）
-    deleted_files = False
+    deleted_storage = False
+    storage_errors = []
+
     if req.delete_files:
-        try:
-            p = job_paths(job_id)
-            # job_paths(job_id)["dir"] がある前提（無ければ _data/job_id に合わせてください）
-            shutil.rmtree(p["dir"], ignore_errors=True)
-            deleted_files = True
-        except Exception:
-            # ファイル削除失敗でもDBは消えてるので、ここは 200 で返す方が運用楽
-            deleted_files = False
+        sp = storage_paths(job_id)
+        for remote_path in sp.values():
+            try:
+                delete_storage_file(remote_path)
+            except Exception as e:
+                storage_errors.append(f"{remote_path}: {e}")
 
-    return {"ok": True, "jobId": job_id, "deletedFiles": deleted_files}
+        deleted_storage = len(storage_errors) == 0
 
+    return {
+        "ok": True,
+        "jobId": job_id,
+        "deletedStorage": deleted_storage,
+        "storageErrors": storage_errors,
+    }

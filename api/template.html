@@ -151,6 +151,7 @@ text-rendering: optimizeLegibility;
   align-items: flex-start;
 }
 
+
 #eventDateWrap {
   flex-shrink: 0;
   min-width: 0;
@@ -213,7 +214,7 @@ text-rendering: optimizeLegibility;
   margin-left: 0;
 }
 
-.info-row.is-newline {
+#eventDatetime-row.is-newline {
   align-items: center;
 }
 
@@ -508,7 +509,7 @@ svg {
     
           <div id="eventDatetimeRight">
             <div id="eventDatetimeTimeWrap">
-              <span id="eventDatetimeTime"></span>
+              <span id="eventDatetimeTime">2222</span>
             </div>
             <div id="eventDatetimeTimeNote"></div>
           </div>
@@ -847,7 +848,7 @@ svg {
       const chairName = (c.name_display || "").trim();
       const chairAff = (c.affiliation || "").trim();
 
-      const chairRole = (c.role || "").trim();
+      let chairRole = (c.role || "").trim();
 
       if (!chairName && !chairAff) {
         chairRow.classList.add("hidden");
@@ -856,15 +857,21 @@ svg {
         document.getElementById("eventChairName").textContent = chairName ? `${chairName}` : "";
         document.getElementById("eventChairAff").textContent = chairAff || "";
         document.getElementById("eventChairHonorificTitle").textContent = c.honorific_title || "";
-        document.getElementById("eventChairLabel").textContent = chairRole || "座長";
+       
 
         if (chairRole.toLowerCase() === "総合司会") {
-         const chairRole = document.getElementById("eventChairLabel");
-          chairRole.classList.add("pill2");
+         const eventChairLabel = document.getElementById("eventChairLabel");
+          eventChairLabel.classList.add("pill2");
         }else {
-          const chairRole = document.getElementById("eventChairLabel");
-          chairRole.classList.remove("pill2");
+          if (chairRole.toLowerCase() !== "座長") {
+            chairRole = "座長";
+            
+          }
+          const eventChairLabel = document.getElementById("eventChairLabel");
+          eventChairLabel.classList.remove("pill2");
       }
+
+       document.getElementById("eventChairLabel").textContent = chairRole || "座長";
     }
 
        const unit = document.getElementById("unitText");
