@@ -937,12 +937,12 @@ useEffect(() => {
               時間を改行表示
             </label>
 
-            <Field label="注釈" help="日時の下に小さめの文字で表示される行。改行も可能。例: 各講演35分（Q&A含む）など">
+            <Field label="注釈" help="日時の下に小さめの文字で表示される行。改行も可能。例: 各講演35分（Q&A含む）など ※VM(本社)の時のみ自動処理が実行されます。">
               <Control
                 as="textarea"
                 rows={2}
                 style={{ width: "100%" }}
-                placeholder="例:※各講演35分 (Q&A含む)"
+                placeholder=" 例:※各講演35分 (Q&A含む)"
                 value={json.datetime_note || ""}
                 onChange={(e) => updateAtPath(["datetime_note"], e.target.value)}
               />

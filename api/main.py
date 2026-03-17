@@ -1535,7 +1535,22 @@ def batch_fetch_system_and_vm_rows(
             row = rowvals[0] if rowvals else []
             eid, rownum = meta
             vm_rows_by_event[eid].append(_rowdict(vm_headers, row, sheet=vm_sheet, rownum=rownum))
-    print(vm_rows_by_event)
+    
+    for eid in uniq_event_ids:
+        presence_rows = presence_rows_by_event.get(eid, [])
+        vm_rows = vm_rows_by_event.get(eid, [])
+
+        # Presenceからsheet一覧を取得
+        sheets = {
+            normalize_space(r.get("_sheet", ""))
+            for r in presence_rows
+            if isinstance(r, dict) and r.get("_sheet")
+        }
+
+        # vm_rowsに付与
+        for r in vm_rows:
+            if isinstance(r, dict):
+                r["_presence_sheets"] = list(sheets)
 
     return presence_rows_by_event, vm_rows_by_event, vm_id_col_used
 
@@ -1663,72 +1678,8 @@ def fetch_rows_for_system_id_fast(
     return out
 
 
-def preload_system_id_index(workbook, sheetname_list, *, header_row: int = 2, id_col_name: str = "システムID"):
-    """
-    3シート側は「存在チェック」用途。
-    system_id -> [{sheet,row}, ...]
-    """
-    index: dict[str, list[dict]] = {}
-
-    for sheet_name in sheetname_list:
-        ws = workbook.worksheet(sheet_name)
-
-        headers = make_unique(ws.row_values(header_row))
-        if id_col_name not in headers:
-            # シート構成が変わっても落とさずSKIP
-            print(f"[SKIP] {sheet_name}: '{id_col_name}' not found (header_row={header_row})")
-            continue
-
-        id_col = headers.index(id_col_name) + 1
-        ids = ws.col_values(id_col)  # 列だけ（軽い）
-
-        for row_num, v in enumerate(ids, start=1):
-            if row_num <= header_row:
-                continue
-            key = str(v).strip()
-            if not key:
-                continue
-            index.setdefault(key, []).append({"sheet": sheet_name, "row": row_num})
-
-    return index
 
 
-def find_event_rows_by_system_id(workbook, event_id, sheetname_list, header_row=1, id_col_name="システムID"):
-    results = []
-
-    for sheet_name in sheetname_list:
-        ws = workbook.worksheet(sheet_name)
-
-        # ヘッダー取得（重複対策でユニーク化）
-        headers_raw = ws.row_values(header_row)
-        headers = make_unique(headers_raw)
-
-        if id_col_name not in headers:
-            print(f"[SKIP] {sheet_name}: '{id_col_name}' column not found")
-            continue
-
-        id_col_idx = headers.index(id_col_name) + 1  # gspreadは1始まり
-
-        # 「システムID」列だけ取得して検索
-        id_values = ws.col_values(id_col_idx)
-
-        for row_num, v in enumerate(id_values, start=1):
-            if row_num <= header_row:
-                continue
-
-            if str(v).strip() == str(event_id).strip():
-                row_values = ws.row_values(row_num)
-                # 列数ズレ対策
-                if len(row_values) < len(headers):
-                    row_values += [""] * (len(headers) - len(row_values))
-
-                results.append({
-                    "sheet": sheet_name,
-                    "row": row_num,
-                    "data": dict(zip(headers, row_values))
-                })
-
-    return results
 
 def _norm(s: str) -> str:
     return " ".join((s or "").replace("　"," ").split()).strip().lower()
@@ -1804,27 +1755,7 @@ def get_gsa_credentials(scopes):
 
     raise RuntimeError("GSA_JSON (or GOOGLE_SA_PATH) is not set")
 
-def read_spreadsheet(event_id) -> str:
-    print("Reading spreadsheet...")
-    print("Event ID:", event_id)
-    scope = ['https://www.googleapis.com/auth/spreadsheets',
-         'https://www.googleapis.com/auth/drive']
-    
-    credentials = get_gsa_credentials(scope)
-    gc = gspread.authorize(credentials)
-    SPREADSHEET_KEY = '1hiV0Ve2cnYyrPkBuZcZIcLWeAnJ-ucNiB0P4owZpXug'
-    workbook = gc.open_by_key(SPREADSHEET_KEY)
-    sheetname_list = ["VM(GWET)","VM(例外)","VM(本社)"]
-    
-    hits = find_event_rows_by_system_id(
-    workbook=workbook,
-    event_id=event_id,
-    sheetname_list=sheetname_list,
-    header_row=2,      # ヘッダーが1行目なら1
-    id_col_name="システムID"
-)
 
-    return hits
 
 def dump_json(obj) -> str:
     if hasattr(obj, "model_dump_json"):
@@ -4300,6 +4231,7 @@ async def ai_refine_json(
     draft: DesignJSON,
     speaker_map: Dict[str, str],
     time_candidates: List[str],
+    vm_rows:list[dict],
 ) -> DesignJSON:
     if not OPENAI_API_KEY:
         return draft
@@ -4449,6 +4381,13 @@ async def ai_refine_json(
         return best_text
     
 
+    def is_honsha_vm(vm_rows):
+        return any(
+            "VM(本社)" in (r.get("_presence_sheets") or [])
+            for r in vm_rows if isinstance(r, dict)
+        )
+    
+
     def extract_datetime_from_blocks_v2(blocks: List[TextBlock]) -> str:
         lines = [normalize_space(x) for x in blocks_to_lines(blocks) if normalize_space(x)]
 
@@ -4509,10 +4448,11 @@ async def ai_refine_json(
         refined.datetime = normalize_space(rule_dt)
 
     rule_dt_note = extract_datetime_note_from_blocks(blocks)
-    if rule_dt_note:
-        refined.datetime_note = normalize_space(rule_dt_note)
+    if is_honsha_vm(vm_rows):
+        rule_dt_note = extract_datetime_note_from_blocks(blocks)
+        refined.datetime_note = normalize_space(rule_dt_note) if rule_dt_note else ""
     else:
-        refined.datetime_note = normalize_space(refined.datetime_note)
+        refined.datetime_note = ""
 
     if not refined.organizer:
         refined.organizer = extract_organizer_from_blocks(blocks)
@@ -5241,7 +5181,7 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
     draft = parse_blocks_to_design_json(blocks)
     print("draft from blocks:")
     print(draft)
-    refined = await ai_refine_json(blocks, draft, speaker_map, time_candidates)
+    refined = await ai_refine_json(blocks, draft, speaker_map, time_candidates, vm_rows)
     print("after AI refinement:")
     print(refined)
     refined = assign_talk_times_by_proximity(blocks, refined)

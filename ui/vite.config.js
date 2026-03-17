@@ -5,7 +5,6 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      "/upload": "http://127.0.0.1:8000",
       "/upload-batch": "http://127.0.0.1:8000",
       "/render": "http://127.0.0.1:8000",
       "/jobs": "http://127.0.0.1:8000",
