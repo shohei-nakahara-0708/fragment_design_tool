@@ -164,39 +164,7 @@ TYPESET_JS = r"""
     return Array.from(new Set(out)).sort((a, b) => a - b);
   };
 
-  // ---- force subtitle separators to 2nd-line head ----
-  // 〜 / ~ / dash（- – — − －）を「必ず次行」にする
-  const splitBySubtitle = (s) => {
-    s = unifyTilde(norm(s));
-    if (!s) return null;
-
-    // 1) Japanese tilde
-    let idx = s.indexOf("〜");
-    if (idx > 0) {
-      const a = s.slice(0, idx).trimEnd();
-      const b = s.slice(idx).trimStart(); // 2行目は必ず「〜」から
-      if (a && b) return [a, b];
-    }
-
-    // 2) ASCII tilde
-    idx = s.indexOf("~");
-    if (idx > 0) {
-      const a = s.slice(0, idx).trimEnd();
-      const b = s.slice(idx).trimStart(); // 2行目は必ず「~」から
-      if (a && b) return [a, b];
-    }
-
-    // 3) Dash separator: prefer " space-dash-space "
-const dashRe = /([\–—−－])/;
-const m = dashRe.exec(s);
-if (m && m.index > 0) {
-  const dashPos = m.index;
-  const a = s.slice(0, dashPos + 1).trimEnd(); // ← ハイフンを前行に残す
-  const b = s.slice(dashPos + 1).trimStart();
-  if (a && b) return [a, b];
-}
-
-const shouldIgnoreParenSubtitle = (s, idx) => {
+  const shouldIgnoreParenSubtitle = (s, idx) => {
   const open = s[idx];
   const close = open === "（" ? "）" : ")";
 
@@ -218,26 +186,63 @@ const shouldIgnoreParenSubtitle = (s, idx) => {
   return false;
 };
 
+  // ---- force subtitle separators to 2nd-line head ----
+  // 〜 / ~ / dash（- – — − －）を「必ず次行」にする
+const splitBySubtitle = (s) => {
+  s = unifyTilde(norm(s));
+  if (!s) return null;
 
-idx = s.indexOf("（");
-if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
-  const a = s.slice(0, idx).trimEnd();
-  const b = s.slice(idx).trimStart();
-  if (a && b) return [a, b];
-}
+  // tilde
+  let idx = s.indexOf("〜");
+  if (idx > 0) {
+    return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
+  }
 
-idx = s.indexOf("(");
-if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
-  const a = s.slice(0, idx).trimEnd();
-  const b = s.slice(idx).trimStart();
-  if (a && b) return [a, b];
-}
+  idx = s.indexOf("~");
+  if (idx > 0) {
+    return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
+  }
 
-    return null;
-  };
+  // dash
+  const dashRe = /[–—−－]/;
+  const m = dashRe.exec(s);
+  if (m && m.index > 0) {
+    const p = m.index;
+    return [s.slice(0, p + 1).trimEnd(), s.slice(p + 1).trimStart()];
+  }
+
+  // 括弧
+  idx = s.indexOf("（");
+  if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
+    return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
+  }
+
+  idx = s.indexOf("(");
+  if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
+    return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
+  }
+
+  return null;
+};
+
+const mergeDanglingDotLines = (lines) => {
+  const out = [];
+  for (const line of lines) {
+    const s = norm(line);
+    if (!s) continue;
+
+    if (out.length && out[out.length - 1].endsWith("・")) {
+      out[out.length - 1] = `${out[out.length - 1]}${s}`;
+    } else {
+      out.push(s);
+    }
+  }
+  return out;
+};
 
   // ---- wrap into <=maxLines with px constraint ----
   const wrapPx = (s, maxPx, style, maxLines, forceSubtitle2ndHead) => {
+  if (s.length > 200) return [s]; 
     s = unifyTilde(norm(s));
     if (!s) return [];
 
@@ -269,6 +274,9 @@ if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
       const b = s.slice(p).trim();
       if (!a || !b) continue;
 
+
+      if (a.endsWith("・")) continue;
+
       const wa = measure(a, style);
       const wb = measure(b, style);
 
@@ -288,6 +296,7 @@ if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
         const a = s.slice(0, p).trim();
         const rest = s.slice(p).trim();
         if (!a || !rest) continue;
+        if (a.endsWith("・")) continue;
         if (measure(a, style) > maxPx) continue;
 
         const cand2 = breakPositions(rest);
@@ -298,6 +307,7 @@ if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
           const b = rest.slice(0, q).trim();
           const c = rest.slice(q).trim();
           if (!b || !c) continue;
+          if (a.endsWith("・")) continue;
 
           const wb = measure(b, style);
           const wc = measure(c, style);
@@ -363,6 +373,9 @@ if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
   data.chair.affiliation = chairAffLines.join("\n");
 }
 
+
+
+
   // ---- talks title lines + affiliation wrap ----
   if (Array.isArray(data.talks)) {
     data.talks = data.talks.map((t) => {
@@ -370,7 +383,8 @@ if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
       const title_lines = wrapPx(title, talkMax, talkStyle, 5, true); // ★subtitle強制ON
 
       const affRaw = String(t?.affiliation ?? "");
-      const paras = affRaw.split("\n").map(x => norm(x)).filter(Boolean);
+      let paras = affRaw.split("\n").map(x => norm(x)).filter(Boolean);
+      paras = mergeDanglingDotLines(paras);
       const affLines = [];
       const baseParas = paras.length ? paras : [norm(affRaw)];
       for (const para of baseParas) {
@@ -2090,7 +2104,7 @@ def _looks_like_one_char_lastname_case(core: str) -> bool:
     return False
 
 
-def build_speaker_display(name: str) -> str:
+def add_space_to_jp_name(name: str) -> str:
     raw = str(name or "")
     s = raw.replace("\u3000", " ").strip()
     if not s:
@@ -2145,7 +2159,7 @@ def build_speaker_display(name: str) -> str:
         return v
 
     # ② fallback（既存ロジック）
-    return build_speaker_display(core)
+    return add_space_to_jp_name(core)
 
 def extend_lastname_dict_from_vm(vm_rows):
     for row in vm_rows:
@@ -4261,6 +4275,24 @@ def normalize_chair_role(role: str) -> str:
 
     return r
 
+TIME_NORMALIZE_RE = re.compile(
+    r"(\d{1,2})[:：](\d{2})\s*[〜～\-－ー−~]\s*(\d{1,2})[:：](\d{2})"
+)
+
+def normalize_time_range_talks(s: str) -> str:
+    if not s:
+        return ""
+
+    s = normalize_space(s)
+
+    m = TIME_NORMALIZE_RE.search(s)
+    if not m:
+        return s
+
+    h1, m1, h2, m2 = m.groups()
+
+    return f"{int(h1):02d}:{m1}~{int(h2):02d}:{m2}"
+
 async def ai_refine_json(
     blocks: List[TextBlock],
     draft: DesignJSON,
@@ -4321,7 +4353,7 @@ async def ai_refine_json(
     refined.chair.affiliation = normalize_space(refined.chair.affiliation)
 
     for t in refined.talks:
-        t.time = normalize_space(t.time)
+        t.time = normalize_time_range_talks(t.time)
         t.title_lines = normalize_lines_keep_order(t.title_lines or [])
         t.speaker = norm_name(t.speaker)
         t.affiliation = normalize_space(t.affiliation)
