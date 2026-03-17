@@ -285,6 +285,40 @@ const ui = {
 
   pager: { marginTop: 14, display: "flex", gap: 10, alignItems: "center" },
 
+  pagerInfo: {
+  color: "#64748b",
+  fontSize: 13,
+  whiteSpace: "nowrap",
+},
+pageNumbers: {
+  display: "flex",
+  gap: 6,
+  alignItems: "center",
+  flexWrap: "wrap",
+},
+pageBtn: {
+  minWidth: 36,
+  height: 36,
+  padding: "0 10px",
+  borderRadius: 10,
+  border: "1px solid rgba(226,232,240,0.95)",
+  background: "#fff",
+  color: "#334155",
+  fontSize: 13,
+  fontWeight: 800,
+  cursor: "pointer",
+},
+pageBtnActive: {
+  background: "#0f172a",
+  color: "#fff",
+  border: "1px solid #0f172a",
+},
+pageEllipsis: {
+  fontSize: 13,
+  color: "#94a3b8",
+  padding: "0 4px",
+},
+
   
 };
 
@@ -308,6 +342,7 @@ export default function JobListPage() {
 
   // jpg download cache buster (manual)
   const [previewBuster, setPreviewBuster] = useState(Date.now());
+  
 
   useEffect(() => {
     const run = async () => {
@@ -331,6 +366,8 @@ export default function JobListPage() {
 
         setItems(d.items || []);
         setTotal(d.total || 0);
+
+
 
         // previewが消えてたら先頭を選ぶ（任意）
         // setPreview((p) => p || ((d.items || [])[0] ? buildPreview((d.items || [])[0]) : null));
@@ -375,6 +412,39 @@ export default function JobListPage() {
       ),
     }));
   }, [visibleItems]);
+
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+const startIndex = total === 0 ? 0 : (page - 1) * pageSize + 1;
+const endIndex = Math.min(page * pageSize, total);
+
+const pageNumbers = useMemo(() => {
+  const pages = [];
+  const maxVisible = 5;
+
+  if (totalPages <= maxVisible) {
+    for (let i = 1; i <= totalPages; i++) pages.push(i);
+    return pages;
+  }
+
+  const start = Math.max(1, page - 2);
+  const end = Math.min(totalPages, page + 2);
+
+  if (start > 1) {
+    pages.push(1);
+    if (start > 2) pages.push("...");
+  }
+
+  for (let i = start; i <= end; i++) {
+    pages.push(i);
+  }
+
+  if (end < totalPages) {
+    if (end < totalPages - 1) pages.push("...");
+    pages.push(totalPages);
+  }
+
+  return pages;
+}, [page, totalPages]);
 
   const toggle = (jobId) => {
     setSelected((prev) => {
@@ -753,30 +823,77 @@ export default function JobListPage() {
               </div>
 
               {/* pager */}
-              <div style={ui.pager}>
-                <button style={ui.buttonGhost} onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1 || loading}>
-                  前へ
-                </button>
-                <span style={{ color: "#64748b", fontSize: 13 }}>
-                  {total}件 / {page}ページ目
-                </span>
-                <button style={ui.buttonGhost} onClick={() => setPage((p) => p + 1)} disabled={loading || page * pageSize >= total}>
-                  次へ
-                </button>
-                <button style={ui.buttonGhost} onClick={() => setPreviewBuster(Date.now())} title="download/preview のキャッシュを更新">
-                  ↻ キャッシュ更新
-                </button>
-                  <label style={{ fontSize: 13, color: "#64748b",marginLeft: "auto", display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
-                <input
-                type="checkbox"
-                checked={debug}
-                onChange={() => setDebug((d) => !d)}
-                
-                />
-              
-                  デバッグ表示
-                </label>
-              </div>
+             <div style={{ ...ui.pager, flexWrap: "wrap" }}>
+  <button
+    style={ui.buttonGhost}
+    onClick={() => setPage((p) => Math.max(1, p - 1))}
+    disabled={page <= 1 || loading}
+  >
+    ← 前へ
+  </button>
+
+  <div style={ui.pageNumbers}>
+    {pageNumbers.map((p, idx) =>
+      p === "..." ? (
+        <span key={`ellipsis-${idx}`} style={ui.pageEllipsis}>
+          …
+        </span>
+      ) : (
+        <button
+          key={p}
+          onClick={() => setPage(p)}
+          disabled={loading}
+          style={{
+            ...ui.pageBtn,
+            ...(p === page ? ui.pageBtnActive : null),
+            ...(loading ? ui.disabled : null),
+          }}
+        >
+          {p}
+        </button>
+      )
+    )}
+  </div>
+
+  <button
+    style={ui.buttonGhost}
+    onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+    disabled={loading || page >= totalPages}
+  >
+    次へ →
+  </button>
+
+  <span style={ui.pagerInfo}>
+    {startIndex}–{endIndex} / {total}件（全{totalPages}ページ）
+  </span>
+
+  <button
+    style={ui.buttonGhost}
+    onClick={() => setPreviewBuster(Date.now())}
+    title="download/preview のキャッシュを更新"
+  >
+    ↻ キャッシュ更新
+  </button>
+
+  <label
+    style={{
+      fontSize: 13,
+      color: "#64748b",
+      marginLeft: "auto",
+      display: "flex",
+      alignItems: "center",
+      gap: 4,
+      cursor: "pointer",
+    }}
+  >
+    <input
+      type="checkbox"
+      checked={debug}
+      onChange={() => setDebug((d) => !d)}
+    />
+    デバッグ表示
+  </label>
+</div>
             </div>
           </div>
 
