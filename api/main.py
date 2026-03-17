@@ -1096,15 +1096,23 @@ def _set_field(payload, key: str, value):
     else:
         setattr(payload, key, value)
 
-CIRCLED_NUM = "①②③④⑤⑥⑦⑧⑨⑩回目"
+TIME_RANGE_IN_TEXT_RE = re.compile(
+    r"(\d{1,2}[:：]\d{2}\s*[～〜\-ー−－—–~]\s*\d{1,2}[:：]\d{2})"
+)
+
+SESSION_LABEL_RE = re.compile(
+    r"[①②③④⑤⑥⑦⑧⑨⑩]"
+    r"|(?:[0-9０-９]+|[一二三四五六七八九十]+)\s*回目"
+    r"|第\s*(?:[0-9０-９]+|[一二三四五六七八九十]+)\s*回"
+)
+
+def has_session_label(s: str) -> bool:
+    return bool(SESSION_LABEL_RE.search(str(s or "")))
 
 def normalize_time_range(s: str) -> str:
     s = str(s or "")
-    # 全角コロン→半角
     s = s.replace("：", ":")
-    # 波線統一
-    s = re.sub(r"[～〜\-ー]", "~", s)
-    # ★空白は全部消さない。~の前後だけ詰める
+    s = re.sub(r"[～〜\-ー−－—–]", "~", s)
     s = re.sub(r"\s*~\s*", "~", s)
     s = s.strip()
     return s
@@ -1112,29 +1120,30 @@ def normalize_time_range(s: str) -> str:
 def extract_session_times_from_blocks(blocks) -> list[str]:
     if not blocks:
         return []
-    # ① 12：20～12：50 / ② 13：00～13：30 のようなブロックを拾う
-    buf = []
+
+    out = []
     for b in blocks:
         t = (b.get("text") if isinstance(b, dict) else getattr(b, "text", "")) or ""
-        if any(c in t for c in CIRCLED_NUM) and ("～" in t or "〜" in t or "~" in t or "：" in t or ":" in t):
-            buf.append(str(t))
-    # 既存の SESSION_TIME_RE を流用（dtに対して使ってたのと同じ）
-    joined = "\n".join(buf)
-    out = []
-    for m in SESSION_TIME_RE.finditer(joined):
-        tt = normalize_time_range(m.group(1))
-        if tt and tt not in out:
-            out.append(tt)
+
+        if not has_session_label(t):
+            continue
+
+        for m in TIME_RANGE_IN_TEXT_RE.finditer(t):
+            tt = normalize_time_range(m.group(1))
+            if tt and tt not in out:
+                out.append(tt)
+
     return out
+
+
 
 def extract_session_times_from_datetime(dt: str) -> list[str]:
     dt = str(dt or "")
-    # ★①②が無いならセッション抽出しない（ここが重要）
-    if not any(c in dt for c in CIRCLED_NUM):
+    if not has_session_label(dt):
         return []
 
     out = []
-    for m in SESSION_TIME_RE.finditer(dt):
+    for m in TIME_RANGE_IN_TEXT_RE.finditer(dt):
         t = normalize_time_range(m.group(1))
         if t and t not in out:
             out.append(t)
@@ -1143,14 +1152,18 @@ def extract_session_times_from_datetime(dt: str) -> list[str]:
 def should_hide_talk_times(payload) -> bool:
     dt = str(_get_field(payload, "datetime", "") or "")
     parts = _get_field(payload, "datetime_parts", None)
+
     time_str = ""
     if parts:
         time_str = parts.get("time", "") if isinstance(parts, dict) else getattr(parts, "time", "")
 
-    if any(c in dt for c in CIRCLED_NUM):
+    # セッション形式なら非表示
+    if has_session_label(dt):
         return True
-    if "1回目" in time_str or "2回目" in time_str:
+
+    if has_session_label(time_str):
         return True
+
     return False
 
 def clear_talk_times(payload):
@@ -1194,9 +1207,9 @@ def fill_datetime_parts(payload, blocks=None):
 
     dt = str(pget(payload, "datetime", "") or "")
 
-    session_times = extract_session_times_from_datetime(dt)
-    if not session_times and blocks:
-        session_times = extract_session_times_from_blocks(blocks)
+    session_times = extract_session_times_from_datetime(blocks)
+    if not session_times:
+        session_times = extract_session_times_from_blocks(dt)
 
     talks = pget(payload, "talks", []) or []
     if session_times and len(session_times) == 1 and talks:
@@ -4608,7 +4621,7 @@ def _norm_title_key(s: str) -> str:
     # 記号ゆらぎを減らす
     s = s.replace("～", "〜").replace("−", "-").replace("—", "-").replace("–", "-").replace("－", "-")
     # かっこ/引用符などを除去（マッチ安定）
-    for ch in ['"', "“", "”", "「", "」", "’", "‘", "（", "）", "(", ")", "【", "】", "[", "]"]:
+    for ch in ['"', "“", "”", "「", "」", "’", "‘", "（", "）", "(", ")", "【", "】", "[", "]", "『", "』"]:
         s = s.replace(ch, "")
     # スペース除去
     return s.replace(" ", "").replace("\u3000", "")
@@ -4664,6 +4677,10 @@ def _strip_outer_quotes(s: str) -> str:
     if s2.startswith("「"):
         s2 = s2[1:]
     if s2.endswith("」"):
+        s2 = s2[:-1]
+    if s2.startswith("『"):
+        s2 = s2[1:]
+    if s2.endswith("』"):
         s2 = s2[:-1]
     return s2.strip()
 
