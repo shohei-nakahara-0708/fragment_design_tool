@@ -214,8 +214,8 @@ text-rendering: optimizeLegibility;
   margin-left: 0;
 }
 
-#eventDatetime-row.is-newline {
-  align-items: center;
+#eventDatetime-row.is-newline .pill {
+  margin-top: 10px;
 }
 
     .pill {
@@ -509,9 +509,9 @@ svg {
     
           <div id="eventDatetimeRight">
             <div id="eventDatetimeTimeWrap">
-              <span id="eventDatetimeTime"></span>
+              <span id="eventDatetimeTime">1800</span>
             </div>
-            <div id="eventDatetimeTimeNote"></div>
+            <div id="eventDatetimeTimeNote">test</div>
           </div>
         </div>
       </div>
@@ -828,6 +828,13 @@ svg {
 
          const baseSize = Number(d.datetime_note_font_size || 14); // 全体の基本サイズ
          if (Number.isFinite(baseSize)) eventDatetimeTimeNote.style.fontSize = baseSize + "px";
+
+         const isAsciiStart = /^[\x21-\x7E]/.test((d.datetime_note || "").trim());
+         if (isAsciiStart) {
+           eventDatetimeTimeNote.style.paddingLeft = "3px";
+         }else {
+           eventDatetimeTimeNote.style.paddingLeft = "0";
+         }
 
         //   const baseLeft = Number(d.datetime_note_left || 5); // 左位置の基本値
         //  if (Number.isFinite(baseLeft)) eventDatetimeTimeNote.style.marginLeft = baseLeft + "px";
