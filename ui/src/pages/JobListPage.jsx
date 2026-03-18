@@ -40,6 +40,9 @@ async function downloadWithFilename(url, filename) {
   URL.revokeObjectURL(objectUrl);
 }
 
+
+
+
 /** ---------- UI tokens ---------- */
 const ui = {
   page: {
@@ -184,7 +187,9 @@ const ui = {
   sessionTitle: { fontWeight: 900, color: "#0f172a" },
 
   card: {
-    border: "1px solid rgba(226,232,240,0.95)",
+    borderWidth: "1px",
+    borderStyle: "solid",
+    borderColor: "rgba(226,232,240,0.95)",
     borderRadius: 16,
     overflow: "hidden",
     background: "#fff",
@@ -492,7 +497,31 @@ const pageNumbers = useMemo(() => {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+  };
+  
+  const exportPdf = async () => {
+  if (selected.size === 0) return;
+
+  const jobIds = Array.from(selected);
+  const r = await fetch(`${API_BASE}/jobs/export.pdf`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jobIds,
+      pageSize: "fit",   // or "a4"
+      orientation: "auto",
+    }),
+  });
+
+  if (!r.ok) {
+    const t = await r.text();
+    alert(`pdf export failed: ${r.status}\n${t}`);
+    return;
+  }
+
+  await downloadBlobWithFilename(r, "selected.pdf");
 };
+
 
 
   const getFilenameFromDisposition = (disposition) => {
@@ -506,7 +535,24 @@ const pageNumbers = useMemo(() => {
   } catch {
     return raw;
   }
-};
+  };
+  
+  async function downloadBlobWithFilename(response, fallbackFilename) {
+  const blob = await response.blob();
+  const cd = response.headers.get("Content-Disposition");
+  const suggested = getFilenameFromDisposition(cd);
+  const filename = suggested || fallbackFilename;
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 
   const exportOneZip = async (jobId, filename) => {
   const API_BASE = import.meta.env.VITE_API_BASE || "";
@@ -625,6 +671,14 @@ const pageNumbers = useMemo(() => {
                   ＋ Upload
                 </button>
               </Link>
+
+              {/* <button
+              style={{ ...ui.buttonGhost2, ...(selected.size === 0 ? ui.disabled : {}) }}
+              onClick={exportPdf}
+              disabled={selected.size === 0}
+            >
+              PDF Export
+            </button> */}
 
               <button style={{ ...ui.buttonGhost2, ...(selected.size === 0 ? ui.disabled : {}) }} onClick={exportZip} disabled={selected.size === 0}>
                 ZIP Export

@@ -51,6 +51,8 @@ from PIL import Image
 import mimetypes
 import requests
 
+import io
+
 
 load_dotenv()
 
@@ -1329,7 +1331,7 @@ def fill_datetime_parts(payload, blocks=None):
         dow = extract_dow_from_blocks(blocks)
         if dow:
             parts.dow = dow
-            
+
     if session_times:
         if len(session_times) == 1:
             time_joined = session_times[0]
@@ -6726,7 +6728,83 @@ async def export_zip(req: ExportReq, background_tasks: BackgroundTasks):
         filename="export.zip",
     )
 
+class ExportPdfReq(BaseModel):
+    jobIds: List[str] = Field(default_factory=list)
+    pageSize: Literal["fit", "a4"] = "fit"   # fit: 画像サイズそのまま / a4: A4に載せる
+    orientation: Literal["portrait", "landscape", "auto"] = "auto"
 
+
+def _fit_to_a4(img: Image.Image, orientation: str = "auto") -> Image.Image:
+    # 150dpiくらいのA4
+    PORTRAIT = (1240, 1754)
+    LANDSCAPE = (1754, 1240)
+
+    if orientation == "portrait":
+        canvas_size = PORTRAIT
+    elif orientation == "landscape":
+        canvas_size = LANDSCAPE
+    else:
+        canvas_size = LANDSCAPE if img.width > img.height else PORTRAIT
+
+    canvas = Image.new("RGB", canvas_size, "white")
+
+    ratio = min(canvas_size[0] / img.width, canvas_size[1] / img.height)
+    new_w = max(1, int(img.width * ratio))
+    new_h = max(1, int(img.height * ratio))
+
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+    x = (canvas_size[0] - new_w) // 2
+    y = (canvas_size[1] - new_h) // 2
+    canvas.paste(resized, (x, y))
+    return canvas
+
+
+@app.post("/jobs/export.pdf")
+async def export_pdf(req: ExportPdfReq, background_tasks: BackgroundTasks):
+    if not req.jobIds:
+        raise HTTPException(400, "jobIds is empty")
+
+    images: list[Image.Image] = []
+
+    for job_id in req.jobIds:
+        sp = storage_paths(job_id)
+        jpg_bytes = download_storage_file(sp["preview"])
+
+        try:
+            img = Image.open(io.BytesIO(jpg_bytes)).convert("RGB")
+        except Exception as e:
+            raise HTTPException(500, f"failed to open preview jpg: {job_id}: {e}")
+
+        if req.pageSize == "a4":
+            img = _fit_to_a4(img, req.orientation)
+
+        images.append(img)
+
+    if not images:
+        raise HTTPException(400, "no images")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp_path = Path(tmp.name)
+    tmp.close()
+
+    first = images[0]
+    rest = images[1:]
+
+    first.save(
+        tmp_path,
+        "PDF",
+        resolution=150.0,
+        save_all=True,
+        append_images=rest,
+    )
+
+    background_tasks.add_task(lambda: os.remove(tmp_path) if tmp_path.exists() else None)
+
+    return FileResponse(
+        tmp_path,
+        media_type="application/pdf",
+        filename=f"selected_{len(req.jobIds)}items.pdf",
+    )
 
 class JobDeleteReq(BaseModel):
     delete_files: bool = True
