@@ -1273,7 +1273,16 @@ def _ensure_datetime_parts(parts):
         time=getattr(parts, "time", "") or "",
     )
 
-    
+
+def extract_dow_from_blocks(blocks) -> str:
+    ordered = sorted(blocks, key=lambda b: (b.top, b.left))
+    for b in ordered:
+        s = normalize_datetime_text(b.text or "")
+        m = re.search(r"\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*[（(]\s*([月火水木金土日])\s*[）)]", s)
+        if m:
+            return m.group(1)
+    return ""
+  
 
 def fill_datetime_parts(payload, blocks=None):
     def pget(obj, key, default=None):
@@ -1306,14 +1315,21 @@ def fill_datetime_parts(payload, blocks=None):
         r"(?:\s*[（(]\s*(?P<dow>[^）)\s]+)\s*[）)])?",
         normalize_datetime_text(dt)
     )
+    
 
     # ★必ず DatetimeParts に統一
     parts = _ensure_datetime_parts(pget(payload, "datetime_parts", None))
 
     if m:
         y, mo, d, dow = (m.group("y") or "", m.group("mo") or "", m.group("d") or "", m.group("dow") or "")
-        parts.year, parts.month, parts.day, parts.dow = y, mo, d, dow
-
+        parts.year, parts.month, parts.day = y, mo, d
+        parts.dow = dow or extract_dow_from_blocks(blocks)
+    else:
+        # 必要なら blocks だけでも拾う
+        dow = extract_dow_from_blocks(blocks)
+        if dow:
+            parts.dow = dow
+            
     if session_times:
         if len(session_times) == 1:
             time_joined = session_times[0]
