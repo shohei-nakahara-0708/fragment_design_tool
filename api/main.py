@@ -5640,6 +5640,17 @@ async def render_png_bytes(payload: DesignJSON) -> tuple[bytes, str]:
 
         await page.evaluate("""
         () => {
+        const footer = document.querySelector(".footer");
+        if (!footer) return;
+        const r = footer.getBoundingClientRect();
+        const dy = Math.round(r.top) - r.top;
+        footer.style.transform = `translateY(${dy}px)`;
+        }
+        """)
+        await page.wait_for_timeout(50)
+
+        await page.evaluate("""
+        () => {
             document.documentElement.style.margin = "0";
             document.body.style.margin = "0";
             document.body.style.padding = "0";
@@ -5652,24 +5663,29 @@ async def render_png_bytes(payload: DesignJSON) -> tuple[bytes, str]:
         """)
 
         wrap = page.locator(".wrap")
+        footer = page.locator(".footer")
 
         for _ in range(60):
-            box = await wrap.bounding_box()
-            if box and box["height"] and box["height"] > 10:
+            wrap_box = await wrap.bounding_box()
+            footer_box = await footer.bounding_box()
+            if wrap_box and footer_box and wrap_box["height"] > 10:
                 break
             await page.wait_for_timeout(100)
         else:
-            html = await page.content()
-            raise RuntimeError("wrap bounding box not ready")
+            raise RuntimeError("layout not ready")
 
-        box = await wrap.bounding_box()
-        if not box:
-            raise RuntimeError("wrap bounding box is None")
+        wrap_box = await wrap.bounding_box()
+        footer_box = await footer.bounding_box()
 
-        clip_x = math.floor(box["x"])
-        clip_y = math.floor(box["y"])
-        clip_w = math.ceil(box["width"])
-        clip_h = min(math.ceil(box["height"]), MAX_HEIGHT)
+        if not wrap_box or not footer_box:
+            raise RuntimeError("bounding box is None")
+
+        clip_x = math.floor(wrap_box["x"])
+        clip_y = math.floor(wrap_box["y"])
+        clip_w = math.ceil(wrap_box["width"])
+
+        footer_bottom = footer_box["y"] + footer_box["height"]
+        clip_h = min(math.ceil(footer_bottom - wrap_box["y"]), MAX_HEIGHT)
 
         await page.set_viewport_size({
             "width": max(clip_x + clip_w, 1),
