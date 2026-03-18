@@ -72,23 +72,25 @@ const ui = {
   muted: { fontSize: 12, color: "#666" },
 
   badge: (tone = "gray") => {
-    const base = {
-      display: "inline-flex",
-      alignItems: "center",
-      gap: 6,
-      padding: "5px 10px",
-      borderRadius: 999,
-      border: "1px solid #e3e3e3",
-      fontSize: 12,
-      lineHeight: 1,
-      userSelect: "none",
-      whiteSpace: "nowrap",
-    };
-    if (tone === "green") return { ...base, background: "#ecf8ef", borderColor: "#bfe3c6", color: "#1b6b2f" };
-    if (tone === "red") return { ...base, background: "#fff2f2", borderColor: "#f2c2c2", color: "#a00000" };
-    if (tone === "blue") return { ...base, background: "#eef5ff", borderColor: "#c7ddff", color: "#1a4fb3" };
-    return { ...base, background: "#f6f6f6", color: "#444" };
-  },
+  const base = {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    padding: "5px 10px",
+    borderRadius: 999,
+    borderWidth: "1px",
+    borderStyle: "solid",
+    borderColor: "#e3e3e3",
+    fontSize: 12,
+    lineHeight: 1,
+    userSelect: "none",
+    whiteSpace: "nowrap",
+  };
+  if (tone === "green") return { ...base, background: "#ecf8ef", borderColor: "#bfe3c6", color: "#1b6b2f" };
+  if (tone === "red") return { ...base, background: "#fff2f2", borderColor: "#f2c2c2", color: "#a00000" };
+  if (tone === "blue") return { ...base, background: "#eef5ff", borderColor: "#c7ddff", color: "#1a4fb3" };
+  return { ...base, background: "#f6f6f6", color: "#444" };
+},
 
   grid2: { display: "grid", gridTemplateColumns: "1fr 160px", gap: 12, alignItems: "start" },
   field: { display: "grid", gap: 6, marginTop: 10 },
