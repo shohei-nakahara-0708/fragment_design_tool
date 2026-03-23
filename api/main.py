@@ -133,8 +133,6 @@ TYPESET_JS = r"""
     .replace(/[\s,，、:：/／]+$/, "")
     .trim();
 
-  const hasJapanese = (s) => /[\u3040-\u30ff\u3400-\u9fff]/.test(String(s ?? ""));
-
   const isMostlyAscii = (s) => {
     const t = String(s ?? "");
     const visible = [...t].filter(ch => !/\s/.test(ch));
@@ -144,6 +142,17 @@ TYPESET_JS = r"""
   };
 
   const wordCount = (s) => oneLine(s).split(/\s+/).filter(Boolean).length;
+
+  const isOnlySymbols = (s) => {
+    const t = oneLine(s);
+    if (!t) return false;
+    return /^[~〜～\-–—−－・･:：,，/／()（）]+$/.test(t);
+  };
+
+  const startsWithWeakSymbol = (s) => {
+    const t = oneLine(s);
+    return /^[~〜～\-–—−－:：,，/／]+/.test(t);
+  };
 
   // =========================================================
   // measurer element
@@ -190,15 +199,14 @@ TYPESET_JS = r"""
     }
 
     // 前後に空白がある dash だけ候補にする
-    // 例: "A - B", "A – B"
     const dashAroundSpaceRe = /\s[-–—−－]\s/g;
     let m;
     while ((m = dashAroundSpaceRe.exec(s)) !== null) {
-      out.push(m.index + 1);                 // dash の手前
-      out.push(m.index + m[0].length - 1);  // dash の直後
+      out.push(m.index + 1);
+      out.push(m.index + m[0].length - 1);
     }
 
-    // 助詞（ざっくり）
+    // 助詞
     const re = /(を|の|に|と|へ|や|で|が|は|も)/g;
     while ((m = re.exec(s)) !== null) {
       out.push(m.index + m[0].length);
@@ -232,14 +240,14 @@ TYPESET_JS = r"""
     s = unifyTilde(oneLine(s));
     if (!s) return null;
 
-    // 1) " - " / " – " / " — " を最優先
+    // " - " / " – " / " — "
     let m = /\s[-–—−－]\s/.exec(s);
     if (m && m.index > 0) {
       const p = m.index + 1;
       return [s.slice(0, p).trimEnd(), s.slice(p).trimStart()];
     }
 
-    // 2) tilde
+    // 〜 / ~
     let idx = s.indexOf("〜");
     if (idx > 0) {
       return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
@@ -250,8 +258,7 @@ TYPESET_JS = r"""
       return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
     }
 
-    // 3) dash fallback は「語中ハイフン」を避ける
-    // 前後どちらかが空白のときだけ許可
+    // dash fallback: 語中ハイフンは避ける
     const dashRe = /[-–—−－]/g;
     while ((m = dashRe.exec(s)) !== null) {
       const p = m.index;
@@ -262,7 +269,7 @@ TYPESET_JS = r"""
       }
     }
 
-    // 4) 括弧
+    // 括弧
     idx = s.indexOf("（");
     if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
       return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
@@ -308,6 +315,26 @@ TYPESET_JS = r"""
     return out;
   };
 
+    const mergeSymbolOnlyTail = (lines) => {
+    if (!Array.isArray(lines) || lines.length < 2) return lines || [];
+    const out = [...lines];
+
+    for (let i = out.length - 1; i >= 1; i--) {
+      const cur = oneLine(out[i]);
+      if (!cur) {
+        out.splice(i, 1);
+        continue;
+      }
+
+      // 最後の行が記号だけなら前行へくっつける
+      if (isOnlySymbols(cur)) {
+        out[i - 1] = `${oneLine(out[i - 1])}${cur}`;
+        out.splice(i, 1);
+      }
+    }
+    return out;
+  };
+
   const linePenalty = (line, idx, total, opts = {}) => {
     let p = 0;
     const t = oneLine(line);
@@ -315,23 +342,29 @@ TYPESET_JS = r"""
 
     if (!t) p += 9999;
 
-    // 最終行1語だけはかなり避ける（英語系）
+    // 最終行1語だけ
     if (idx === total - 1 && wc === 1 && isMostlyAscii(t)) p += 1600;
 
     // 最終行が短すぎる
     if (idx === total - 1 && t.length <= 8) p += 900;
 
+    // 最終行が記号だけはほぼ禁止
+    if (idx === total - 1 && isOnlySymbols(t)) p += 100000;
+
+    // 最終行が弱い記号スタートで極端に短いのも避ける
+    if (idx === total - 1 && startsWithWeakSymbol(t) && t.length <= 2) p += 50000;
+
     // 先頭が記号っぽい
     if (/^[-–—−－:：,，/／]+/.test(t)) p += 700;
 
-    // GLP- みたいな行末を強く避ける
+    // GLP- みたいな行末を避ける
     if (/^[A-Za-z0-9]+-$/.test(t)) p += 1800;
     if (/[A-Za-z0-9]-$/.test(t)) p += 1200;
 
     // 行末が中途半端
     if (/[のにとへやではがも]$/.test(t)) p += 120;
 
-    // "・" 終わりは避ける
+    // ・終わり
     if (/[・･]$/.test(t)) p += 800;
 
     if (opts.preferBalancedAscii && isMostlyAscii(t) && wc === 1) {
@@ -373,7 +406,7 @@ TYPESET_JS = r"""
       avoidSingleWordLastLine = false,
     } = opts;
 
-    // 1) subtitle rule
+    // subtitle rule
     if (forceSubtitle2ndHead) {
       const sp = splitBySubtitle(s);
       if (sp) {
@@ -381,7 +414,7 @@ TYPESET_JS = r"""
         const b = stripEdgePunct(sp[1]);
 
         if (a && b) {
-          if (measure(a, style) <= maxPx && measure(b, style) <= maxPx) {
+          if (!isOnlySymbols(b) && measure(a, style) <= maxPx && measure(b, style) <= maxPx) {
             return mergeTinyParenTail(mergeDanglingDotLines([a, b])).slice(0, maxLines);
           }
 
@@ -402,19 +435,20 @@ TYPESET_JS = r"""
       }
     }
 
-    // 2) one line
+    // one line
     if (measure(s, style) <= maxPx) return [s];
 
     const cand = breakPositions(s);
     let best = null;
     let bestScore = null;
 
-    // 3) try 2 lines
+    // try 2 lines
     for (const p of cand) {
       const a = stripEdgePunct(s.slice(0, p).trim());
       const b = stripEdgePunct(s.slice(p).trim());
       if (!a || !b) continue;
       if (/[・･]$/.test(a)) continue;
+      if (isOnlySymbols(b)) continue;
 
       const wa = measure(a, style);
       const wb = measure(b, style);
@@ -432,7 +466,7 @@ TYPESET_JS = r"""
     }
     if (best) return mergeTinyParenTail(mergeDanglingDotLines(best)).slice(0, maxLines);
 
-    // 4) try 3 lines
+    // try 3 lines
     if (maxLines >= 3) {
       for (const p of cand) {
         const a = stripEdgePunct(s.slice(0, p).trim());
@@ -447,6 +481,7 @@ TYPESET_JS = r"""
           const c = stripEdgePunct(rest.slice(q).trim());
           if (!b || !c) continue;
           if (/[・･]$/.test(b)) continue;
+          if (isOnlySymbols(c)) continue;
 
           const wb = measure(b, style);
           const wc = measure(c, style);
@@ -466,8 +501,7 @@ TYPESET_JS = r"""
     }
     if (best) return mergeTinyParenTail(mergeDanglingDotLines(best)).slice(0, maxLines);
 
-    // 5) last resort: force by char
-    // 英数字ハイフン連結は途中で切りにくくする
+    // last resort
     const out = [];
     let cur = "";
 
@@ -478,7 +512,6 @@ TYPESET_JS = r"""
       const prevCh = s[i - 1] || "";
       const nextCh = s[i + 1] || "";
 
-      // GLP-1 のような箇所では無理やり切らない
       const isHyphenInsideToken =
         ch === "-" &&
         /[A-Za-z0-9]/.test(prevCh) &&
@@ -538,10 +571,7 @@ TYPESET_JS = r"""
   const wrapEl = document.querySelector(".wrap");
   const wrapW = wrapEl ? wrapEl.clientWidth : 600;
 
-  // タイトル領域
   const talkMax = (wrapW - 28 - 102);
-
-  // talk-info領域
   const rolePillW = 41;
   const infoGap = 14;
   const affMax = (wrapW - 28 - rolePillW - infoGap);
@@ -583,6 +613,7 @@ TYPESET_JS = r"""
 
   evLines = mergeTinyParenTail(evLines);
   evLines = mergeDanglingDotLines(evLines);
+  evLines = mergeSymbolOnlyTail(evLines);
 
   data.event_title_lines = evLines;
   data.event_title = evLines.join("\n");
@@ -599,15 +630,17 @@ TYPESET_JS = r"""
   // =========================================================
   if (Array.isArray(data.talks)) {
     data.talks = data.talks.map((t) => {
-      const rawTitleLines =
-        Array.isArray(t?.title_lines) && t.title_lines.length
-          ? t.title_lines.map(x => oneLine(x)).filter(Boolean)
-          : [oneLine(t?.title ?? "")].filter(Boolean);
+      const titleJoined = oneLine(
+  t?.title
+    ? t.title
+    : (Array.isArray(t?.title_lines) ? t.title_lines.join(" ") : "")
+);
 
-      const titleJoined = oneLine(rawTitleLines.join(" "));
+      
       let title_lines = wrapTalkTitle(titleJoined, talkMax, talkStyle);
       title_lines = mergeTinyParenTail(title_lines);
       title_lines = mergeDanglingDotLines(title_lines);
+      title_lines = mergeSymbolOnlyTail(title_lines);
 
       const affRaw = String(t?.affiliation ?? "");
       const affiliation = normalizeAffiliation(affRaw);
