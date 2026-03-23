@@ -113,17 +113,41 @@ ORG_CANON = {
 SESSION_TIME_RE = re.compile(r"[①②③④⑤⑥⑦⑧⑨⑩]?\s*(\d{1,2}[:：]\d{2}\s*[～〜\-ー~]\s*\d{1,2}[:：]\d{2})")
 TYPESET_JS = r"""
 ({ data }) => {
-  // ---- helpers: normalize ----
+  // =========================================================
+  // helpers: normalize
+  // =========================================================
   const norm = (s) => String(s ?? "")
     .replace(/\u3000/g, " ")
-    .replace(/\s+/g, " ")
+    .replace(/[ \t\r\f\v]+/g, " ")
+    .replace(/\n+/g, "\n")
     .trim();
+
+  const oneLine = (s) => norm(String(s ?? "").replace(/\n/g, " "));
 
   const unifyTilde = (s) => String(s ?? "")
     .replace(/～/g, "〜")
     .trim();
 
-  // ---- measurer element (CSS font/letter-spacing reflected) ----
+  const stripEdgePunct = (s) => String(s ?? "")
+    .replace(/^[\s,，、:：/／]+/, "")
+    .replace(/[\s,，、:：/／]+$/, "")
+    .trim();
+
+  const hasJapanese = (s) => /[\u3040-\u30ff\u3400-\u9fff]/.test(String(s ?? ""));
+
+  const isMostlyAscii = (s) => {
+    const t = String(s ?? "");
+    const visible = [...t].filter(ch => !/\s/.test(ch));
+    if (!visible.length) return false;
+    const ascii = visible.filter(ch => ch.charCodeAt(0) < 128).length;
+    return ascii / visible.length >= 0.7;
+  };
+
+  const wordCount = (s) => oneLine(s).split(/\s+/).filter(Boolean).length;
+
+  // =========================================================
+  // measurer element
+  // =========================================================
   const getMeasurer = () => {
     let el = document.getElementById("__measurer__");
     if (!el) {
@@ -147,191 +171,320 @@ TYPESET_JS = r"""
     el.style.fontWeight = String(style.fontWeight);
     el.style.fontSize = style.fontSize;
     el.style.letterSpacing = style.letterSpacing ?? "normal";
-    el.textContent = text;
-    return el.scrollWidth; // px
+    el.textContent = String(text ?? "");
+    return el.scrollWidth;
   };
 
-  // ---- break candidates ----
+  // =========================================================
+  // break candidates
+  // =========================================================
   const breakPositions = (s) => {
     const out = [];
-    const breakers = new Set([" ", "、", "。",  ",", "，", ":", "：",  "－", "—", "–", "−"]);
+    const breakers = new Set([
+      " ", "、", "。", ",", "，", ":", "：", "/", "／"
+    ]);
+
     for (let i = 0; i < s.length; i++) {
       const ch = s[i];
       if (breakers.has(ch)) out.push(i + 1);
     }
-    // 助詞（ざっくり）
-    const re = /(を|の|に|と|へ|や|で)/g;
+
+    // 前後に空白がある dash だけ候補にする
+    // 例: "A - B", "A – B"
+    const dashAroundSpaceRe = /\s[-–—−－]\s/g;
     let m;
-    while ((m = re.exec(s)) !== null) out.push(m.index + m[0].length);
+    while ((m = dashAroundSpaceRe.exec(s)) !== null) {
+      out.push(m.index + 1);                 // dash の手前
+      out.push(m.index + m[0].length - 1);  // dash の直後
+    }
+
+    // 助詞（ざっくり）
+    const re = /(を|の|に|と|へ|や|で|が|は|も)/g;
+    while ((m = re.exec(s)) !== null) {
+      out.push(m.index + m[0].length);
+    }
+
     return Array.from(new Set(out)).sort((a, b) => a - b);
   };
 
   const shouldIgnoreParenSubtitle = (s, idx) => {
-  const open = s[idx];
-  const close = open === "（" ? "）" : ")";
+    const open = s[idx];
+    const close = open === "（" ? "）" : ")";
+    const endIdx = s.indexOf(close, idx + 1);
+    if (endIdx === -1) return false;
 
-  const endIdx = s.indexOf(close, idx + 1);
-  if (endIdx === -1) return false;
+    const inside = s.slice(idx + 1, endIdx).trim();
+    const ignoreWords = new Set([
+      "仮", "予定", "案", "再", "改", "新",
+      "案1", "案2", "案3"
+    ]);
 
-  const inside = s.slice(idx + 1, endIdx).trim();
+    if (ignoreWords.has(inside)) return true;
+    if (inside.length <= 2) return true;
 
-  // よくある短い注記は改行しない
-  const ignoreWords = new Set([
-    "仮", "予定", "案", "再", "改", "新", "案1", "案2", "案3"
-  ]);
+    return false;
+  };
 
-  if (ignoreWords.has(inside)) return true;
+  // =========================================================
+  // subtitle split
+  // =========================================================
+  const splitBySubtitle = (s) => {
+    s = unifyTilde(oneLine(s));
+    if (!s) return null;
 
-  // かなり短い括弧注記は改行しない
-  if (inside.length <= 2) return true;
-
-  return false;
-};
-
-  // ---- force subtitle separators to 2nd-line head ----
-  // 〜 / ~ / dash（- – — − －）を「必ず次行」にする
-const splitBySubtitle = (s) => {
-  s = unifyTilde(norm(s));
-  if (!s) return null;
-
-  // tilde
-  let idx = s.indexOf("〜");
-  if (idx > 0) {
-    return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
-  }
-
-  idx = s.indexOf("~");
-  if (idx > 0) {
-    return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
-  }
-
-  // dash
-  const dashRe = /[–—−－]/;
-  const m = dashRe.exec(s);
-  if (m && m.index > 0) {
-    const p = m.index;
-    return [s.slice(0, p + 1).trimEnd(), s.slice(p + 1).trimStart()];
-  }
-
-  // 括弧
-  idx = s.indexOf("（");
-  if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
-    return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
-  }
-
-  idx = s.indexOf("(");
-  if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
-    return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
-  }
-
-  return null;
-};
-
-const mergeDanglingDotLines = (lines) => {
-  const out = [];
-  for (const line of lines) {
-    const s = norm(line);
-    if (!s) continue;
-
-    if (out.length && out[out.length - 1].endsWith("・")) {
-      out[out.length - 1] = `${out[out.length - 1]}${s}`;
-    } else {
-      out.push(s);
+    // 1) " - " / " – " / " — " を最優先
+    let m = /\s[-–—−－]\s/.exec(s);
+    if (m && m.index > 0) {
+      const p = m.index + 1;
+      return [s.slice(0, p).trimEnd(), s.slice(p).trimStart()];
     }
-  }
-  return out;
-};
 
-  // ---- wrap into <=maxLines with px constraint ----
-  const wrapPx = (s, maxPx, style, maxLines, forceSubtitle2ndHead) => {
-  if (s.length > 200) return [s]; 
-    s = unifyTilde(norm(s));
-    if (!s) return [];
+    // 2) tilde
+    let idx = s.indexOf("〜");
+    if (idx > 0) {
+      return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
+    }
 
-    // 1) subtitle rule (always newline)
-    if (forceSubtitle2ndHead) {
-      const sp = splitBySubtitle(s);
-      if (sp) {
-        const a = sp[0], b = sp[1];
-        if (measure(a, style) <= maxPx && measure(b, style) <= maxPx) {
-          return [a, b];
-        }
-        // 収まらなくても「区切りは次行」を守る：a/bをそれぞれwrapして連結
-        const aLines = wrapPx(a, maxPx, style, maxLines, false);
-        const bLines = wrapPx(b, maxPx, style, maxLines, false);
-        return [...aLines, ...bLines].filter(Boolean).slice(0, maxLines);
+    idx = s.indexOf("~");
+    if (idx > 0) {
+      return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
+    }
+
+    // 3) dash fallback は「語中ハイフン」を避ける
+    // 前後どちらかが空白のときだけ許可
+    const dashRe = /[-–—−－]/g;
+    while ((m = dashRe.exec(s)) !== null) {
+      const p = m.index;
+      const prev = s[p - 1] || "";
+      const next = s[p + 1] || "";
+      if (/\s/.test(prev) || /\s/.test(next)) {
+        return [s.slice(0, p + 1).trimEnd(), s.slice(p + 1).trimStart()];
       }
     }
 
-    // 2) one line if fits
+    // 4) 括弧
+    idx = s.indexOf("（");
+    if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
+      return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
+    }
+
+    idx = s.indexOf("(");
+    if (idx > 0 && !shouldIgnoreParenSubtitle(s, idx)) {
+      return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
+    }
+
+    return null;
+  };
+
+  // =========================================================
+  // line cleanup / penalties
+  // =========================================================
+  const mergeDanglingDotLines = (lines) => {
+    const out = [];
+    for (const line of lines) {
+      const s = oneLine(line);
+      if (!s) continue;
+
+      if (out.length && /[・･]$/.test(out[out.length - 1])) {
+        out[out.length - 1] = `${out[out.length - 1]}${s}`;
+      } else {
+        out.push(s);
+      }
+    }
+    return out;
+  };
+
+  const mergeTinyParenTail = (lines) => {
+    if (!Array.isArray(lines) || lines.length < 2) return lines || [];
+    const out = [...lines];
+
+    for (let i = out.length - 1; i >= 1; i--) {
+      const cur = oneLine(out[i]);
+      if (/^[（(][^)）]{1,3}[)）]$/.test(cur)) {
+        out[i - 1] = `${oneLine(out[i - 1])}${cur}`;
+        out.splice(i, 1);
+      }
+    }
+    return out;
+  };
+
+  const linePenalty = (line, idx, total, opts = {}) => {
+    let p = 0;
+    const t = oneLine(line);
+    const wc = wordCount(t);
+
+    if (!t) p += 9999;
+
+    // 最終行1語だけはかなり避ける（英語系）
+    if (idx === total - 1 && wc === 1 && isMostlyAscii(t)) p += 1600;
+
+    // 最終行が短すぎる
+    if (idx === total - 1 && t.length <= 8) p += 900;
+
+    // 先頭が記号っぽい
+    if (/^[-–—−－:：,，/／]+/.test(t)) p += 700;
+
+    // GLP- みたいな行末を強く避ける
+    if (/^[A-Za-z0-9]+-$/.test(t)) p += 1800;
+    if (/[A-Za-z0-9]-$/.test(t)) p += 1200;
+
+    // 行末が中途半端
+    if (/[のにとへやではがも]$/.test(t)) p += 120;
+
+    // "・" 終わりは避ける
+    if (/[・･]$/.test(t)) p += 800;
+
+    if (opts.preferBalancedAscii && isMostlyAscii(t) && wc === 1) {
+      p += 250;
+    }
+
+    return p;
+  };
+
+  const scoreLines = (lines, maxPx, style, opts = {}) => {
+    const widths = lines.map(line => measure(line, style));
+    const slackScore = widths.reduce((acc, w) => acc + (maxPx - w) ** 2, 0);
+    const penalties = lines.reduce((acc, line, i) => {
+      return acc + linePenalty(line, i, lines.length, opts);
+    }, 0);
+
+    let raggedPenalty = 0;
+    if (widths.length >= 2) {
+      const mx = Math.max(...widths);
+      const mn = Math.min(...widths);
+      raggedPenalty = (mx - mn) * 2;
+    }
+
+    return slackScore + penalties + raggedPenalty;
+  };
+
+  // =========================================================
+  // generic wrap
+  // =========================================================
+  const wrapPx = (s, maxPx, style, maxLines, opts = {}) => {
+    if (String(s ?? "").length > 400) return [oneLine(s)];
+
+    s = unifyTilde(oneLine(s));
+    if (!s) return [];
+
+    const {
+      forceSubtitle2ndHead = false,
+      preferBalancedAscii = false,
+      avoidSingleWordLastLine = false,
+    } = opts;
+
+    // 1) subtitle rule
+    if (forceSubtitle2ndHead) {
+      const sp = splitBySubtitle(s);
+      if (sp) {
+        const a = stripEdgePunct(sp[0]);
+        const b = stripEdgePunct(sp[1]);
+
+        if (a && b) {
+          if (measure(a, style) <= maxPx && measure(b, style) <= maxPx) {
+            return mergeTinyParenTail(mergeDanglingDotLines([a, b])).slice(0, maxLines);
+          }
+
+          const aLines = wrapPx(a, maxPx, style, maxLines, {
+            ...opts,
+            forceSubtitle2ndHead: false,
+          });
+          const remain = Math.max(1, maxLines - aLines.length);
+          const bLines = wrapPx(b, maxPx, style, remain, {
+            ...opts,
+            forceSubtitle2ndHead: false,
+          });
+
+          return mergeTinyParenTail(
+            mergeDanglingDotLines([...aLines, ...bLines].filter(Boolean))
+          ).slice(0, maxLines);
+        }
+      }
+    }
+
+    // 2) one line
     if (measure(s, style) <= maxPx) return [s];
 
-    // 3) try 2 lines by candidates: choose minimal slack^2
     const cand = breakPositions(s);
     let best = null;
     let bestScore = null;
 
+    // 3) try 2 lines
     for (const p of cand) {
-      const a = s.slice(0, p).trim();
-      const b = s.slice(p).trim();
+      const a = stripEdgePunct(s.slice(0, p).trim());
+      const b = stripEdgePunct(s.slice(p).trim());
       if (!a || !b) continue;
-
-
-      if (a.endsWith("・")) continue;
+      if (/[・･]$/.test(a)) continue;
 
       const wa = measure(a, style);
       const wb = measure(b, style);
+      if (wa > maxPx || wb > maxPx) continue;
 
-      if (wa <= maxPx && wb <= maxPx) {
-        const score = (maxPx - wa) ** 2 + (maxPx - wb) ** 2;
-        if (bestScore === null || score < bestScore) {
-          bestScore = score;
-          best = [a, b];
-        }
+      if (avoidSingleWordLastLine && isMostlyAscii(b) && wordCount(b) === 1) continue;
+
+      const lines = [a, b];
+      const score = scoreLines(lines, maxPx, style, { preferBalancedAscii });
+
+      if (bestScore === null || score < bestScore) {
+        bestScore = score;
+        best = lines;
       }
     }
-    if (best) return best;
+    if (best) return mergeTinyParenTail(mergeDanglingDotLines(best)).slice(0, maxLines);
 
     // 4) try 3 lines
     if (maxLines >= 3) {
       for (const p of cand) {
-        const a = s.slice(0, p).trim();
-        const rest = s.slice(p).trim();
+        const a = stripEdgePunct(s.slice(0, p).trim());
+        const rest = stripEdgePunct(s.slice(p).trim());
         if (!a || !rest) continue;
-        if (a.endsWith("・")) continue;
+        if (/[・･]$/.test(a)) continue;
         if (measure(a, style) > maxPx) continue;
 
         const cand2 = breakPositions(rest);
-        let best2 = null;
-        let best2Score = null;
-
         for (const q of cand2) {
-          const b = rest.slice(0, q).trim();
-          const c = rest.slice(q).trim();
+          const b = stripEdgePunct(rest.slice(0, q).trim());
+          const c = stripEdgePunct(rest.slice(q).trim());
           if (!b || !c) continue;
-          if (a.endsWith("・")) continue;
+          if (/[・･]$/.test(b)) continue;
 
           const wb = measure(b, style);
           const wc = measure(c, style);
+          if (wb > maxPx || wc > maxPx) continue;
 
-          if (wb <= maxPx && wc <= maxPx) {
-            const score = (maxPx - wb) ** 2 + (maxPx - wc) ** 2;
-            if (best2Score === null || score < best2Score) {
-              best2Score = score;
-              best2 = [a, b, c];
-            }
+          if (avoidSingleWordLastLine && isMostlyAscii(c) && wordCount(c) === 1) continue;
+
+          const lines = [a, b, c];
+          const score = scoreLines(lines, maxPx, style, { preferBalancedAscii });
+
+          if (bestScore === null || score < bestScore) {
+            bestScore = score;
+            best = lines;
           }
         }
-        if (best2) return best2;
       }
     }
+    if (best) return mergeTinyParenTail(mergeDanglingDotLines(best)).slice(0, maxLines);
 
-    // 5) last resort: force break by char
+    // 5) last resort: force by char
+    // 英数字ハイフン連結は途中で切りにくくする
     const out = [];
     let cur = "";
-    for (const ch of s) {
+
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
       const nxt = cur + ch;
-      if (!cur || measure(nxt, style) <= maxPx) {
+
+      const prevCh = s[i - 1] || "";
+      const nextCh = s[i + 1] || "";
+
+      // GLP-1 のような箇所では無理やり切らない
+      const isHyphenInsideToken =
+        ch === "-" &&
+        /[A-Za-z0-9]/.test(prevCh) &&
+        /[A-Za-z0-9]/.test(nextCh);
+
+      if (!cur || measure(nxt, style) <= maxPx || isHyphenInsideToken) {
         cur = nxt;
       } else {
         out.push(cur.trim());
@@ -340,64 +493,131 @@ const mergeDanglingDotLines = (lines) => {
       }
     }
     if (cur.trim()) out.push(cur.trim());
-    return out.slice(0, maxLines);
+
+    return mergeTinyParenTail(mergeDanglingDotLines(out)).slice(0, maxLines);
   };
 
-  // ---- compute widths from DOM ----
+  // =========================================================
+  // specialized wrappers
+  // =========================================================
+  const wrapHeroTitle = (line, maxPx, style) => {
+    const s = unifyTilde(oneLine(line));
+    if (!s) return [];
+
+    const ascii = isMostlyAscii(s);
+
+    return wrapPx(s, maxPx, style, 8, {
+      forceSubtitle2ndHead: true,
+      preferBalancedAscii: ascii,
+      avoidSingleWordLastLine: ascii,
+    });
+  };
+
+  const wrapTalkTitle = (line, maxPx, style) => {
+    const s = unifyTilde(oneLine(line));
+    if (!s) return [];
+
+    return wrapPx(s, maxPx, style, 5, {
+      forceSubtitle2ndHead: true,
+      preferBalancedAscii: isMostlyAscii(s),
+      avoidSingleWordLastLine: isMostlyAscii(s),
+    });
+  };
+
+  const normalizeAffiliation = (s) => {
+    return String(s ?? "")
+      .split("\n")
+      .map(x => oneLine(x))
+      .filter(Boolean)
+      .join("\n");
+  };
+
+  // =========================================================
+  // compute widths from DOM
+  // =========================================================
   const wrapEl = document.querySelector(".wrap");
   const wrapW = wrapEl ? wrapEl.clientWidth : 600;
 
-  // タイトル領域（左padding+右padding=約28, time(74)+gap(28)=102）
-  const talkMax = (wrapW - 28 - 102); // ≒470
+  // タイトル領域
+  const talkMax = (wrapW - 28 - 102);
 
-  // talk-info領域（role-pill(41)+gap(14)+左右padding(28)）を引く
+  // talk-info領域
   const rolePillW = 41;
   const infoGap = 14;
   const affMax = (wrapW - 28 - rolePillW - infoGap);
 
-  // ---- styles (match CSS) ----
-  const heroStyle = { fontFamily: "Invention JP", fontWeight: 700, fontSize: "30px", letterSpacing: "normal" };
-  const talkStyle = { fontFamily: "Invention JP", fontWeight: 700, fontSize: "25px", letterSpacing: "normal" };
-  const affStyle  = { fontFamily: "Invention JP", fontWeight: 400, fontSize: "14px", letterSpacing: "normal" };
+  // =========================================================
+  // styles
+  // =========================================================
+  const heroStyle = {
+    fontFamily: "Invention JP",
+    fontWeight: 700,
+    fontSize: "30px",
+    letterSpacing: "normal"
+  };
 
-  // ---- event title ----
-  const evBase = norm((data.event_title_lines?.length ? data.event_title_lines.join(" ") : data.event_title) ?? "");
-  const evLines = wrapPx(evBase, wrapW, heroStyle, 5, true); // ★subtitle強制ON
-  if (evLines.length) {
-    data.event_title_lines = evLines;
-    data.event_title = evLines.join("\n");
+  const talkStyle = {
+    fontFamily: "Invention JP",
+    fontWeight: 700,
+    fontSize: "25px",
+    letterSpacing: "normal"
+  };
+
+  const affStyle = {
+    fontFamily: "Invention JP",
+    fontWeight: 400,
+    fontSize: "14px",
+    letterSpacing: "normal"
+  };
+
+  // =========================================================
+  // event title
+  // =========================================================
+  const evBaseLines =
+    Array.isArray(data.event_title_lines) && data.event_title_lines.length
+      ? data.event_title_lines.map(x => oneLine(x)).filter(Boolean)
+      : [oneLine(data.event_title || "")].filter(Boolean);
+
+  let evJoined = oneLine(evBaseLines.join(" "));
+  let evLines = wrapHeroTitle(evJoined, wrapW, heroStyle);
+
+  evLines = mergeTinyParenTail(evLines);
+  evLines = mergeDanglingDotLines(evLines);
+
+  data.event_title_lines = evLines;
+  data.event_title = evLines.join("\n");
+
+  // =========================================================
+  // chair
+  // =========================================================
+  if (data.chair) {
+    data.chair.affiliation = normalizeAffiliation(data.chair.affiliation ?? "");
   }
 
-  if (data.chair) {
-  const chairAffRaw = String(data.chair.affiliation ?? "");
-  const chairAffText = norm(chairAffRaw);
-  const chairAffLines = wrapPx(chairAffText, affMax, affStyle, 3, false);
-  data.chair.affiliation = chairAffLines.join("\n");
-}
-
-
-
-
-  // ---- talks title lines + affiliation wrap ----
+  // =========================================================
+  // talks
+  // =========================================================
   if (Array.isArray(data.talks)) {
     data.talks = data.talks.map((t) => {
-      const title = t?.title ?? "";
-      const title_lines = wrapPx(title, talkMax, talkStyle, 5, true); // ★subtitle強制ON
+      const rawTitleLines =
+        Array.isArray(t?.title_lines) && t.title_lines.length
+          ? t.title_lines.map(x => oneLine(x)).filter(Boolean)
+          : [oneLine(t?.title ?? "")].filter(Boolean);
+
+      const titleJoined = oneLine(rawTitleLines.join(" "));
+      let title_lines = wrapTalkTitle(titleJoined, talkMax, talkStyle);
+      title_lines = mergeTinyParenTail(title_lines);
+      title_lines = mergeDanglingDotLines(title_lines);
 
       const affRaw = String(t?.affiliation ?? "");
-      let paras = affRaw.split("\n").map(x => norm(x)).filter(Boolean);
-      paras = mergeDanglingDotLines(paras);
-      const affLines = [];
-      const baseParas = paras.length ? paras : [norm(affRaw)];
-      for (const para of baseParas) {
-        if (!para) continue;
-        // affiliationは最大2行くらいにしたいなら maxLines=2 に変えてOK
-        const lines = wrapPx(para, affMax, affStyle, 5, true);
-        for (const ln of lines) affLines.push(ln);
-      }
-      const affiliation = affLines.join("\n");
+      const affiliation = normalizeAffiliation(affRaw);
 
-      return { ...t, title_lines, affiliation };
+      return {
+        ...t,
+        title_lines,
+        title: title_lines.join("\n"),
+        affiliation
+      };
     });
   }
 
@@ -578,10 +798,30 @@ def extract_talk_number_and_time_from_text(text: str) -> tuple[int | None, str]:
     if talk_no is None and "特別講演" in s:
         talk_no = 3
 
-    tm = re.search(r"(\d{1,2}:\d{2}\s*[～〜~\-－]\s*\d{1,2}:\d{2})", s)
-    time_text = normalize_time_range(tm.group(1)) if tm else ""
+    m = TIME_RANGE_RE.search(normalize_space(text or "").replace("：", ":"))
+    time_text = f"{m.group(1)}~{m.group(2)}" if m else ""
 
     return talk_no, time_text
+
+def extract_talk_times_in_order(blocks: list[TextBlock]) -> list[str]:
+    ordered = sorted(blocks, key=lambda b: (b.top, b.left))
+    out: list[str] = []
+
+    for b in ordered:
+        txt = normalize_space(getattr(b, "text", "") or "")
+        one = txt.replace("\n", " ")
+
+        # 講演ラベルがある block だけ対象
+        if not any(k in one for k in ["講演", "一般講演", "特別講演"]):
+            continue
+
+        m = TIME_RANGE_RE.search(one.replace("：", ":"))
+        if not m:
+            continue
+
+        out.append(f"{m.group(1)}~{m.group(2)}")
+
+    return out
 
 def assign_talk_times_by_order_fallback(
     payload: DesignJSON,
@@ -608,6 +848,10 @@ def assign_talk_times_by_order_fallback(
         if m:
             t = normalize_time_range(m.group(1))
             time_list.append(t)
+
+    time_list = extract_talk_times_in_order(blocks)
+    if not time_list:
+        return payload
 
     if not time_list:
         return payload
@@ -657,6 +901,7 @@ def extract_talk_time_map_by_anchor(blocks: list[TextBlock]) -> dict[int, str]:
             out[talk_no] = best_time
 
     return out
+    
 
 def assign_talk_times_by_anchor(blocks: list[TextBlock], payload: DesignJSON) -> DesignJSON:
     talks = list(payload.talks or [])
@@ -676,6 +921,7 @@ def assign_talk_times_by_anchor(blocks: list[TextBlock], payload: DesignJSON) ->
 
     payload.talks = talks
     return payload
+
 
 def assign_talk_times_by_proximity(blocks: list[TextBlock], payload: DesignJSON) -> DesignJSON:
     # 1) イベント全体の時間枠（VM由来のdatetimeでも、blocks由来でもOK）
@@ -1203,7 +1449,7 @@ def post_format_design_initial(payload):
         payload.event_title_lines = format_title_initial(
             one_line,
             max_len=22,
-            max_lines=3,
+            max_lines=20,
             force_tilde_second_line=False
         )
 
@@ -1216,12 +1462,12 @@ def post_format_design_initial(payload):
         t.title_lines = format_title_initial(
     raw_title,
     max_len=18,
-    max_lines=3,
+    max_lines=20,
     force_tilde_second_line=True   # ←ここ重要
 )
 
         # affiliation: 16px太字 → だいたい 26〜30文字/行（最大2行）
-        t.affiliation = format_affiliation_initial(t.affiliation or "", max_len=28, max_lines=2)
+        t.affiliation = format_affiliation_initial(t.affiliation or "", max_len=28, max_lines=20)
 
     return payload
 
@@ -1254,10 +1500,14 @@ def has_session_label(s: str) -> bool:
 def normalize_time_range(s: str) -> str:
     s = str(s or "")
     s = s.replace("：", ":")
-    s = re.sub(r"[～〜\-ー−－—–]", "~", s)
-    s = re.sub(r"\s*~\s*", "~", s)
-    s = s.strip()
-    return s
+
+    # 変な連続区切りを 1 個の ~ に寄せる
+    s = re.sub(r"\s*[-－ー‐-‒–—―〜～~]+\s*", "~", s)
+
+    # 19:30-~20:15 みたいな中途半端な並びも潰す
+    s = re.sub(r"~+", "~", s)
+
+    return s.strip()
 
 def extract_session_times_from_blocks(blocks) -> list[str]:
     if not blocks:
@@ -2352,7 +2602,9 @@ DT_RE = re.compile(
 
 DATE_ONLY_RE = re.compile(r"(20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)")
 
-TIME_RANGE_RE = re.compile(r"(\d{1,2}\s*[:：]\s*\d{2}\s*[～〜\-ー~]\s*\d{1,2}\s*[:：]\s*\d{2})")
+TIME_RANGE_RE = re.compile(
+    r"(\d{1,2}:\d{2})\s*[-－ー‐-‒–—―〜～~]+\s*(\d{1,2}:\d{2})"
+)
 
 def normalize_time_colon(s: str) -> str:
     # "19：00" -> "19:00"
@@ -4781,17 +5033,31 @@ def looks_like_title_text(s: str) -> bool:
 def split_affiliation_and_name_tail(s: str) -> tuple[str, str]:
     s = normalize_space(s or "")
     s = s.replace("\n", " ").strip()
-    s = re.sub(r"^演者\s*", "", s)
-    s = re.sub(r"^講師\s*", "", s)
+
+    # 演者/講師ラベル除去
+    s = re.sub(r"^(演者|講師)\s*[/／:：]?\s*", "", s)
     s = re.sub(r"先生$", "", s).strip()
+
+    compact = s.replace(" ", "").replace("　", "")
+
+    # すでに人名だけならそのまま返す
+    if compact and not any(x in s for x in ["大学", "病院", "科", "センター", "教授", "部長", "医長", "院長", "医学部"]):
+        if 3 <= len(compact) <= 8:
+            return "", compact
 
     for role in ROLE_WORDS2:
         i = s.rfind(role)
         if i >= 0:
             aff = s[: i + len(role)].strip()
             name = s[i + len(role):].strip()
-            if 1 <= len(name) <= 8:
-                return aff, name
+            compact = name.replace(" ", "").replace("　", "")
+
+            if len(compact) < 3 or len(compact) > 8:
+                continue
+            if any(x in name for x in ["大学", "病院", "科", "センター", "教授", "部長", "医長", "院長", "医学部"]):
+                continue
+
+            return aff, compact
 
     return "", ""
 
@@ -5553,50 +5819,221 @@ def split_name_and_affiliation_strict(s: str) -> tuple[str, str]:
     return "", ""
 
 def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> DesignJSON:
+    def is_time_line(s: str) -> str:
+        s2 = normalize_time_colon(normalize_space(s))
+        m = TIME_RANGE_RE.search(s2)
+        return normalize_space(m.group(1)) if m else ""
+    
+    if not getattr(payload, "talks", None):
+        return payload
+
     ordered = sorted(blocks, key=lambda b: (b.top, b.left))
 
-    # 「講演」ラベル位置
-    lecture_label = None
-    for b in ordered:
-        if normalize_space(b.text) == "講演":
-            lecture_label = b
+
+    def strip_label(prefixes, s: str) -> str:
+        s2 = normalize_space(s or "")
+        s2_key = normalize_key(s2)
+
+        for p in prefixes:
+            p_key = normalize_key(p)
+            if s2_key.startswith(p_key):
+                chars = list(p_key)
+                pat = r"^" + r"\s*".join(map(re.escape, chars)) + r"\s*(?:[:：/／]\s*)?"
+                s2 = re.sub(pat, "", s2).strip()
+                return s2
+
+        return s2
+
+    def _norm(s: str) -> str:
+        return normalize_space(s or "").replace("　", " ")
+
+    def _find_talk_anchor(no: int) -> Optional[TextBlock]:
+        for b in ordered:
+            s = _norm(b.text).replace("\n", " ")
+            if re.search(rf"講演\s*{no}\b", s):
+                return b
+            if re.search(rf"講演\s*{str(no).translate(str.maketrans('1234567890', '１２３４５６７８９０'))}", s):
+                return b
+        return None
+
+    def _looks_like_title(s: str) -> bool:
+        s = _norm(s)
+        if not s:
+            return False
+        if "講演" in s or "演者" in s or "座長" in s:
+            return False
+        if looks_like_datetime_text(s):
+            return False
+        if is_time_line(s):
+            return False
+        if "先生" in s:
+            return False
+        return len(s) >= 6
+
+    def _extract_person_after_enja(seg: list[TextBlock]) -> tuple[str, str]:
+        speaker = ""
+        affiliation = ""
+
+        for i, b in enumerate(seg):
+            raw = _norm(b.text)
+            key = normalize_key(raw)
+
+            if "演者" not in key:
+                continue
+
+            sp = strip_label(["演者", "演者:", "演者："], raw)
+            sp = _norm(sp)
+
+            # 1) 同一ブロックに名前がある場合を最優先
+            m = re.search(r"([^\s　]+)\s+([^\s　]+)\s*先生?$", sp)
+            if m:
+                speaker = norm_name(m.group(1) + m.group(2))
+            else:
+                sp_no_honor = re.sub(r"\s*先生\s*$", "", sp).strip()
+                if sp_no_honor and not any(x in sp_no_honor for x in ["大学", "病院", "科", "センター", "教授", "部長", "医長", "院長", "医学部"]):
+                    speaker = norm_name(sp_no_honor)
+                else:
+                    aff_tail, name_tail = split_affiliation_and_name_tail(sp_no_honor)
+                    if name_tail:
+                        speaker = norm_name(name_tail)
+                        if aff_tail:
+                            affiliation = aff_tail
+
+            # 2) 次ブロックに名前がある場合
+            if not speaker and i + 1 < len(seg):
+                nxt = _norm(seg[i + 1].text)
+                m = re.search(r"([^\s　]+)\s+([^\s　]+)\s*先生?$", nxt)
+                if m:
+                    speaker = norm_name(m.group(1) + m.group(2))
+                elif "先生" in nxt:
+                    speaker = norm_name(nxt.replace("先生", ""))
+
+            # 3) affiliation
+            if i + 1 < len(seg):
+                for j in range(i + 1, min(i + 4, len(seg))):
+                    cand = _norm(seg[j].text)
+                    if not cand:
+                        continue
+                    if looks_like_affil_line(cand):
+                        affiliation = cand
+                        break
+
+            if speaker:
+                return speaker, affiliation
+
+        return "", ""
+    def strip_label(prefixes, s: str) -> str:
+        s2 = normalize_space(s or "")
+        s2_key = normalize_key(s2)  # スペースなどを潰した比較用
+
+        for p in prefixes:
+            p_key = normalize_key(p)
+            if s2_key.startswith(p_key):
+                # 先頭の「演\s*者」みたいな形も含めて消す
+                # p が "演者" なら ^演\s*者\s*[:：]?\s* を消す
+                chars = list(p_key)  # "演者" -> ["演","者"]
+                pat = r"^" + r"\s*".join(map(re.escape, chars)) + r"\s*[:：]?\s*"
+                s2 = re.sub(pat, "", s2).strip()
+                return s2
+        return s2
+
+    def _extract_title_near_anchor(anchor: TextBlock, seg: list[TextBlock]) -> list[str]:
+        title_lines: list[str] = []
+
+        # まず anchor より下の最初のタイトルっぽい行
+        after = [b for b in seg if b.top >= anchor.top]
+        after = sorted(after, key=lambda b: (b.top, b.left))
+
+        for i, b in enumerate(after):
+            s = _norm(b.text)
+
+            if not _looks_like_title(s):
+                continue
+
+            title_lines.append(s)
+
+            # 次行が ～ で始まる副題なら追加
+            if i + 1 < len(after):
+                nxt = _norm(after[i + 1].text)
+                if nxt.startswith(("～", "〜", "~")):
+                    title_lines.append(nxt)
+
             break
 
-    if not lecture_label or not payload.talks:
-        return payload
+        # 「演題」ラベル付きがあるならそちらを優先
+        for i, b in enumerate(after):
+            s = _norm(b.text)
+            k = normalize_key(s)
+            if "演題" not in k:
+                continue
 
-    # 講演ラベルより下で、最初の name block を探す
-    cand_idx = None
-    for i, b in enumerate(ordered):
-        t = normalize_space(b.text)
-        if b.top <= lecture_label.top:
+            tmp: list[str] = []
+            t = strip_label(["演題", "演題:", "演題："], s)
+            if t:
+                for ln in t.split("\n"):
+                    ln = _norm(ln)
+                    if ln and not looks_like_affil_line(ln):
+                        tmp.append(ln)
+
+            if i + 1 < len(after):
+                nxt = _norm(after[i + 1].text)
+                if nxt.startswith(("～", "〜", "~")):
+                    tmp.append(nxt)
+
+            if tmp:
+                title_lines = tmp
+                break
+
+        # 重複除去
+        out = []
+        seen = set()
+        for x in title_lines:
+            if x not in seen:
+                out.append(x)
+                seen.add(x)
+
+        return out[:4]
+
+    # talks[0], talks[1]... を各「講演N」アンカーから拾い直す
+    talks = list(payload.talks or [])
+
+    for idx, t in enumerate(talks, start=1):
+        anchor = _find_talk_anchor(idx)
+        if not anchor:
             continue
-        if "先生" in t:
-            cand_idx = i
-            break
 
-    if cand_idx is None:
-        return payload
+        # 次の講演アンカーまでをこの講演の範囲にする
+        next_anchor = _find_talk_anchor(idx + 1)
 
-    line1 = normalize_space(ordered[cand_idx].text)
-    line2 = normalize_space(ordered[cand_idx + 1].text) if cand_idx + 1 < len(ordered) else ""
+        x0 = anchor.left - 2500000
+        x1 = anchor.left + 4500000
+        y0 = anchor.top - 100000
+        y1 = (next_anchor.top - 150000) if next_anchor else (anchor.top + 2200000)
 
-    sp, aff = split_name_and_affiliation_strict(line1)
+        seg = [b for b in ordered if in_region(b, x0, y0, x1, y1)]
+        seg = sorted(seg, key=lambda b: (b.top, b.left))
 
-    # continuation line を affiliation に継ぎ足す
-    if line2 and not looks_like_talk_title_text(line2) and not ("先生" in line2):
-        if aff:
-            aff = f"{aff} {line2}".strip()
-        elif looks_like_affil_line(line2):
-            aff = line2
+        # title
+        title_lines = _extract_title_near_anchor(anchor, seg)
+        if title_lines:
+            t.title_lines = title_lines
+            t.title = "\n".join(title_lines)
 
-    t0 = payload.talks[0]
-    if sp:
-        t0.speaker = sp
-        t0.speaker_display = sp
-    if aff:
-        t0.affiliation = aff
+        # speaker / affiliation
+        speaker, affiliation = _extract_person_after_enja(seg)
 
+        if speaker:
+            t.speaker = speaker
+            t.speaker_display = build_speaker_display(speaker) or speaker
+
+        if affiliation:
+            t.affiliation = affiliation
+
+        # 最後の保険: speaker だけ取れて affiliation がない場合は speaker_map 相当を使いたいならここで補完
+        # if t.speaker and not t.affiliation:
+        #     t.affiliation = aff_from_speaker_map(t.speaker)
+
+    payload.talks = talks
     return payload
 
 def strip_outer_parens_suffix(s: str) -> str:
@@ -5693,16 +6130,30 @@ def repair_talk_speaker_tail_split(payload: DesignJSON) -> DesignJSON:
         sp = normalize_space(getattr(t, "speaker", "") or "")
         aff = normalize_space(getattr(t, "affiliation", "") or "")
 
-        aff2, name2 = split_affiliation_and_name_tail(sp)
+        if not sp:
+            continue
 
-        if name2:
-            # 👇 ここ重要：affiliationがあっても speaker は必ず分離する
-            t.speaker = name2
-            t.speaker_display = name2
+        # 演者/講師ラベル除去
+        sp_clean = re.sub(r"^(演者|講師)\s*[/／:：]?\s*", "", sp).strip()
+        sp_compact = sp_clean.replace(" ", "").replace("　", "")
 
-            # affiliation は空のときだけ補完
-            if aff2 and not aff:
-                t.affiliation = aff2
+        # すでに人名だけならそのまま採用して終了
+        if sp_compact and not any(x in sp_clean for x in ["大学", "病院", "科", "センター", "教授", "部長", "医長", "院長", "医学部"]):
+            if 3 <= len(sp_compact) <= 8:
+                t.speaker = sp_compact
+                continue
+
+        aff2, name2 = split_affiliation_and_name_tail(sp_clean)
+        if not name2:
+            continue
+
+        compact = name2.replace(" ", "").replace("　", "")
+        if len(compact) < 3:
+            continue
+
+        t.speaker = compact
+        if aff2 and not aff:
+            t.affiliation = aff2
 
     return payload
 
@@ -5770,6 +6221,10 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
     refined = finalize_people_fields(refined)
 
     refined = fill_datetime_parts(refined, blocks)
+
+
+    print("final refined:")
+    print(refined)
 
     
     # if refined.confidence < draft.confidence:
