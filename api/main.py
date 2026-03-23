@@ -154,6 +154,25 @@ TYPESET_JS = r"""
     return /^[~〜～\-–—−－:：,，/／]+/.test(t);
   };
 
+  // title_lines を join するときに記号前の余計な空白を作らない
+  const joinTitleLinesSmart = (lines) => {
+    const arr = (lines || []).map(x => oneLine(x)).filter(Boolean);
+    if (!arr.length) return "";
+
+    let out = arr[0];
+    for (let i = 1; i < arr.length; i++) {
+      const cur = arr[i];
+
+      // 記号始まりの行は前に空白を入れない
+      if (/^[~〜～\-–—−－・･:：/／]/.test(cur)) {
+        out += cur;
+      } else {
+        out += " " + cur;
+      }
+    }
+    return oneLine(out);
+  };
+
   // =========================================================
   // measurer element
   // =========================================================
@@ -187,11 +206,18 @@ TYPESET_JS = r"""
   // =========================================================
   // break candidates
   // =========================================================
+  const hasJapanese = (s) => /[ぁ-んァ-ヶ一-龠々]/.test(String(s ?? ""));
+
   const breakPositions = (s) => {
     const out = [];
-    const breakers = new Set([
-      " ", "、", "。", ",", "，", ":", "：", "/", "／"
-    ]);
+    const jp = hasJapanese(s);
+
+    // 日本語が入っているときは半角スペースを安易な改行候補にしない
+    const breakers = new Set(
+      jp
+        ? ["、", "。", ",", "，", ":", "：", "/", "／"]
+        : [" ", "、", "。", ",", "，", ":", "：", "/", "／"]
+    );
 
     for (let i = 0; i < s.length; i++) {
       const ch = s[i];
@@ -315,7 +341,7 @@ TYPESET_JS = r"""
     return out;
   };
 
-    const mergeSymbolOnlyTail = (lines) => {
+  const mergeSymbolOnlyTail = (lines) => {
     if (!Array.isArray(lines) || lines.length < 2) return lines || [];
     const out = [...lines];
 
@@ -326,7 +352,6 @@ TYPESET_JS = r"""
         continue;
       }
 
-      // 最後の行が記号だけなら前行へくっつける
       if (isOnlySymbols(cur)) {
         out[i - 1] = `${oneLine(out[i - 1])}${cur}`;
         out.splice(i, 1);
@@ -570,11 +595,7 @@ TYPESET_JS = r"""
   // =========================================================
   const wrapEl = document.querySelector(".wrap");
   const wrapW = wrapEl ? wrapEl.clientWidth : 600;
-
   const talkMax = (wrapW - 28 - 102);
-  const rolePillW = 41;
-  const infoGap = 14;
-  const affMax = (wrapW - 28 - rolePillW - infoGap);
 
   // =========================================================
   // styles
@@ -593,30 +614,22 @@ TYPESET_JS = r"""
     letterSpacing: "normal"
   };
 
-  const affStyle = {
-    fontFamily: "Invention JP",
-    fontWeight: 400,
-    fontSize: "14px",
-    letterSpacing: "normal"
-  };
-
   // =========================================================
   // event title
   // =========================================================
-  const evBaseLines =
-    Array.isArray(data.event_title_lines) && data.event_title_lines.length
-      ? data.event_title_lines.map(x => oneLine(x)).filter(Boolean)
-      : [oneLine(data.event_title || "")].filter(Boolean);
+const evBaseLines =
+  Array.isArray(data.event_title_lines) && data.event_title_lines.length
+    ? data.event_title_lines.map(x => oneLine(x)).filter(Boolean)
+    : [oneLine(data.event_title || "")].filter(Boolean);
 
-  let evJoined = oneLine(evBaseLines.join(" "));
-  let evLines = wrapHeroTitle(evJoined, wrapW, heroStyle);
+// ★ 日本語はそのまま
+const evLines =
+  Array.isArray(data.event_title_lines) && data.event_title_lines.length
+    ? data.event_title_lines
+    : evBaseLines;
 
-  evLines = mergeTinyParenTail(evLines);
-  evLines = mergeDanglingDotLines(evLines);
-  evLines = mergeSymbolOnlyTail(evLines);
-
-  data.event_title_lines = evLines;
-  data.event_title = evLines.join("\n");
+data.event_title_lines = evLines;
+data.event_title = evLines.join("\n");
 
   // =========================================================
   // chair
@@ -628,31 +641,26 @@ TYPESET_JS = r"""
   // =========================================================
   // talks
   // =========================================================
-  if (Array.isArray(data.talks)) {
-    data.talks = data.talks.map((t) => {
-      const titleJoined = oneLine(
-  t?.title
-    ? t.title
-    : (Array.isArray(t?.title_lines) ? t.title_lines.join(" ") : "")
-);
+if (Array.isArray(data.talks)) {
+  data.talks = data.talks.map((t) => {
+    const rawTitleLines =
+      Array.isArray(t?.title_lines) && t.title_lines.length
+        ? t.title_lines.map(x => oneLine(x)).filter(Boolean)
+        : [oneLine(t?.title ?? "")].filter(Boolean);
 
-      
-      let title_lines = wrapTalkTitle(titleJoined, talkMax, talkStyle);
-      title_lines = mergeTinyParenTail(title_lines);
-      title_lines = mergeDanglingDotLines(title_lines);
-      title_lines = mergeSymbolOnlyTail(title_lines);
+    // ★ 日本語はそのまま使う（超重要）
+    const title_lines = t.title_lines?.length ? t.title_lines : rawTitleLines;
 
-      const affRaw = String(t?.affiliation ?? "");
-      const affiliation = normalizeAffiliation(affRaw);
+    const affiliation = normalizeAffiliation(String(t?.affiliation ?? ""));
 
-      return {
-        ...t,
-        title_lines,
-        title: title_lines.join("\n"),
-        affiliation
-      };
-    });
-  }
+    return {
+      ...t,
+      title_lines,
+      title: title_lines.join("\n"),
+      affiliation
+    };
+  });
+}
 
   return data;
 }
@@ -805,33 +813,42 @@ ROMAN_JP_MAP = {
     "Ⅰ": 1, "II": 2, "Ⅱ": 2, "III": 3, "Ⅲ": 3,
     "IV": 4, "Ⅳ": 4, "V": 5, "Ⅴ": 5,
 }
+def normalize_time_text(s: str) -> str:
+    s = str(s or "")
+    s = s.replace("：", ":")
+    s = re.sub(r"[～〜\-ー]", "~", s)
+    s = re.sub(r"\s*~\s*", "~", s)
+    return s.strip()
 
 def extract_talk_number_and_time_from_text(text: str) -> tuple[int | None, str]:
-    s = normalize_space(text or "").replace("\n", " ")
+    raw = normalize_space(text or "").replace("\n", " ")
+    s = normalize_key(raw)  # ← 空白を潰した比較用
 
     talk_no = None
 
-    # 1) 講演1 / 講演１ / 講演①
-    m = re.search(r"講演\s*([0-9０-９]+|[①②③④⑤⑥⑦⑧⑨⑩])", s)
+    # 1) 講演1 / 講演１ / 講演① / 講 演 1
+    m = re.search(r"講演([0-9０-９]+|[①②③④⑤⑥⑦⑧⑨⑩])", s)
     if m:
-        raw = m.group(1)
-        if raw in CIRCLED_NUM_MAP:
-            talk_no = CIRCLED_NUM_MAP[raw]
+        raw_no = m.group(1)
+        if raw_no in CIRCLED_NUM_MAP:
+            talk_no = CIRCLED_NUM_MAP[raw_no]
         else:
-            talk_no = int(z2h_digits(raw))
+            talk_no = int(z2h_digits(raw_no))
 
-    # 2) 一般講演Ⅰ / 一般講演Ⅱ / 一般講演III
+    # 2) 一般講演Ⅰ / 一般 講 演 Ⅱ / III
     if talk_no is None:
-        m = re.search(r"一般講演\s*([ⅠⅡⅢⅣⅤ]+|I{1,3}|IV|V)", s)
+        m = re.search(r"一般講演([ⅠⅡⅢⅣⅤ]+|I{1,3}|IV|V)", s)
         if m:
-            raw = m.group(1)
-            talk_no = ROMAN_JP_MAP.get(raw)
+            raw_no = m.group(1)
+            talk_no = ROMAN_JP_MAP.get(raw_no)
 
-    # 3) 特別講演は最後の枠として仮に3扱い
+    # 3) 特別講演
     if talk_no is None and "特別講演" in s:
         talk_no = 3
 
-    m = TIME_RANGE_RE.search(normalize_space(text or "").replace("：", ":"))
+    # time
+    t0 = normalize_time_text(raw)
+    m = re.search(r"(\d{1,2}:\d{2})\s*[～〜~\-－]\s*(\d{1,2}:\d{2})", t0)
     time_text = f"{m.group(1)}~{m.group(2)}" if m else ""
 
     return talk_no, time_text
@@ -843,12 +860,14 @@ def extract_talk_times_in_order(blocks: list[TextBlock]) -> list[str]:
     for b in ordered:
         txt = normalize_space(getattr(b, "text", "") or "")
         one = txt.replace("\n", " ")
+        key = normalize_key(one)
 
         # 講演ラベルがある block だけ対象
-        if not any(k in one for k in ["講演", "一般講演", "特別講演"]):
+        if not any(k in key for k in ["講演", "一般講演", "特別講演"]):
             continue
 
-        m = TIME_RANGE_RE.search(one.replace("：", ":"))
+        t0 = normalize_time_text(one)
+        m = re.search(r"(\d{1,2}:\d{2})\s*[～〜~\-－]\s*(\d{1,2}:\d{2})", t0)
         if not m:
             continue
 
@@ -860,42 +879,17 @@ def assign_talk_times_by_order_fallback(
     payload: DesignJSON,
     blocks: list[TextBlock],
 ) -> DesignJSON:
-    """
-    番号で割り当てできなかった talks に対して、
-    上から順で time を補完する
-    """
-
     if not getattr(payload, "talks", None):
         return payload
-
-    # ① blocks から time を上から順で取得
-    time_list: list[str] = []
-
-    ordered = sorted(blocks, key=lambda b: (b.top, b.left))
-
-    for b in ordered:
-        txt = normalize_space(getattr(b, "text", "") or "")
-        txt = txt.replace("\n", " ")
-
-        m = re.search(r"(\d{1,2}:\d{2}\s*[～〜~\-－]\s*\d{1,2}:\d{2})", txt)
-        if m:
-            t = normalize_time_range(m.group(1))
-            time_list.append(t)
 
     time_list = extract_talk_times_in_order(blocks)
     if not time_list:
         return payload
 
-    if not time_list:
-        return payload
-
-    # ② talks のうち「timeが空のもの」だけ対象
     targets = [t for t in payload.talks if not getattr(t, "time", "")]
-
     if not targets:
         return payload
 
-    # ③ 上から順に割り当て
     for t, tm in zip(targets, time_list):
         t.time = tm
 
@@ -911,24 +905,27 @@ def extract_talk_time_map_by_anchor(blocks: list[TextBlock]) -> dict[int, str]:
             out[talk_no] = time_text
             continue
 
-        # 「講演２」と「19:00～19:30」が別ブロックのケース
         talk_no, _ = extract_talk_number_and_time_from_text(b.text)
         if talk_no is None:
             continue
 
         best_time = ""
         best_dist = None
-        for j in range(max(0, i - 3), min(len(ordered), i + 3)):
+        for j in range(max(0, i - 3), min(len(ordered), i + 4)):
             if j == i:
                 continue
-            cand = normalize_space(ordered[j].text)
-            tm = re.search(r"(\d{1,2}:\d{2}\s*[～〜~\-－]\s*\d{1,2}:\d{2})", cand)
+
+            cand = normalize_space(ordered[j].text or "")
+            cand = normalize_time_text(cand)
+
+            tm = re.search(r"(\d{1,2}:\d{2})\s*[～〜~\-－]\s*(\d{1,2}:\d{2})", cand)
             if not tm:
                 continue
+
             dist = abs(ordered[j].top - b.top) + abs(ordered[j].left - b.left) * 0.15
             if best_dist is None or dist < best_dist:
                 best_dist = dist
-                best_time = normalize_time_range(tm.group(1))
+                best_time = f"{tm.group(1)}~{tm.group(2)}"
 
         if best_time:
             out[talk_no] = best_time
@@ -1398,6 +1395,7 @@ async def apply_precise_typeset_initial(payload: DesignJSON, page=None) -> Desig
 
     for t in (getattr(payload, "talks", None) or []):
         if getattr(t, "title_lines", None):
+            t.title_lines = fix_title_lines_jp(t.title_lines)
             t.title = "\n".join(t.title_lines)
 
     # payload.typeset_done = True
@@ -1464,42 +1462,44 @@ def format_affiliation_initial(raw: str, *, max_len: int, max_lines: int = 2) ->
     return "\n".join(lines[:max_lines]).strip()
 
 def post_format_design_initial(payload):
-    """
-    manual_override=False の “初期生成” だけ適用する想定
-    """
-    # event_title（600px ≒ 30px太字 → だいたい 20〜22文字/行）
+    # event title
     if getattr(payload, "event_title_lines", None):
-        base = " ".join(payload.event_title_lines).strip()  # ← 改行をスペースで結合
+        payload.event_title_lines = [
+            normalize_space(x) for x in payload.event_title_lines if normalize_space(x)
+        ]
     else:
-        base = getattr(payload, "event_title", "") or ""
-
-    # ★ まず1行に戻せるか試す
-    one_line = normalize_space(base)
-
-    if len(one_line) <= 24:   # 600px相当（少し余裕を持たせる）
-        payload.event_title_lines = [one_line]
-    else:
-        payload.event_title_lines = format_title_initial(
-            one_line,
-            max_len=22,
-            max_lines=20,
-            force_tilde_second_line=False
-        )
+        base = normalize_space(getattr(payload, "event_title", "") or "")
+        if base:
+            if len(base) <= 24:
+                payload.event_title_lines = [base]
+            else:
+                payload.event_title_lines = format_title_initial(
+                    base,
+                    max_len=22,
+                    max_lines=20,
+                    force_tilde_second_line=False,
+                )
 
     payload.event_title = "\n".join(payload.event_title_lines).strip()
 
-    # talks（470px）
+    # talks
     for t in getattr(payload, "talks", []) or []:
-        # title: 25px太字 → だいたい 17〜19文字/行
-        raw_title = (t.title or "")
-        t.title_lines = format_title_initial(
-    raw_title,
-    max_len=18,
-    max_lines=20,
-    force_tilde_second_line=True   # ←ここ重要
-)
+        if getattr(t, "title_lines", None):
+            t.title_lines = [normalize_space(x) for x in t.title_lines if normalize_space(x)]
+        else:
+            raw_title = normalize_space(getattr(t, "title", "") or "")
+            if raw_title:
+                t.title_lines = format_title_initial(
+                    raw_title,
+                    max_len=18,
+                    max_lines=20,
+                    force_tilde_second_line=True,
+                )
 
-        # affiliation: 16px太字 → だいたい 26〜30文字/行（最大2行）
+        if getattr(t, "title_lines", None):
+            t.title = "\n".join(t.title_lines)
+
+        # affiliation だけ軽く整形
         t.affiliation = format_affiliation_initial(t.affiliation or "", max_len=28, max_lines=20)
 
     return payload
@@ -2317,6 +2317,26 @@ def split_tilde_subtitle_lines(line: str) -> List[str]:
         out.append(after)
     return out
 
+def clean_event_title_line(s: str) -> str:
+    s = normalize_space(s or "")
+
+    # 「〇〇のご案内」→後ろだけ残す
+    m = re.match(r"^(.+?)のご案内\s*(.*)$", s)
+    if m:
+        after = m.group(2).strip()
+        if after:
+            return after
+        return ""
+
+    # 「開催のご案内」系
+    m = re.match(r"^(.+?)開催のご案内\s*(.*)$", s)
+    if m:
+        after = m.group(2).strip()
+        if after:
+            return after
+        return ""
+
+    return s
 
 def normalize_lines_keep_order(lines: List[str]) -> List[str]:
     out: List[str] = []
@@ -2329,6 +2349,11 @@ def normalize_lines_keep_order(lines: List[str]) -> List[str]:
             if x not in seen:
                 out.append(x)
                 seen.add(x)
+    cleaned = [clean_event_title_line(l) for l in out]
+    cleaned = [l for l in cleaned if l]  # 空削除
+
+    if cleaned:
+        out = cleaned
     return out
 
 
@@ -4740,11 +4765,38 @@ async def ai_refine_json(
 
     content = data["choices"][0]["message"]["content"]
 
+    print("RAW CONTENT >>>")
+    print(content)
+    print("<<< RAW CONTENT")
+
+    def parse_llm_json(content: str) -> dict:
+        s = (content or "").strip()
+
+        # fence除去
+        s = re.sub(r"^\s*```json\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"^\s*```\s*", "", s)
+        s = re.sub(r"\s*```+\s*$", "", s)
+
+        # 最初の { から最後の } を抜く
+        m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+        if m:
+            s = m.group(0)
+
+        # Python風 → JSON風
+        s = re.sub(r"\bNone\b", "null", s)
+        s = re.sub(r"\bTrue\b", "true", s)
+        s = re.sub(r"\bFalse\b", "false", s)
+
+        # 末尾カンマ削除
+        s = re.sub(r",\s*([}\]])", r"\1", s)
+
+        return json.loads(s)
+        
+
     try:
         parsed = json.loads(content)
     except Exception:
-        content2 = re.sub(r"^```json\s*|\s*```$", "", content.strip())
-        parsed = json.loads(content2)
+        parsed = parse_llm_json(content)
 
     refined = DesignJSON(**parsed)
     refined.talks = refined.talks[:4]
@@ -5094,41 +5146,202 @@ def split_affiliation_and_name_tail(s: str) -> tuple[str, str]:
 
     return "", ""
 
+def fix_title_lines_jp(lines: list[str]) -> list[str]:
+    arr = [normalize_space(x) for x in (lines or []) if normalize_space(x)]
+    if not arr:
+        return []
+
+    out = []
+    i = 0
+    while i < len(arr):
+        cur = arr[i]
+
+        if i + 1 < len(arr):
+            nxt = arr[i + 1]
+
+            # 1文字だけの次行
+            if len(nxt) == 1:
+                out.append(cur + nxt)
+                i += 2
+                continue
+
+            # ひらがな始まりの短い次行（る / が / に / を 等）
+            if re.match(r"^[ぁ-ん]", nxt) and len(nxt) <= 4:
+                out.append(cur + nxt)
+                i += 2
+                continue
+
+            # 漢字1字 + 続き、みたいな不自然分割（性 －... など）
+            if re.match(r"^[一-龠々]", nxt) and len(cur) >= 6:
+                out.append(cur + nxt)
+                i += 2
+                continue
+
+        out.append(cur)
+        i += 1
+
+    return out
+
 def repair_chair_from_multiline_block(payload: DesignJSON, blocks: list[TextBlock]) -> DesignJSON:
+    if not getattr(payload, "chair", None):
+        return payload
+
     ordered = sorted(blocks, key=lambda b: (b.top, b.left))
 
+    def _norm(s: str) -> str:
+        return normalize_space(s or "")
+
+    def _key(s: str) -> str:
+        return _norm(s).replace(" ", "").replace("　", "")
+
+    def _person_key(s: str) -> str:
+        s = _norm(s)
+        s = s.replace("先生", "")
+        return s.replace(" ", "").replace("　", "")
+
+    role_words = ["大学", "病院", "研究科", "医学部", "センター", "科", "講師", "教授", "部長", "医長", "副部長"]
+
+    def _is_name_line(s: str) -> bool:
+        s = _norm(s)
+        if not s or "先生" not in s:
+            return False
+        if any(x in s for x in role_words):
+            return False
+
+        name = s.replace("先生", "").replace(" ", "").replace("　", "")
+        return 2 <= len(name) <= 8
+
+    def _looks_like_valid_person_name(s: str) -> bool:
+        s = _norm(s)
+        if not s:
+            return False
+        if any(x in s for x in role_words):
+            return False
+        s2 = s.replace("先生", "").replace(" ", "").replace("　", "")
+        return 2 <= len(s2) <= 8
+
+    def _looks_like_bad_affiliation(s: str) -> bool:
+        s = _norm(s)
+        if not s:
+            return True
+        # 役職だけで施設名がない
+        has_role = any(x in s for x in ["講師", "教授", "部長", "医長", "副部長"])
+        has_org = any(x in s for x in ["大学", "病院", "研究科", "医学部", "センター"])
+        return has_role and not has_org
+
+    current_name = _norm(payload.chair.name or "")
+    current_name_key = _person_key(current_name)
+    current_name_is_valid = _looks_like_valid_person_name(current_name)
+
+    current_aff = _norm(payload.chair.affiliation or "")
+    current_aff_is_bad = _looks_like_bad_affiliation(current_aff)
+
+    first_talk_top = None
     for b in ordered:
-        raw = str(getattr(b, "text", "") or "")
-        lines = [normalize_space(x) for x in raw.split("\n") if normalize_space(x)]
-        if not lines:
-            continue
-        if lines[0] != "座長":
+        if "講演" in _key(b.text):
+            first_talk_top = b.top
+            break
+
+    for i, b in enumerate(ordered):
+        raw = _norm(b.text)
+        if "座長" not in _key(raw):
             continue
 
-        name_parts: list[str] = []
-        aff_parts: list[str] = []
-        seen_name = False
+        role = "座長"
+        name = ""
+        aff_lines = []
 
-        for ln in lines[1:]:
-            if ln == "先生":
+        lines = [_norm(x) for x in str(b.text).split("\n") if _norm(x)]
+        for ln in lines:
+            k = _key(ln)
+            if "座長" in k:
                 continue
 
-            # 氏名っぽい短い行は連結対象
-            if re.fullmatch(r"[一-龥ぁ-んァ-ヶーA-Za-z]+", ln) and len(ln) <= 8:
-                name_parts.append(ln)
-                seen_name = True
+            # 既存chair名が妥当なときだけ優先
+            if current_name_is_valid and current_name_key and current_name_key in _person_key(ln):
+                name = current_name
                 continue
 
-            # 氏名の後ろに来た行は affiliation 側へ
-            aff_parts.append(ln)
+            if _is_name_line(ln) and not name:
+                name = norm_name(ln.replace("先生", ""))
+            else:
+                if any(x in ln for x in role_words):
+                    aff_lines.append(ln)
 
-        name = "".join(name_parts).strip()
+        allow_nearby_name_search = not current_name_is_valid and not name
+
+        for j in range(max(0, i - 3), min(len(ordered), i + 4)):
+            bj = ordered[j]
+            if first_talk_top is not None and bj.top >= first_talk_top:
+                break
+
+            ln = _norm(bj.text)
+            if not ln:
+                continue
+
+            key = _key(ln)
+            if "講演" in key or "演者" in key:
+                break
+
+            if allow_nearby_name_search and _is_name_line(ln):
+                name = norm_name(ln.replace("先生", ""))
+                allow_nearby_name_search = False
+                continue
+
+            if any(x in ln for x in role_words):
+                aff_lines.append(ln)
+
+        org_words = ["大学", "病院", "研究科", "医学部", "センター"]
+        role_words = ["講師", "教授", "部長", "医長", "副部長"]
+
+        org_lines = []
+        role_lines = []
+
+        for ln in lines:
+            if any(x in ln for x in org_words):
+                org_lines.append(ln)
+            elif any(x in ln for x in role_words):
+                role_lines.append(ln)
+
+        aff_out = []
+
+        # まず施設
+        if org_lines:
+            aff_out.extend(org_lines)
+
+        # 次に役職
+        if role_lines:
+            aff_out.extend(role_lines)
+
+
+        # 既存nameは「妥当なときだけ」優先
+        if current_name_is_valid:
+            name = current_name
+
+        # aff_out = []
+        # seen = set()
+        # for x in aff_lines:
+        #     x2 = _norm(x)
+        #     if not x2:
+        #         continue
+        #     if "座長" in _key(x2):
+        #         continue
+        #     if "先生" in x2:
+        #         continue
+        #     if x2 not in seen:
+        #         aff_out.append(x2)
+        #         seen.add(x2)
 
         if name:
-            payload.chair.role = "座長"
-            payload.chair.name = name
-            payload.chair.name_display = name
-            payload.chair.affiliation = " ".join(aff_parts).strip()
+            payload.chair.role = role
+            payload.chair.name = norm_name(name)
+            payload.chair.name_display = build_speaker_display(payload.chair.name) or payload.chair.name
+
+            # affiliation は空欄 or 明らかに壊れている時は上書き
+            if aff_out and (not current_aff or current_aff_is_bad):
+                payload.chair.affiliation = "\n".join(aff_out).strip()
+
+            payload.chair.honorific_title = "先生"
             return payload
 
     return payload
@@ -5623,15 +5836,22 @@ def fill_missing_from_vm(payload: DesignJSON, vm_rows: List[dict]) -> DesignJSON
         if not vm:
             continue
 
-        # タイトル補完（完全空のときのみ）
-        if not (t.title or "").strip():
-            v = (vm.get("演題") or "").strip()
+        cur_title = normalize_space(getattr(t, "title", "") or "")
+        cur_title_lines = [
+            normalize_space(x)
+            for x in (getattr(t, "title_lines", None) or [])
+            if normalize_space(x)
+        ]
+
+        # タイトル補完（title も title_lines も空のときのみ）
+        if not cur_title and not cur_title_lines:
+            v = normalize_space(vm.get("演題") or "")
             if v:
                 t.title = v
-                t.title_lines = [ln for ln in v.split("\n") if ln.strip()]
+                t.title_lines = [ln for ln in v.split("\n") if normalize_space(ln)]
 
         # 所属補完（完全空のときのみ）
-        if not (t.affiliation or "").strip():
+        if not normalize_space(getattr(t, "affiliation", "") or ""):
             aff = _vm_aff_str(vm)
             if aff:
                 t.affiliation = aff
@@ -5816,19 +6036,31 @@ def clean_chair_fields(payload: DesignJSON) -> DesignJSON:
     if not getattr(payload, "chair", None):
         return payload
 
-    # name から括弧所属を剥がす
-    chair_name = normalize_space(payload.chair.name or "")
-    m = re.match(r"^(?P<name>[^（(]+?)(?:先生)?\s*[（(](?P<aff>.+)[）)]\s*$", chair_name)
+    name = normalize_space(payload.chair.name or "")
+    aff = normalize_space(payload.chair.affiliation or "")
+
+    # name から明らかなノイズを削る
+    name = re.sub(r"^(座長|司会)\s*", "", name)
+    name = re.sub(r"(座長|司会)", "", name)
+    name = name.replace("先生", "").strip()
+
+    # 所属語が混ざっていたら切り落とす
+    m = re.search(r"(大学|病院|研究科|医学部|センター|科|講師|教授|部長|医長|副部長)", name)
     if m:
-        payload.chair.name = normalize_space(m.group("name"))
-        payload.chair.name_display = payload.chair.name
-        if not (payload.chair.affiliation or "").strip():
-            payload.chair.affiliation = normalize_space(m.group("aff"))
+        cut = m.start()
+        # 手前に人名が残っていればそこだけ採用
+        maybe_name = name[:cut].strip()
+        if maybe_name:
+            name = maybe_name
 
-    # affiliation に演題が入っていたら破棄
-    if looks_like_talk_title_text(payload.chair.affiliation or ""):
-        payload.chair.affiliation = ""
+    name = norm_name(name)
 
+    if name:
+        payload.chair.name = name
+        payload.chair.name_display = build_speaker_display(name) or name
+
+    payload.chair.affiliation = aff
+    payload.chair.role = normalize_chair_role(payload.chair.role)
     return payload
 
 def split_name_and_affiliation_strict(s: str) -> tuple[str, str]:
@@ -5973,57 +6205,94 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
     def _extract_title_near_anchor(anchor: TextBlock, seg: list[TextBlock]) -> list[str]:
         title_lines: list[str] = []
 
-        # まず anchor より下の最初のタイトルっぽい行
-        after = [b for b in seg if b.top >= anchor.top]
-        after = sorted(after, key=lambda b: (b.top, b.left))
+        # anchorの少し上も含める
+        around = [b for b in seg if b.top >= anchor.top - 450000]
+        around = sorted(around, key=lambda b: (b.top, b.left))
 
-        for i, b in enumerate(after):
-            s = _norm(b.text)
+        def strip_outer_quotes(s: str) -> str:
+            s = normalize_space(s or "")
 
-            if not _looks_like_title(s):
+            PAIRS = [
+                ("「", "」"),
+                ("『", "』"),
+                ("（", "）"),
+                ("(", ")"),
+            ]
+
+            for l, r in PAIRS:
+                if s.startswith(l) and s.endswith(r):
+                    return s[len(l):-len(r)].strip()
+
+            return s
+
+        def _clean_title_piece(s: str) -> str:
+            s = _norm(s)
+            s = re.sub(r"^\d{1,2}:\d{2}\s*[～〜~\-－]\s*\d{1,2}:\d{2}\s*", "", s)
+            s = re.sub(r"^講\s*演\s*[0-9０-９①②③④⑤⑥⑦⑧⑨⑩ⅠⅡⅢⅣⅤIVX]+\s*", "", s)
+            return s.strip()
+
+        def _looks_like_title_piece(s: str) -> bool:
+            s = _clean_title_piece(s)
+            if not s:
+                return False
+            if "演者" in normalize_key(s) or "座長" in normalize_key(s):
+                return False
+            if looks_like_affil_line(s):
+                return False
+            if "先生" in s:
+                return False
+            return True
+
+        # まず time と同じブロックにタイトル前半があるケースを優先
+        for i, b in enumerate(around):
+            raw = _norm(b.text)
+            if not is_time_line(raw):
                 continue
 
-            title_lines.append(s)
+            parts = [_clean_title_piece(x) for x in raw.split("\n")]
+            parts = [x for x in parts if _looks_like_title_piece(x)]
+            if parts:
+                title_lines.extend(parts)
 
-            # 次行が ～ で始まる副題なら追加
-            if i + 1 < len(after):
-                nxt = _norm(after[i + 1].text)
-                if nxt.startswith(("～", "〜", "~")):
-                    title_lines.append(nxt)
+                # 直後のブロックに後半があれば連結
+                for j in range(i + 1, min(i + 3, len(around))):
+                    nxt = _clean_title_piece(around[j].text)
+                    if _looks_like_title_piece(nxt):
+                        title_lines.append(nxt)
+                        # 1つ拾えば十分なことが多い
+                        break
+                break
 
-            break
+        # timeブロックから取れなければ従来fallback
+        if not title_lines:
+            for i, b in enumerate(around):
+                s = _clean_title_piece(b.text)
+                if not _looks_like_title_piece(s):
+                    continue
 
-        # 「演題」ラベル付きがあるならそちらを優先
-        for i, b in enumerate(after):
-            s = _norm(b.text)
-            k = normalize_key(s)
-            if "演題" not in k:
-                continue
+                title_lines.append(s)
 
-            tmp: list[str] = []
-            t = strip_label(["演題", "演題:", "演題："], s)
-            if t:
-                for ln in t.split("\n"):
-                    ln = _norm(ln)
-                    if ln and not looks_like_affil_line(ln):
-                        tmp.append(ln)
+                if i + 1 < len(around):
+                    nxt = _clean_title_piece(around[i + 1].text)
+                    if nxt.startswith(("～", "〜", "~", "－", "-")) or nxt.endswith("」"):
+                        if _looks_like_title_piece(nxt):
+                            title_lines.append(nxt)
 
-            if i + 1 < len(after):
-                nxt = _norm(after[i + 1].text)
-                if nxt.startswith(("～", "〜", "~")):
-                    tmp.append(nxt)
-
-            if tmp:
-                title_lines = tmp
                 break
 
         # 重複除去
         out = []
         seen = set()
         for x in title_lines:
-            if x not in seen:
+            x = _norm(x)
+            if x and x not in seen:
                 out.append(x)
                 seen.add(x)
+
+        title = "\n".join(out)
+        title = strip_outer_quotes(title)
+
+        out = [normalize_space(x) for x in title.split("\n") if x]
 
         return out[:4]
 
@@ -6047,8 +6316,15 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         seg = sorted(seg, key=lambda b: (b.top, b.left))
 
         # title
+        def has_meaningful_title(t) -> bool:
+            title = normalize_space(getattr(t, "title", "") or "")
+            lines = [normalize_space(x) for x in (getattr(t, "title_lines", None) or []) if normalize_space(x)]
+            full = "\n".join(lines) if lines else title
+            return len(full) >= 8
+
         title_lines = _extract_title_near_anchor(anchor, seg)
-        if title_lines:
+
+        if title_lines and not has_meaningful_title(t):
             t.title_lines = title_lines
             t.title = "\n".join(title_lines)
 
@@ -6190,6 +6466,16 @@ def repair_talk_speaker_tail_split(payload: DesignJSON) -> DesignJSON:
 
     return payload
 
+def dump_titles(tag, payload):
+    print(f"--- {tag} ---")
+    print(payload)
+    for i, t in enumerate(payload.talks or []):
+        print("idx=", i)
+        print("title=", repr(getattr(t, "title", "")))
+        print("title_lines=", getattr(t, "title_lines", []))
+        print("speaker=", repr(getattr(t, "speaker", "")))
+        print("affiliation=", repr(getattr(t, "affiliation", "")))
+
 async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_blocks_path: Optional[Path] = None) -> DesignJSON:
     """PPTX優先。VMは精度を上げるヒントとして blocks からの拾い直しにのみ使用し、欠損時のみVMで補完する。"""
     blocks = extract_blocks_any(pptx_path, first_only=True)
@@ -6213,51 +6499,55 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
     time_candidates = extract_time_candidates_from_blocks(blocks)
 
     draft = parse_blocks_to_design_json(blocks)
-    print("draft from blocks:")
-    print(draft)
-    refined = await ai_refine_json(blocks, draft, speaker_map, time_candidates, vm_rows)
-    print("after AI refinement:")
-    print(refined)
-    refined = assign_talk_times_by_anchor(blocks, refined)
-    print("after talk time assignment:")
-    print(refined)
-    refined = assign_talk_times_by_order_fallback(refined, blocks)
 
-    refined = apply_vm_hints_from_blocks(blocks, refined, vm_rows)
-    
-    refined = fill_missing_from_vm(refined, vm_rows)
+    refined = await ai_refine_json(blocks, draft, speaker_map, time_candidates, vm_rows)
+
+    dump_titles("after ai_refine_json", refined)
+
+    refined = assign_talk_times_by_anchor(blocks, refined)
+    dump_titles("after assign_talk_times_by_anchor", refined)
+
+    refined = assign_talk_times_by_order_fallback(refined, blocks)
+    dump_titles("after assign_talk_times_by_order_fallback", refined)
 
     refined = repair_chair_from_multiline_block(refined, blocks)
+    dump_titles("after repair_chair_from_multiline_block", refined)
+
     refined = clean_chair_fields(refined)
+    dump_titles("after clean_chair_fields", refined)
+
     refined = repair_talks_from_blocks(refined, blocks)
+    dump_titles("after repair_talks_from_blocks", refined)
 
     vm_titles = _vm_speaker_titles(vm_rows)
     if vm_titles:
         refined = prune_talks_using_vm_titles(refined, vm_rows)
     else:
         refined = prune_talks_heuristic_only(refined)
+    dump_titles("after prune_talks", refined)
+
+    refined = apply_vm_hints_from_blocks(blocks, refined, vm_rows)
+    dump_titles("after apply_vm_hints_from_blocks", refined)
+
+    refined = fill_missing_from_vm(refined, vm_rows)
+    dump_titles("after fill_missing_from_vm", refined)
 
     append_vm_role_to_talk_affiliation(refined, vm_rows)
-
-    refined = repair_chair_from_multiline_block(refined, blocks)
-    refined = clean_chair_fields(refined)
-    refined = repair_talks_from_blocks(refined, blocks)
-    refined = repair_talk_speaker_tail_split(refined)
-    print("after chair/talk repair:")
-    print(refined)
+    dump_titles("after append_vm_role_to_talk_affiliation", refined)
 
     refined = fill_chair_affiliation_from_vm_hint(refined, blocks, vm_rows)
+    dump_titles("after fill_chair_affiliation_from_vm_hint", refined)
+
     refined = fill_chair_affiliation_from_blocks(refined, blocks)
+    dump_titles("after fill_chair_affiliation_from_blocks", refined)
+
     refined = normalize_speaker_display(refined)
-    print("after filling chair affiliation:")
-    print(refined)
+    dump_titles("after normalize_speaker_display", refined)
+
     refined = finalize_people_fields(refined)
+    dump_titles("after finalize_people_fields", refined)
 
     refined = fill_datetime_parts(refined, blocks)
-
-
-    print("final refined:")
-    print(refined)
 
     
     # if refined.confidence < draft.confidence:
