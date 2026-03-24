@@ -857,22 +857,22 @@ def extract_talk_number_and_time_from_text(text: str) -> tuple[int | None, str]:
 def extract_talk_times_in_order(blocks: list[TextBlock]) -> list[str]:
     ordered = sorted(blocks, key=lambda b: (b.top, b.left))
     out: list[str] = []
+    seen = set()
 
     for b in ordered:
         txt = normalize_space(getattr(b, "text", "") or "")
-        one = txt.replace("\n", " ")
-        key = normalize_key(one)
+        one = normalize_time_text(txt.replace("\n", " "))
 
-        # 講演ラベルがある block だけ対象
-        if not any(k in key for k in ["講演", "一般講演", "特別講演"]):
-            continue
-
-        t0 = normalize_time_text(one)
-        m = re.search(r"(\d{1,2}:\d{2})\s*[～〜~\-－]\s*(\d{1,2}:\d{2})", t0)
+        m = re.search(r"(\d{1,2}:\d{2})\s*[～〜~\-－]\s*(\d{1,2}:\d{2})", one)
         if not m:
             continue
 
-        out.append(f"{m.group(1)}~{m.group(2)}")
+        tm = f"{m.group(1)}~{m.group(2)}"
+
+        # 全体時間っぽい長い1本は除外したいならここで弾く
+        if tm not in seen:
+            out.append(tm)
+            seen.add(tm)
 
     return out
 
@@ -884,6 +884,16 @@ def assign_talk_times_by_order_fallback(
         return payload
 
     time_list = extract_talk_times_in_order(blocks)
+    if not time_list:
+        return payload
+
+    full_dt = normalize_time_text(normalize_space(getattr(payload, "datetime", "") or ""))
+    m_full = re.search(r"(\d{1,2}:\d{2})\s*[～〜~\-－]\s*(\d{1,2}:\d{2})", full_dt)
+    full_time = f"{m_full.group(1)}~{m_full.group(2)}" if m_full else ""
+
+    # 全体時間を除外
+    time_list = [tm for tm in time_list if tm != full_time]
+
     if not time_list:
         return payload
 
@@ -912,7 +922,7 @@ def extract_talk_time_map_by_anchor(blocks: list[TextBlock]) -> dict[int, str]:
 
         best_time = ""
         best_dist = None
-        for j in range(max(0, i - 3), min(len(ordered), i + 4)):
+        for j in range(max(0, i - 6), min(len(ordered), i + 7)):
             if j == i:
                 continue
 
@@ -943,7 +953,11 @@ def assign_talk_times_by_anchor(blocks: list[TextBlock], payload: DesignJSON) ->
     if not talk_time_map:
         return payload
 
-    # AIで抽出された talks の並び順に 1,2,3... を対応
+    # 先に全部消す（壊れた time を残さない）
+    for t in talks:
+        t.time = ""
+
+    # 講演番号 1,2,3... に対応して入れ直す
     for idx, t in enumerate(talks, start=1):
         tm = talk_time_map.get(idx)
         if tm:
@@ -4633,7 +4647,7 @@ def build_ai_prompt(
 ) -> str:
     blocks_json: List[Dict[str, Any]] = [
         {
-            "text": b.text,  # 改行含む
+            "text": b.text,
             "left": b.left,
             "top": b.top,
             "width": b.width,
@@ -4643,69 +4657,73 @@ def build_ai_prompt(
         for b in blocks
     ]
 
-    return f"""あなたは日本語の医療セミナー案内スライド(PPTX)から情報を抽出してJSONに整形するアシスタントです。
+    draft_obj = json.loads(draft.model_dump_json() if hasattr(draft, "model_dump_json") else draft.json(ensure_ascii=False))
 
-# 重要ルール（厳守）
-- 出力は JSONのみ（前後に文章を付けない）
-- 誤推測禁止：抽出データに根拠がない値は空文字
-- datetime は「開催日」＋「全体の開催時間(開始～終了)」を1つの文字列で返す
-  - 例: "2026年5月21日（木） 18:00～19:10"
-  - 時間が抽出できない場合のみ、日付だけでも可（例: "2026年5月21日（木）"）
-  - 形式/配信方法/会場などは絶対に混ぜない
-- datetime_note は blocks 内に実際に存在する原文だけをそのまま入れる
-- datetime_note に要約・言い換え・補完をしてはいけない
-- datetime_note に入れてよいのは、日時ブロックの近傍にある短い注記のみ
-- datetime_note に "Q&A" "分" "同一内容" などの文言を入れる場合、必ず同じ語が blocks 内に存在していなければならない
-- datetime_note の候補が複数ある場合は、日時ブロックに最も近いもの1つのみ採用する
-- datetime_note が blocks に見当たらない場合は必ず空文字にする
-- 注意事項、参加登録案内、視聴方法、旅費、脚注本文は datetime_note に入れない
-- organizer は主催の会社名（抽出データにある場合のみ）
-- chair は総合司会か座長の進行役
-- chair.role には役職名を入れる（例: "座長", "総合司会"）。不明なら座長
-- chair.roleは基本的に座長が入るが、総合司会がいる場合のみそちらを優先するイメージ
-  - chair.roleが総合座長なら座長になる(基本的に座長のテキストが優先)
-- talks は1〜4件、順序はスライドの登場順（top/left）
-- 空のtalkは禁止（title_lines/speaker/timeが全て空の要素を作らない）
-- event_title_lines / talk.title_lines は改行を保持して配列で返す（統合しない）
-- 1行内の ~...~ / ～...～ は必ず別行（別要素）扱いにする
-- talk.speaker は speaker_map のキーから選ぶ。不明なら空
-- talk.affiliation は speaker_map[talk.speaker] をそのまま使用（推測禁止）
-- talk.time は「その講演ブロック近傍に明示された時間」のみ使用する
-- talk.title_lines は必ず抽出ブロック(text)内の文字列から作る
-- 抽出ブロックに存在しない文章を生成してはいけない
-- speaker名から講演タイトルを推測してはいけない
-- 全体の開催時間(datetime)を talk.time に使ってはいけない
-- 「先生」はspeakerから除去する（例：河 良崇 先生 → 河良崇）
-- talksは「講演1/2/3...」アンカー付近（座標的に近いブロック）から構成すること
-- affiliation から役職（教授、主任教授など）を削除しないこと
-- affiliation は原文をできるだけ保持すること
+    # AIには「差分だけ」返させる
+    # talks は draft と同じ長さ・同じ順序の配列で返す
+    return f"""あなたは、日本語の医療セミナー案内スライドから抽出済みの下書きJSONを、
+根拠が明確な箇所だけ最小限修正するアシスタントです。
 
-# speaker_map（所属の根拠。ここに無い所属は書かない）
+# 最重要ルール
+- 出力は JSONのみ
+- 推測禁止
+- blocks に明示されていない内容は生成禁止
+- 下書きJSON(draft)をベースに、必要最小限だけ修正すること
+- draft にある情報を勝手に消さないこと
+- 不確実な場合は draft の値をそのまま残すこと
+
+# 配列・構造の固定ルール（厳守）
+- talks 配列の長さを変更してはいけない
+- talks の順序を変更してはいけない
+- talks を追加・削除してはいけない
+- event_title_lines の要素数を増減しないこと
+- draft に存在しない新しいフィールドを追加してはいけない
+
+# 修正可能な項目
+- event_title_lines: blocks に明示根拠がある場合のみ微修正可
+- event_title: event_title_lines を "\\n" で結合したものにする
+- chair.role / chair.name / chair.affiliation: blocks に根拠がある場合のみ修正可
+- talks[i].title_lines: blocks に根拠がある場合のみ修正可
+- talks[i].speaker: speaker_map のキーに完全一致する名前に限り修正可
+- talks[i].affiliation: speaker_map[talks[i].speaker] の値のみ使用可
+- confidence: 0.0〜1.0 の範囲で設定可
+- warnings: 必要なら維持・追加可
+
+# 修正禁止の項目
+- talks[i].time は変更禁止
+- datetime は変更禁止
+- datetime_note は変更禁止
+- organizer は変更禁止
+- title_overrides は変更禁止
+- datetime_parts は変更禁止
+- datetime_time_newline は変更禁止
+- note は変更禁止
+- locked は変更禁止
+- manual_override は変更禁止
+- region / unit / event_id は変更禁止
+
+# speaker_map（このキーにある speaker 名だけ使用可）
 {json.dumps(speaker_map, ensure_ascii=False, indent=2)}
 
-# time_candidates（talk.timeはここから選ぶ）
+# time_candidates（参考のみ。talk.time は変更禁止）
 {json.dumps(time_candidates, ensure_ascii=False, indent=2)}
 
-# 抽出ブロック（座標付き）
+# 抽出ブロック
 {json.dumps(blocks_json, ensure_ascii=False, indent=2)}
 
-# 下書きJSON（ルールベース）
-{dump_json(draft)}
+# 下書きJSON(draft)
+{json.dumps(draft_obj, ensure_ascii=False, indent=2)}
 
-# 出力JSONスキーマ（厳守）
-{{
-  "event_title_lines": ["string"],
-  "event_title": "string",
-  "datetime": "string",
-  "datetime_note": "string",
-  "organizer": "string",
-  "chair": {{"role":"string","name":"string","affiliation":"string"}},
-  "talks": [
-    {{"time":"string","title_lines":["string"],"speaker":"string","affiliation":"string"}}
-  ],
-  "warnings": ["string"],
-  "confidence": 0.0
-}}
+# 出力形式
+- draft と同じ talks 件数・同じ順序で返すこと
+- 各 talks[i] は少なくとも以下を含めること:
+  - time
+  - title_lines
+  - speaker
+  - affiliation
+- event_title_lines は配列で返す
+- event_title は文字列で返す
+- JSON以外の文は禁止
 """
 
 def normalize_chair_role(role: str) -> str:
@@ -4794,19 +4812,23 @@ def clean_ai_title_lines(lines: list[str]) -> list[str]:
 
     return out
 
+
 def clean_ai_talk_titles(payload: DesignJSON) -> DesignJSON:
 
     def _clean_title_text(s: str) -> str:
         s = normalize_space(s or "")
 
-        # 前後のゴミ
-        s = re.sub(r"^[「『（(']+", "", s)
-        s = re.sub(r"[」』）)']+$", "", s)
+        # 引用符だけ除去
+        s = re.sub(r'^[「『]+', '', s)
+        s = re.sub(r'[」』]+$', '', s)
 
-        # 余分なスペース
-        s = s.strip()
+        # 括弧のバランス補完
+        if s.count("（") > s.count("）"):
+            s += "）"
+        if s.count("(") > s.count(")"):
+            s += ")"
 
-        return s
+        return s.strip()
 
     for t in payload.talks or []:
         lines = t.title_lines or []
@@ -4822,7 +4844,7 @@ async def ai_refine_json(
     draft: DesignJSON,
     speaker_map: Dict[str, str],
     time_candidates: List[str],
-    vm_rows:list[dict],
+    vm_rows: list[dict],
 ) -> DesignJSON:
     if not OPENAI_API_KEY:
         return draft
@@ -4837,14 +4859,31 @@ async def ai_refine_json(
     body = {
         "model": AI_MODEL,
         "messages": [
-            {"role": "system", "content": "Return ONLY valid JSON. No extra text."},
+            {
+                "role": "system",
+                "content": (
+                    "Return ONLY valid JSON object. "
+                    "Do not add explanations. "
+                    "Do not wrap in markdown."
+                ),
+            },
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.0,
+        "top_p": 1,
+        "presence_penalty": 0,
+        "frequency_penalty": 0,
+        "response_format": {"type": "json_object"},
     }
 
     async with httpx.AsyncClient(timeout=AI_TIMEOUT) as client:
-        r = await post_with_retry(client, f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json_body=body, retries=3)
+        r = await post_with_retry(
+            client,
+            f"{OPENAI_BASE_URL}/chat/completions",
+            headers=headers,
+            json_body=body,
+            retries=3,
+        )
         try:
             print("error json=", r.json())
         except Exception:
@@ -4852,21 +4891,17 @@ async def ai_refine_json(
         r.raise_for_status()
         data = r.json()
 
-    content = data["choices"][0]["message"]["content"]
-
+    content = (data["choices"][0]["message"]["content"] or "").strip()
 
     def _extract_json_text(s: str) -> str:
         s = (s or "").strip()
         s = re.sub(r"^\s*```json\s*", "", s, flags=re.IGNORECASE)
         s = re.sub(r"^\s*```\s*", "", s)
         s = re.sub(r"\s*```+\s*$", "", s)
-
         m = re.search(r"\{.*\}", s, flags=re.DOTALL)
         if m:
             s = m.group(0)
-
         return s.strip()
-
 
     def _escape_control_chars_in_json_strings(s: str) -> str:
         out = []
@@ -4912,7 +4947,6 @@ async def ai_refine_json(
 
         return "".join(out)
 
-
     def _fix_unterminated_string_lines(s: str) -> str:
         fixed = []
 
@@ -4930,7 +4964,6 @@ async def ai_refine_json(
                 if ch == '"':
                     q += 1
 
-            # 行内の quote 数が奇数なら閉じ忘れを補う
             if q % 2 == 1:
                 stripped = line.rstrip()
                 if stripped.endswith(","):
@@ -4943,27 +4976,15 @@ async def ai_refine_json(
 
         return "\n".join(fixed)
 
-
     def parse_llm_json(content: str) -> dict:
         s = _extract_json_text(content)
-
-        # スマートクォートなど
         s = s.replace("“", '"').replace("”", '"').replace("’", "'")
-
-        # Python風値
         s = re.sub(r"\bNone\b", "null", s)
         s = re.sub(r"\bTrue\b", "true", s)
         s = re.sub(r"\bFalse\b", "false", s)
-
-        # 1) 文字列内の生制御文字を逃がす
         s = _escape_control_chars_in_json_strings(s)
-
-        # 2) 閉じ quote 抜けを補修
         s = _fix_unterminated_string_lines(s)
-
-        # 3) 末尾カンマを除去
         s = re.sub(r",\s*([}\]])", r"\1", s)
-
         return json.loads(s)
 
     try:
@@ -4978,33 +4999,169 @@ async def ai_refine_json(
             draft.warnings = sorted(set((draft.warnings or []) + ["ai_json_parse_failed"]))
             return draft
 
+    # -------------------------------
+    # ここから「丸ごと置換」ではなく「draftに部分マージ」
+    # -------------------------------
+    refined = draft.model_copy(deep=True) if hasattr(draft, "model_copy") else DesignJSON(**json.loads(draft.json(ensure_ascii=False)))
 
-    refined = DesignJSON(**parsed)
-    refined.talks = refined.talks[:4]
+    def _safe_list_str(v) -> list[str]:
+        if not isinstance(v, list):
+            return []
+        out = []
+        for x in v:
+            s = normalize_space(str(x or ""))
+            if s:
+                out.append(s)
+        return out
 
-    # 正規化
-    refined.event_title_lines = normalize_lines_keep_order(refined.event_title_lines or [])
-    refined.event_title = "\n".join(refined.event_title_lines).strip() if refined.event_title_lines else normalize_space(refined.event_title)
+    def _norm_speaker_candidate(s: str) -> str:
+        s = norm_name(s or "")
+        return normalize_space(s)
 
-    refined.datetime = normalize_space(refined.datetime)
-    refined.datetime_note = normalize_space(refined.datetime_note)
-    refined.organizer = normalize_space(refined.organizer)
-    refined.chair.role = normalize_space(getattr(refined.chair, "role", ""))
-    refined.chair.role = normalize_chair_role(refined.chair.role)
-    refined.chair.name = normalize_person_name(refined.chair.name)
-    if getattr(refined.chair, "name_display", ""):
-        refined.chair.name_display = normalize_person_display(refined.chair.name_display)
-    refined.chair.affiliation = normalize_space(refined.chair.affiliation)
+    def _same_len_talks(parsed_talks: Any, draft_talks: List[Talk]) -> bool:
+        return isinstance(parsed_talks, list) and len(parsed_talks) == len(draft_talks)
 
-    for t in refined.talks:
-        t.time = normalize_time_range_talks(t.time)
-        t.title_lines = normalize_lines_keep_order(t.title_lines or [])
-        t.speaker = norm_name(t.speaker)
-        t.affiliation = normalize_space(t.affiliation)
-        
+    def _is_valid_ai_patch(parsed: dict, draft: DesignJSON) -> bool:
+        if not isinstance(parsed, dict):
+            return False
 
-    refined = postprocess_refined(refined, speaker_map, time_candidates)
+        parsed_talks = parsed.get("talks")
 
+        if "talks" in parsed:
+            if not isinstance(parsed_talks, list):
+                return False
+
+            # draft に talks がある案件だけ長さ固定
+            if draft.talks:
+                if len(parsed_talks) != len(draft.talks):
+                    return False
+
+            for i, pt in enumerate(parsed_talks):
+                if not isinstance(pt, dict):
+                    return False
+
+                sp = _norm_speaker_candidate(pt.get("speaker", "") or "")
+
+                # draft が既にある案件だけ speaker を厳格チェック
+                if draft.talks and sp and sp not in speaker_map:
+                    return False
+
+                # draft が既にある案件だけ time を厳格チェック
+                if draft.talks and i < len(draft.talks):
+                    pt_time = normalize_time_range_talks(pt.get("time", "") or "")
+                    dr_time = normalize_time_range_talks(getattr(draft.talks[i], "time", "") or "")
+                    if pt_time and dr_time and pt_time != dr_time:
+                        return False
+
+        return True
+
+    if not _is_valid_ai_patch(parsed, draft):
+        draft.warnings = sorted(set((draft.warnings or []) + ["ai_patch_rejected"]))
+        return draft
+
+    # event_title_lines / event_title
+    if "event_title_lines" in parsed:
+        lines = normalize_lines_keep_order(_safe_list_str(parsed.get("event_title_lines")))
+        if lines and len(lines) == len(draft.event_title_lines or []):
+            refined.event_title_lines = lines
+            refined.event_title = "\n".join(lines).strip()
+
+    elif getattr(refined, "event_title_lines", None):
+        refined.event_title_lines = normalize_lines_keep_order(refined.event_title_lines or [])
+        refined.event_title = "\n".join(refined.event_title_lines).strip()
+
+    # chair
+    chair_patch = parsed.get("chair")
+    if isinstance(chair_patch, dict):
+        role = normalize_space(chair_patch.get("role", "") or "")
+        name = normalize_person_name(chair_patch.get("name", "") or "")
+        aff = normalize_space(chair_patch.get("affiliation", "") or "")
+
+        if role:
+            refined.chair.role = normalize_chair_role(role)
+        if name:
+            refined.chair.name = name
+        if aff:
+            refined.chair.affiliation = aff
+
+        if getattr(refined.chair, "name_display", ""):
+            refined.chair.name_display = normalize_person_display(refined.chair.name_display)
+
+    # talks: 件数・順序固定で index ごとにパッチ
+    parsed_talks = parsed.get("talks")
+
+    # draft が空なら AI の talks を新規採用
+    if isinstance(parsed_talks, list) and not refined.talks:
+        new_talks = []
+
+        for pt in parsed_talks[:4]:
+            if not isinstance(pt, dict):
+                continue
+
+            title_lines = normalize_lines_keep_order(_safe_list_str(pt.get("title_lines")))
+            speaker = _norm_speaker_candidate(pt.get("speaker", "") or "")
+            affiliation = normalize_space(pt.get("affiliation", "") or "")
+            time = normalize_time_range_talks(pt.get("time", "") or "")
+
+            title = "\n".join(title_lines).strip()
+
+            new_talks.append(
+                Talk(
+                    time=time,
+                    title=title,
+                    title_lines=title_lines,
+                    speaker=speaker,
+                    speaker_display=build_speaker_display(speaker) if speaker else "",
+                    affiliation=affiliation,
+                    title_overrides=[],
+                    honorific_title="先生",
+                )
+            )
+
+        refined.talks = new_talks
+
+    # draft が既にある案件は index ごとの patch
+    elif isinstance(parsed_talks, list) and len(parsed_talks) == len(refined.talks):
+        for i, pt in enumerate(parsed_talks):
+            if not isinstance(pt, dict):
+                continue
+
+            t = refined.talks[i]
+
+            # time は draft がある案件では基本維持
+            t.time = normalize_time_range_talks(getattr(draft.talks[i], "time", "") or "")
+
+            title_lines = normalize_lines_keep_order(_safe_list_str(pt.get("title_lines")))
+            if title_lines:
+                t.title_lines = title_lines
+                t.title = "\n".join(title_lines).strip()
+
+            sp = _norm_speaker_candidate(pt.get("speaker", "") or "")
+            if sp and sp in speaker_map:
+                t.speaker = sp
+                t.affiliation = normalize_space(speaker_map.get(sp, "") or "")
+            else:
+                t.speaker = norm_name(t.speaker)
+                t.affiliation = normalize_space(t.affiliation)
+
+    # confidence
+    if "confidence" in parsed:
+        try:
+            conf = float(parsed.get("confidence"))
+            refined.confidence = max(0.0, min(1.0, conf))
+        except Exception:
+            pass
+
+    # warnings
+    w = set(refined.warnings or [])
+    for x in (parsed.get("warnings") or []):
+        sx = normalize_space(str(x or ""))
+        if sx:
+            w.add(sx)
+
+    # -------------------------------
+    # 以降は既存の rule-based 後処理を維持
+    # -------------------------------
     DATETIME_NOTE_PAT = re.compile(r"^[※\*]\s*.+")
     DATE_PAT = re.compile(r"(20\d{2}年\s*\d{1,2}月\s*\d{1,2}日(?:\s*（[^）]+）)?)")
     TIME_RANGE_PAT2 = re.compile(r"(\d{1,2}:\d{2}\s*[～〜\-ー~]\s*\d{1,2}:\d{2})")
@@ -5016,7 +5173,6 @@ async def ai_refine_json(
         def norm(s: str) -> str:
             return normalize_space(s or "")
 
-        # 1) まず datetime 候補ブロックを探す
         datetime_blocks: List[TextBlock] = []
         for b in blocks:
             txt = norm(b.text)
@@ -5026,30 +5182,23 @@ async def ai_refine_json(
             has_time = bool(TIME_RANGE_PAT2.search(txt2))
             has_datetime_label = "日時" in txt
 
-            # 日付 or 時間 or 日時ラベルを含むものを候補に
             if has_date or has_time or has_datetime_label:
                 datetime_blocks.append(b)
 
         if not datetime_blocks:
             return ""
 
-        # 2) ※注釈候補を探す
         note_candidates: List[TextBlock] = []
         for b in blocks:
             txt = norm(b.text)
 
             if not DATETIME_NOTE_PAT.match(txt):
                 continue
-
-            # 長すぎる注意書きは除外
             if len(txt) > 60:
                 continue
-
-            # 複数行の長文注意書きは除外
             if "\n" in txt and len(txt.splitlines()) >= 3:
                 continue
 
-            # よくある注意本文を除外
             ng_keywords = [
                 "ご視聴", "事前参加", "旅費", "ご了承ください", "担当者へご連絡",
                 "医療従事者", "学生", "ご参加はご遠慮"
@@ -5062,7 +5211,6 @@ async def ai_refine_json(
         if not note_candidates:
             return ""
 
-        # 3) datetimeブロック近傍の note をスコアリング
         best_text = ""
         best_score = None
 
@@ -5072,11 +5220,8 @@ async def ai_refine_json(
             for dt in datetime_blocks:
                 dx = abs(note.left - dt.left)
                 dy = abs(note.top - dt.top)
-
-                # 下にある注釈をやや優先
                 below_bonus = 0 if note.top >= dt.top else 200000
 
-                # 遠すぎるものは除外
                 if dy > 1200000:
                     continue
                 if dx > 5000000:
@@ -5089,36 +5234,30 @@ async def ai_refine_json(
                     best_text = note_txt
 
         return best_text
-    
 
     def is_honsha_vm(vm_rows):
         return any(
             "VM(本社)" in (r.get("_presence_sheets") or [])
             for r in vm_rows if isinstance(r, dict)
         )
-    
 
     def extract_datetime_from_blocks_v2(blocks: List[TextBlock]) -> str:
         lines = [normalize_space(x) for x in blocks_to_lines(blocks) if normalize_space(x)]
 
-        # 1) 同一行で “日付 + 時間帯” が揃ってるパターン（最強）
         for l in lines:
             m_date = DATE_PAT.search(l)
             m_time = TIME_RANGE_PAT2.search(normalize_time_colon(l))
             if m_date and m_time:
                 return normalize_space(f"{m_date.group(1)} {m_time.group(1)}")
 
-        # 2) “日時:” ラベル行
         for l in lines:
             if "日時" in l:
                 s = re.sub(r"^.*日時\s*[:：]?\s*", "", normalize_space(l))
-                # ラベル行自体に時間が無くても、近傍の時間行を結合
                 m_date = DATE_PAT.search(s)
                 m_time = TIME_RANGE_PAT2.search(normalize_time_colon(s))
                 if m_date and m_time:
                     return normalize_space(f"{m_date.group(1)} {m_time.group(1)}")
                 if m_date:
-                    # 近傍探索
                     near_time = ""
                     for l2 in lines:
                         mt = TIME_RANGE_PAT2.search(normalize_time_colon(l2))
@@ -5129,7 +5268,6 @@ async def ai_refine_json(
 
                 return normalize_space(s)
 
-        # 3) 日付行 + どこかの時間行（よくある）
         date_str = ""
         for l in lines:
             md = DATE_PAT.search(l)
@@ -5151,15 +5289,13 @@ async def ai_refine_json(
 
         return ""
 
-    rule_dt = extract_datetime_from_blocks_v2(blocks)  # 下に改善版を載せます
-
-    # ルールで取れてるなら AI の datetime は上書き（＝揺れが消える）
+    # rule優先
+    rule_dt = extract_datetime_from_blocks_v2(blocks)
     if rule_dt:
         refined.datetime = normalize_space(rule_dt)
 
     rule_dt_note = extract_datetime_note_from_blocks(blocks)
     if is_honsha_vm(vm_rows):
-        rule_dt_note = extract_datetime_note_from_blocks(blocks)
         refined.datetime_note = normalize_space(rule_dt_note) if rule_dt_note else ""
     else:
         refined.datetime_note = ""
@@ -5167,7 +5303,46 @@ async def ai_refine_json(
     if not refined.organizer:
         refined.organizer = extract_organizer_from_blocks(blocks)
 
-    w = set(refined.warnings or [])
+    rule_org = extract_organizer_from_blocks(blocks)
+    if rule_org:
+        refined.organizer = normalize_organizer(rule_org)
+
+    refined.organizer = normalize_space(refined.organizer)
+    refined.datetime = normalize_space(refined.datetime)
+    refined.datetime_note = normalize_space(refined.datetime_note)
+
+    refined.chair.role = normalize_chair_role(normalize_space(getattr(refined.chair, "role", "") or ""))
+    refined.chair.name = normalize_person_name(getattr(refined.chair, "name", "") or "")
+    if getattr(refined.chair, "name_display", ""):
+        refined.chair.name_display = normalize_person_display(refined.chair.name_display)
+    refined.chair.affiliation = normalize_space(getattr(refined.chair, "affiliation", "") or "")
+
+
+    def clean_speaker_text_strict(s: str) -> str:
+        s = normalize_space(s or "")
+        s = normalize_time_colon(s)
+        s = re.sub(r"\d{1,2}[:：]\d{2}\s*[-~～〜－—–]\s*\d{1,2}[:：]\d{2}", "", s)
+        s = re.sub(r"^(演者|座長|講師)\s*[:：]?\s*", "", s)
+        s = s.replace("\n", " ").strip()
+        s = re.sub(r"\s*先生$", "", s)
+        return norm_name(s)
+
+    for t in refined.talks:
+        t.time = normalize_time_range_talks(t.time)
+        t.title_lines = normalize_lines_keep_order(t.title_lines or [])
+        if t.title_lines:
+            t.title = "\n".join(t.title_lines).strip()
+        t.speaker = clean_speaker_text_strict(getattr(t, "speaker", "") or "")
+        t.speaker = norm_name(t.speaker)
+        if t.speaker in speaker_map:
+            t.affiliation = normalize_space(speaker_map[t.speaker] or "")
+        else:
+            t.affiliation = normalize_space(t.affiliation)
+
+    refined = postprocess_refined(refined, speaker_map, time_candidates)
+    refined.talks = sort_talks_by_layout(blocks, refined.talks)
+    refined.talks = assign_talk_times_by_nearest_upper_time(blocks, refined.talks)
+
     w.add("ai_refined")
     if not refined.datetime:
         w.add("missing_datetime")
@@ -5179,14 +5354,83 @@ async def ai_refine_json(
         w.add("no_talks")
     if not refined.event_title_lines and not refined.event_title:
         w.add("missing_event_title")
+
     refined.warnings = sorted(w)
-
-    rule_org = extract_organizer_from_blocks(blocks)
-    if rule_org:
-        refined.organizer = normalize_organizer(rule_org)
-
     return refined
 
+def find_talk_anchor_top(blocks: list[TextBlock], talk: Talk) -> int:
+    candidates = []
+
+    title_lines = [normalize_space(x) for x in (talk.title_lines or []) if normalize_space(x)]
+    speaker_keys = [
+        normalize_space(getattr(talk, "speaker", "") or ""),
+        normalize_space(getattr(talk, "speaker_display", "") or ""),
+    ]
+    speaker_keys = [x for x in speaker_keys if x]
+
+    for b in blocks:
+        bt = normalize_space(getattr(b, "text", "") or "")
+        bt_key = bt.replace(" ", "").replace("　", "")
+
+        score = 0
+
+        for tl in title_lines:
+            key = tl.replace(" ", "").replace("　", "")
+            if key and key in bt_key:
+                score += 3
+
+        for sp in speaker_keys:
+            key = sp.replace(" ", "").replace("　", "").replace("先生", "")
+            if key and key in bt_key.replace("先生", ""):
+                score += 5
+
+        if score > 0:
+            candidates.append((score, b.top))
+
+    if not candidates:
+        return 10**18
+
+    # score高いもの優先、同点なら上にあるもの
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    return candidates[0][1]
+
+
+def sort_talks_by_layout(blocks: list[TextBlock], talks: list[Talk]) -> list[Talk]:
+    items = []
+    for t in talks:
+        anchor_top = find_talk_anchor_top(blocks, t)
+        items.append((anchor_top, t))
+    items.sort(key=lambda x: x[0])
+    return [t for _, t in items]
+
+def assign_talk_times_by_nearest_upper_time(blocks: list[TextBlock], talks: list[Talk]) -> list[Talk]:
+    time_blocks = []
+    for b in blocks:
+        txt = normalize_time_colon(normalize_space(b.text or ""))
+        m = re.search(r"(\d{1,2}:\d{2})\s*[～〜~\-－]\s*(\d{1,2}:\d{2})", txt)
+        if m:
+            time_blocks.append((b.top, b.left, f"{m.group(1)}~{m.group(2)}"))
+
+    for t in talks:
+        anchor_top = find_talk_anchor_top(blocks, t)
+
+        best = None
+        best_score = None
+
+        for top, left, tm in time_blocks:
+            # 基本は talk より上の time を優先
+            if top > anchor_top:
+                continue
+
+            dist = anchor_top - top
+            if best_score is None or dist < best_score:
+                best_score = dist
+                best = tm
+
+        if best and not normalize_space(t.time):
+            t.time = best
+
+    return talks
 
 # ---------------- Postprocess ----------------
 def postprocess_refined(refined: DesignJSON, speaker_map: Dict[str, str], time_candidates: List[str]) -> DesignJSON:
@@ -6797,6 +7041,7 @@ def dump_titles(tag, payload):
         print("title_lines=", getattr(t, "title_lines", []))
         print("speaker=", repr(getattr(t, "speaker", "")))
         print("affiliation=", repr(getattr(t, "affiliation", "")))
+        
 
 async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_blocks_path: Optional[Path] = None) -> DesignJSON:
     """PPTX優先。VMは精度を上げるヒントとして blocks からの拾い直しにのみ使用し、欠損時のみVMで補完する。"""
@@ -6821,16 +7066,13 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
     time_candidates = extract_time_candidates_from_blocks(blocks)
 
     draft = parse_blocks_to_design_json(blocks)
+    print("draft", draft)
 
     refined = await ai_refine_json(blocks, draft, speaker_map, time_candidates, vm_rows)
-    refined = clean_ai_talk_titles(refined)
     dump_titles("after ai_refine_json", refined)
 
-    refined = assign_talk_times_by_anchor(blocks, refined)
-    dump_titles("after assign_talk_times_by_anchor", refined)
-
-    refined = assign_talk_times_by_order_fallback(refined, blocks)
-    dump_titles("after assign_talk_times_by_order_fallback", refined)
+    refined = clean_ai_talk_titles(refined)
+    dump_titles("after clean_ai_talk_titles", refined)
 
     refined = repair_chair_from_multiline_block(refined, blocks)
     dump_titles("after repair_chair_from_multiline_block", refined)
@@ -6840,6 +7082,20 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
 
     refined = repair_talks_from_blocks(refined, blocks)
     dump_titles("after repair_talks_from_blocks", refined)
+    for t in refined.talks:
+        t.time = ""
+
+    refined = assign_talk_times_by_anchor(blocks, refined)
+    dump_titles("after assign_talk_times_by_anchor", refined)
+
+    refined = assign_talk_times_by_order_fallback(refined, blocks)
+    dump_titles("after assign_talk_times_by_order_fallback", refined)
+
+    refined = assign_talk_times_by_proximity(blocks, refined)
+
+
+
+    
 
     vm_titles = _vm_speaker_titles(vm_rows)
     if vm_titles:
