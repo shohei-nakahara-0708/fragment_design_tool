@@ -52,6 +52,7 @@ import mimetypes
 import requests
 
 import io
+import asyncio
 
 
 load_dotenv()
@@ -96,7 +97,7 @@ BASE_VIEWPORT = {"width": 600, "height": 800}
 AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-AI_TIMEOUT = 30
+AI_TIMEOUT = 120
 
 # EMU -> pt (pptx uses EMU units for font size)
 EMU_PER_PT = 12700
@@ -4558,6 +4559,17 @@ def find_sponsor_logo_blobs(pptx_path: Path) -> list[bytes]:
 
     return blobs
 
+async def post_with_retry(client, url, *, headers, json_body, retries=3):
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return await client.post(url, headers=headers, json=json_body)
+        except httpx.ReadTimeout as e:
+            last_exc = e
+            if attempt == retries - 1:
+                raise
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise last_exc
 
 async def ocr_company_name_with_openai(image_bytes: bytes) -> str:
     if not OPENAI_API_KEY:
@@ -4591,7 +4603,7 @@ async def ocr_company_name_with_openai(image_bytes: bytes) -> str:
     }
 
     async with httpx.AsyncClient(timeout=AI_TIMEOUT) as client:
-        r = await client.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=body)
+        r = await post_with_retry(client, f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json_body=body, retries=3)
         r.raise_for_status()
         data = r.json()
 
@@ -4728,6 +4740,83 @@ def normalize_time_range_talks(s: str) -> str:
 
     return f"{int(h1):02d}:{m1}~{int(h2):02d}:{m2}"
 
+def clean_ai_title_lines(lines: list[str]) -> list[str]:
+    out = []
+
+    def _norm(s: str) -> str:
+        return normalize_space(s or "")
+
+    def _is_name_line(s: str) -> bool:
+        s = _norm(s)
+        if not s:
+            return False
+        if "先生" in s:
+            return True
+        # 鈴木勇三 / 平野勉 みたいな短い氏名だけの行
+        s2 = s.replace(" ", "").replace("　", "")
+        return 2 <= len(s2) <= 8 and not any(x in s for x in [
+            "大学", "病院", "研究科", "医学部", "センター",
+            "講師", "教授", "部長", "医長", "院長", "副会長", "幹事"
+        ])
+
+    def _is_aff_line(s: str) -> bool:
+        s = _norm(s)
+        return any(x in s for x in [
+            "大学", "病院", "研究科", "医学部", "センター",
+            "クリニック", "講師", "教授", "部長", "医長", "院長",
+            "副会長", "幹事", "名誉院長"
+        ])
+
+    for ln in lines or []:
+        s = _norm(ln)
+        if not s:
+            continue
+
+        # 外側の引用符だけ除去対象として残す
+        if s in ["「", "」", "『", "』"]:
+            continue
+
+        # 氏名行・所属行が来たらタイトル終了
+        if _is_name_line(s) or _is_aff_line(s):
+            break
+
+        out.append(s)
+
+    # 先頭末尾のカッコを剥がす
+    if out:
+        joined = "\n".join(out).strip()
+        pairs = [("「", "」"), ("『", "』"), ("（", "）"), ("(", ")")]
+        for l, r in pairs:
+            if joined.startswith(l) and joined.endswith(r):
+                joined = joined[len(l):-len(r)].strip()
+                break
+        out = [normalize_space(x) for x in joined.split("\n") if normalize_space(x)]
+
+    return out
+
+def clean_ai_talk_titles(payload: DesignJSON) -> DesignJSON:
+
+    def _clean_title_text(s: str) -> str:
+        s = normalize_space(s or "")
+
+        # 前後のゴミ
+        s = re.sub(r"^[「『（(']+", "", s)
+        s = re.sub(r"[」』）)']+$", "", s)
+
+        # 余分なスペース
+        s = s.strip()
+
+        return s
+
+    for t in payload.talks or []:
+        lines = t.title_lines or []
+        cleaned = [_clean_title_text(x) for x in lines if _clean_title_text(x)]
+
+        if cleaned:
+            t.title_lines = cleaned
+            t.title = "\n".join(cleaned)
+    return payload
+
 async def ai_refine_json(
     blocks: List[TextBlock],
     draft: DesignJSON,
@@ -4755,7 +4844,7 @@ async def ai_refine_json(
     }
 
     async with httpx.AsyncClient(timeout=AI_TIMEOUT) as client:
-        r = await client.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=body)
+        r = await post_with_retry(client, f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json_body=body, retries=3)
         try:
             print("error json=", r.json())
         except Exception:
@@ -4765,38 +4854,130 @@ async def ai_refine_json(
 
     content = data["choices"][0]["message"]["content"]
 
-    print("RAW CONTENT >>>")
-    print(content)
-    print("<<< RAW CONTENT")
 
-    def parse_llm_json(content: str) -> dict:
-        s = (content or "").strip()
-
-        # fence除去
+    def _extract_json_text(s: str) -> str:
+        s = (s or "").strip()
         s = re.sub(r"^\s*```json\s*", "", s, flags=re.IGNORECASE)
         s = re.sub(r"^\s*```\s*", "", s)
         s = re.sub(r"\s*```+\s*$", "", s)
 
-        # 最初の { から最後の } を抜く
         m = re.search(r"\{.*\}", s, flags=re.DOTALL)
         if m:
             s = m.group(0)
 
-        # Python風 → JSON風
+        return s.strip()
+
+
+    def _escape_control_chars_in_json_strings(s: str) -> str:
+        out = []
+        in_string = False
+        escape = False
+
+        for ch in s:
+            if in_string:
+                if escape:
+                    out.append(ch)
+                    escape = False
+                    continue
+
+                if ch == "\\":
+                    out.append(ch)
+                    escape = True
+                    continue
+
+                if ch == '"':
+                    out.append(ch)
+                    in_string = False
+                    continue
+
+                if ch == "\n":
+                    out.append("\\n")
+                    continue
+                if ch == "\r":
+                    out.append("\\r")
+                    continue
+                if ch == "\t":
+                    out.append("\\t")
+                    continue
+                if ord(ch) < 0x20:
+                    out.append(f"\\u{ord(ch):04x}")
+                    continue
+
+                out.append(ch)
+            else:
+                out.append(ch)
+                if ch == '"':
+                    in_string = True
+                    escape = False
+
+        return "".join(out)
+
+
+    def _fix_unterminated_string_lines(s: str) -> str:
+        fixed = []
+
+        for line in s.splitlines():
+            q = 0
+            escape = False
+
+            for ch in line:
+                if escape:
+                    escape = False
+                    continue
+                if ch == "\\":
+                    escape = True
+                    continue
+                if ch == '"':
+                    q += 1
+
+            # 行内の quote 数が奇数なら閉じ忘れを補う
+            if q % 2 == 1:
+                stripped = line.rstrip()
+                if stripped.endswith(","):
+                    stripped = stripped[:-1] + '",'
+                else:
+                    stripped = stripped + '"'
+                line = stripped
+
+            fixed.append(line)
+
+        return "\n".join(fixed)
+
+
+    def parse_llm_json(content: str) -> dict:
+        s = _extract_json_text(content)
+
+        # スマートクォートなど
+        s = s.replace("“", '"').replace("”", '"').replace("’", "'")
+
+        # Python風値
         s = re.sub(r"\bNone\b", "null", s)
         s = re.sub(r"\bTrue\b", "true", s)
         s = re.sub(r"\bFalse\b", "false", s)
 
-        # 末尾カンマ削除
+        # 1) 文字列内の生制御文字を逃がす
+        s = _escape_control_chars_in_json_strings(s)
+
+        # 2) 閉じ quote 抜けを補修
+        s = _fix_unterminated_string_lines(s)
+
+        # 3) 末尾カンマを除去
         s = re.sub(r",\s*([}\]])", r"\1", s)
 
         return json.loads(s)
-        
 
     try:
         parsed = json.loads(content)
     except Exception:
-        parsed = parse_llm_json(content)
+        try:
+            parsed = parse_llm_json(content)
+        except Exception:
+            print("RAW CONTENT >>>")
+            print(content)
+            print("<<< RAW CONTENT")
+            draft.warnings = sorted(set((draft.warnings or []) + ["ai_json_parse_failed"]))
+            return draft
+
 
     refined = DesignJSON(**parsed)
     refined.talks = refined.talks[:4]
@@ -5478,6 +5659,30 @@ def _strip_outer_quotes(s: str) -> str:
         s2 = s2[:-1]
     return s2.strip()
 
+def strip_outer_quotes_loose(s: str) -> str:
+    s = normalize_space(s or "")
+
+    # まず完全ペアを剥がす
+    pairs = [
+        ("「", "」"),
+        ("『", "』"),
+        ("（", "）"),
+        ("(", ")"),
+    ]
+    changed = True
+    while changed and s:
+        changed = False
+        for l, r in pairs:
+            if s.startswith(l) and s.endswith(r):
+                s = s[len(l):-len(r)].strip()
+                changed = True
+
+    # 片側だけ残った外カッコも落とす
+    s = re.sub(r'^[「『（(]+', '', s).strip()
+    s = re.sub(r'[」』）)]+$', '', s).strip()
+
+    return s
+
 def _clean_title_lines(t):
     if getattr(t, "title_lines", None):
         t.title_lines = [_strip_outer_quotes(x) for x in t.title_lines]
@@ -5529,7 +5734,7 @@ def prune_talks_using_vm_titles(payload: DesignJSON, vm_rows: list[dict]) -> Des
         for t in talks
     ]
 
-    # 1) まず不要ワードは常に落とす（VMなくても効く）
+    # 1) 不要ワード除去
     filtered = []
     for t in talks:
         tt = normalize_space("\n".join(t.title_lines or []).strip() or (t.title or ""))
@@ -5547,42 +5752,26 @@ def prune_talks_using_vm_titles(payload: DesignJSON, vm_rows: list[dict]) -> Des
         seen.add(key)
         dedup.append(t)
 
-    # ---- ここから先は VMがあるときだけ ----
     vm_titles = _vm_speaker_titles(vm_rows)
     if not vm_titles:
-        dedup = [t for t in dedup if looks_like_real_talk(t)]
-        payload.talks = dedup
-        payload.warnings = sorted(set((payload.warnings or []) + ["talks_pruned_heuristic_only"]))
-        for t in payload.talks:
-            _clean_title_lines(t)
-        payload = normalize_talk_speakers(payload)
+        payload.talks = [t for t in dedup if looks_like_real_talk(t)]
         return payload
 
-    # 3) VM演題にマッチするtalkだけ残す
     vm_keys = [_norm_title_key(x) for x in vm_titles]
+
     kept = []
     for t in dedup:
         k = _norm_title_key("\n".join(t.title_lines or []).strip() or (t.title or ""))
         if any(k == vk or (vk and vk in k) or (k and k in vk) for vk in vm_keys):
             kept.append(t)
 
-    if kept:
-        dedup = kept
-
-    # 4) VM演題数へ寄せる（最大4）
-    payload.talks = dedup[: min(len(vm_titles), 4)]
-    for t in payload.talks:
-            _clean_title_lines(t)
-    payload = normalize_talk_speakers(payload)
-
-    after_keys = [
-        _norm_title_key("\n".join(t.title_lines or []).strip() or (t.title or ""))
-        for t in (payload.talks or [])
-    ]
-
-    # ★「VM処理で結果が変わった」時だけ warning
-    if after_keys != before_keys:
+    # ★ここが重要
+    # VM側件数と talks件数が一致しないなら、消しすぎ防止で pruning しない
+    if kept and len(kept) == len(dedup):
+        payload.talks = kept[: min(len(vm_titles), 4)]
         payload.warnings = sorted(set((payload.warnings or []) + ["talks_pruned_by_vm_hint"]))
+    else:
+        payload.talks = dedup[:4]
 
     return payload
 
@@ -6094,6 +6283,18 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
 
     ordered = sorted(blocks, key=lambda b: (b.top, b.left))
 
+    def _clean_speaker_line(s: str) -> str:
+        s = normalize_space(s)
+        s = normalize_time_colon(s)  # ← 追加
+
+        # 時間削除
+        s = re.sub(r"\d{1,2}:\d{2}\s*[～〜~\-－—–]\s*\d{1,2}:\d{2}", "", s)
+
+        # ラベル削除
+        s = re.sub(r"(演者|座長)\s*[:：]?", "", s)
+
+        return s.strip()
+
 
     def strip_label(prefixes, s: str) -> str:
         s2 = normalize_space(s or "")
@@ -6113,12 +6314,20 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         return normalize_space(s or "").replace("　", " ")
 
     def _find_talk_anchor(no: int) -> Optional[TextBlock]:
+        labels_by_no = {
+            1: ["講演1", "講演１", "講演①", "講演Ⅰ", "教育講演"],
+            2: ["講演2", "講演２", "講演②", "講演Ⅱ"],
+            3: ["講演3", "講演３", "講演③", "講演Ⅲ", "特別講演"],
+            4: ["講演4", "講演４", "講演④", "講演Ⅳ"],
+        }
+
+        labels = labels_by_no.get(no, [f"講演{no}", f"講演{str(no).translate(str.maketrans('1234567890', '１２３４５６７８９０'))}"])
+
         for b in ordered:
-            s = _norm(b.text).replace("\n", " ")
-            if re.search(rf"講演\s*{no}\b", s):
-                return b
-            if re.search(rf"講演\s*{str(no).translate(str.maketrans('1234567890', '１２３４５６７８９０'))}", s):
-                return b
+            key = normalize_key(b.text or "")
+            for lb in labels:
+                if normalize_key(lb) in key:
+                    return b
         return None
 
     def _looks_like_title(s: str) -> bool:
@@ -6139,41 +6348,56 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         speaker = ""
         affiliation = ""
 
+        bad_words = ["大学", "病院", "研究科", "医学部", "センター", "講師", "教授", "部長", "医長", "院長", "副部長"]
+
+        def _is_name_only(s: str) -> bool:
+            s = _norm(s).replace("先生", "").strip()
+            s2 = s.replace(" ", "").replace("　", "")
+            if not s2:
+                return False
+            if any(x in s for x in bad_words):
+                return False
+            return 2 <= len(s2) <= 8
+
         for i, b in enumerate(seg):
             raw = _norm(b.text)
             key = normalize_key(raw)
-
             if "演者" not in key:
                 continue
 
-            sp = strip_label(["演者", "演者:", "演者："], raw)
-            sp = _norm(sp)
+            lines = [_norm(x) for x in str(b.text).split("\n") if _norm(x)]
 
-            # 1) 同一ブロックに名前がある場合を最優先
-            m = re.search(r"([^\s　]+)\s+([^\s　]+)\s*先生?$", sp)
-            if m:
-                speaker = norm_name(m.group(1) + m.group(2))
-            else:
-                sp_no_honor = re.sub(r"\s*先生\s*$", "", sp).strip()
-                if sp_no_honor and not any(x in sp_no_honor for x in ["大学", "病院", "科", "センター", "教授", "部長", "医長", "院長", "医学部"]):
-                    speaker = norm_name(sp_no_honor)
-                else:
-                    aff_tail, name_tail = split_affiliation_and_name_tail(sp_no_honor)
-                    if name_tail:
-                        speaker = norm_name(name_tail)
-                        if aff_tail:
-                            affiliation = aff_tail
+            # 1) 同一ブロック内の「演者」の次の行を最優先
+            for li, ln in enumerate(lines):
+                if "演者" not in normalize_key(ln):
+                    continue
 
-            # 2) 次ブロックに名前がある場合
-            if not speaker and i + 1 < len(seg):
+                if li + 1 < len(lines):
+                    cand = _clean_speaker_line(lines[li + 1]).replace("先生", "").strip()
+                    if _is_name_only(cand):
+                        speaker = norm_name(cand)
+
+                # 前の行に所属があるケース
+                for prev in lines[:li]:
+                    if looks_like_affil_line(prev):
+                        affiliation = prev
+
+                # 後ろの行に所属があるケース
+                if li + 2 < len(lines):
+                    cand_aff = _norm(lines[li + 2])
+                    if looks_like_affil_line(cand_aff):
+                        affiliation = cand_aff
+
+                if speaker:
+                    return speaker, affiliation
+
+            # 2) 次ブロック fallback
+            if i + 1 < len(seg):
                 nxt = _norm(seg[i + 1].text)
-                m = re.search(r"([^\s　]+)\s+([^\s　]+)\s*先生?$", nxt)
-                if m:
-                    speaker = norm_name(m.group(1) + m.group(2))
-                elif "先生" in nxt:
-                    speaker = norm_name(nxt.replace("先生", ""))
+                nxt2 = _clean_speaker_line(nxt).replace("先生", "").strip()
+                if _is_name_only(nxt2):
+                    speaker = norm_name(nxt2)
 
-            # 3) affiliation
             if i + 1 < len(seg):
                 for j in range(i + 1, min(i + 4, len(seg))):
                     cand = _norm(seg[j].text)
@@ -6187,20 +6411,34 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
                 return speaker, affiliation
 
         return "", ""
-    def strip_label(prefixes, s: str) -> str:
-        s2 = normalize_space(s or "")
-        s2_key = normalize_key(s2)  # スペースなどを潰した比較用
 
-        for p in prefixes:
-            p_key = normalize_key(p)
-            if s2_key.startswith(p_key):
-                # 先頭の「演\s*者」みたいな形も含めて消す
-                # p が "演者" なら ^演\s*者\s*[:：]?\s* を消す
-                chars = list(p_key)  # "演者" -> ["演","者"]
-                pat = r"^" + r"\s*".join(map(re.escape, chars)) + r"\s*[:：]?\s*"
-                s2 = re.sub(pat, "", s2).strip()
-                return s2
-        return s2
+    def clean_title_lines2(lines: list[str]) -> list[str]:
+        out = []
+
+        for ln in lines:
+            s = normalize_space(ln)
+
+            # 単独カッコ除去
+            if s in ["「", "」", "『", "』"]:
+                continue
+
+            # 明確な名前行は除外
+            if re.fullmatch(r"[一-龥々]{1,4}\s*[一-龥々]{1,4}\s*先生?", s):
+                continue
+
+            # 所属行は除外
+            if any(x in s for x in [
+                "大学", "病院", "研究科", "医学部", "センター",
+                "クリニック", "講師", "教授", "部長", "医長", "院長", "名誉院長"
+            ]):
+                continue
+
+            s = strip_outer_quotes_loose(s).strip()
+            if s:
+                out.append(s)
+
+        return out
+
 
     def _extract_title_near_anchor(anchor: TextBlock, seg: list[TextBlock]) -> list[str]:
         title_lines: list[str] = []
@@ -6208,6 +6446,13 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         # anchorの少し上も含める
         around = [b for b in seg if b.top >= anchor.top - 450000]
         around = sorted(around, key=lambda b: (b.top, b.left))
+
+        def _is_name_line(s: str) -> bool:
+            s = _norm(s)
+            if not s or "先生" not in s:
+                return False
+            bad = ["大学", "病院", "研究科", "医学部", "センター", "科", "講師", "教授", "部長", "医長", "院長", "副部長"]
+            return not any(x in s for x in bad)
 
         def strip_outer_quotes(s: str) -> str:
             s = normalize_space(s or "")
@@ -6231,16 +6476,27 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
             s = re.sub(r"^講\s*演\s*[0-9０-９①②③④⑤⑥⑦⑧⑨⑩ⅠⅡⅢⅣⅤIVX]+\s*", "", s)
             return s.strip()
 
+        
+
         def _looks_like_title_piece(s: str) -> bool:
             s = _clean_title_piece(s)
+
             if not s:
                 return False
-            if "演者" in normalize_key(s) or "座長" in normalize_key(s):
+
+            if any(x in s for x in ["講演", "演者", "座長"]):
                 return False
+
             if looks_like_affil_line(s):
                 return False
+
             if "先生" in s:
                 return False
+
+            # ★追加：短すぎる or 記号だけは除外
+            if len(s) < 8:
+                return False
+
             return True
 
         # まず time と同じブロックにタイトル前半があるケースを優先
@@ -6254,12 +6510,16 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
             if parts:
                 title_lines.extend(parts)
 
-                # 直後のブロックに後半があれば連結
+                # ← ここは for i の内側
                 for j in range(i + 1, min(i + 3, len(around))):
-                    nxt = _clean_title_piece(around[j].text)
+                    raw2 = _norm(around[j].text)
+                    nxt = _clean_title_piece(raw2)
+
+                    if _is_name_line(raw2) or looks_like_affil_line(raw2):
+                        break
+
                     if _looks_like_title_piece(nxt):
                         title_lines.append(nxt)
-                        # 1つ拾えば十分なことが多い
                         break
                 break
 
@@ -6274,8 +6534,13 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
 
                 if i + 1 < len(around):
                     nxt = _clean_title_piece(around[i + 1].text)
-                    if nxt.startswith(("～", "〜", "~", "－", "-")) or nxt.endswith("」"):
-                        if _looks_like_title_piece(nxt):
+                    if _looks_like_title_piece(nxt):
+                        # ★ここ追加
+                        if (
+                            s.startswith(("「", "『")) or
+                            nxt.endswith(("」", "』")) or
+                            nxt.startswith(("―", "-", "～", "〜"))
+                        ):
                             title_lines.append(nxt)
 
                 break
@@ -6290,11 +6555,54 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
                 seen.add(x)
 
         title = "\n".join(out)
-        title = strip_outer_quotes(title)
-
-        out = [normalize_space(x) for x in title.split("\n") if x]
+        title = strip_outer_quotes_loose(title)
+        out = [strip_outer_quotes_loose(normalize_space(x)) for x in title.split("\n") if normalize_space(x)]
 
         return out[:4]
+
+
+    
+    def is_bad_speaker(s: str) -> bool:
+        s = normalize_space(s or "")
+        if not s:
+            return True
+
+        # 所属ワードが入ってたらアウト
+        bad = ["大学", "病院", "研究科", "医学部", "センター", "講師", "教授", "部長", "医長", "院長"]
+        if any(x in s for x in bad):
+            return True
+
+        # 長すぎる
+        s2 = s.replace(" ", "").replace("　", "")
+        if len(s2) > 10:
+            return True
+
+        return False
+
+    def clean_speaker_text(s: str) -> str:
+        s = normalize_space(s or "")
+
+        # 時間削除
+        s = re.sub(r"\d{1,2}[:：]\d{2}\s*[-~～〜]\s*\d{1,2}[:：]\d{2}", "", s)
+
+        # ラベル削除
+        s = re.sub(r"(演者|座長)\s*", "", s)
+
+        # 最後の人名だけ取る
+        m = re.search(r"([一-龥々]{1,4}\s*[一-龥々]{1,4})$", s)
+        if m:
+            return norm_name(m.group(1))
+
+        return norm_name(s)
+    
+    def clean_affiliation_text(s: str) -> str:
+        s = normalize_space(s or "")
+
+        # 演者とか混ざってたら除去
+        s = re.sub(r"(演者|座長)\s*", "", s)
+
+        return s.strip()
+
 
     # talks[0], talks[1]... を各「講演N」アンカーから拾い直す
     talks = list(payload.talks or [])
@@ -6317,12 +6625,24 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
 
         # title
         def has_meaningful_title(t) -> bool:
-            title = normalize_space(getattr(t, "title", "") or "")
             lines = [normalize_space(x) for x in (getattr(t, "title_lines", None) or []) if normalize_space(x)]
+            title = normalize_space(getattr(t, "title", "") or "")
             full = "\n".join(lines) if lines else title
-            return len(full) >= 8
+
+            if not full:
+                return False
+
+            if re.search(r"[^\s　]+\s+[^\s　]+\s*先生?$", full):
+                return False
+
+            if any(x in full for x in ["大学", "病院", "研究科", "医学部", "センター", "講師", "教授", "部長", "医長", "院長"]):
+                return False
+
+            return len(full) >= 6
 
         title_lines = _extract_title_near_anchor(anchor, seg)
+        title_lines = clean_title_lines2(title_lines)
+        # title_lines = normalize_title_lines(title_lines)
 
         if title_lines and not has_meaningful_title(t):
             t.title_lines = title_lines
@@ -6331,12 +6651,14 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         # speaker / affiliation
         speaker, affiliation = _extract_person_after_enja(seg)
 
-        if speaker:
-            t.speaker = speaker
-            t.speaker_display = build_speaker_display(speaker) or speaker
+        if speaker and (not t.speaker or is_bad_speaker(t.speaker)):
+            sp = clean_speaker_text(speaker)
+            t.speaker = sp
+            t.speaker_display = build_speaker_display(sp) or sp
 
         if affiliation:
-            t.affiliation = affiliation
+            aff = clean_affiliation_text(affiliation)
+            t.affiliation = aff
 
         # 最後の保険: speaker だけ取れて affiliation がない場合は speaker_map 相当を使いたいならここで補完
         # if t.speaker and not t.affiliation:
@@ -6501,7 +6823,7 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
     draft = parse_blocks_to_design_json(blocks)
 
     refined = await ai_refine_json(blocks, draft, speaker_map, time_candidates, vm_rows)
-
+    refined = clean_ai_talk_titles(refined)
     dump_titles("after ai_refine_json", refined)
 
     refined = assign_talk_times_by_anchor(blocks, refined)
