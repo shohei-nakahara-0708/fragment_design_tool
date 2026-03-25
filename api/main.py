@@ -6218,41 +6218,28 @@ def prune_talks_using_vm_titles(payload: DesignJSON, vm_rows: list[dict]) -> Des
     if not talks:
         return payload
 
-    chair_name = getattr(payload.chair, "name", "") or ""
-
-    # 1) 明らかに不要なものだけ落とす
+    # 1) 明らかな不要物だけ落とす
     filtered = []
     for t in talks:
-        if _is_obviously_bad_talk(t, chair_name=chair_name):
+        tt = normalize_space("\n".join(t.title_lines or []).strip() or (t.title or ""))
+        if _is_unwanted_talk(tt):
             continue
         filtered.append(t)
 
-    # 2) title重複を除去（同じtitleなら speaker/affiliation がある方を優先）
-    grouped = {}
-    for t in filtered:
-        key = _norm_title_key(_talk_title_text(t))
-        if not key:
-            key = f"__idx__{len(grouped)}"
-        grouped.setdefault(key, []).append(t)
-
+    # 2) title重複だけ除去
+    seen = set()
     dedup = []
-    for _, group in grouped.items():
-        if len(group) == 1:
-            dedup.append(group[0])
+    for t in filtered:
+        key = _norm_title_key("\n".join(t.title_lines or []).strip() or (t.title or ""))
+        if not key:
+            dedup.append(t)
             continue
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(t)
 
-        def score_talk(x):
-            return (
-                1 if normalize_space(getattr(x, "speaker", "") or "") else 0,
-                1 if normalize_space(getattr(x, "affiliation", "") or "") else 0,
-                1 if normalize_space(getattr(x, "time", "") or "") else 0,
-                len(_talk_title_text(x)),
-            )
-
-        group = sorted(group, key=score_talk, reverse=True)
-        dedup.append(group[0])
-
-    # 3) VMは削除には使わず、並びや件数の参考程度
+    # 3) VMでは削らない。最大4件だけ残す
     payload.talks = dedup[:4]
     payload.warnings = sorted(set((payload.warnings or []) + ["talks_pruned_by_vm_hint"]))
     return payload
@@ -7365,6 +7352,163 @@ def repair_talk_speaker_tail_split(payload: DesignJSON) -> DesignJSON:
 
     return payload
 
+
+def rebuild_talks_from_anchors(blocks: list[TextBlock], payload: DesignJSON) -> DesignJSON:
+    ordered = sorted(blocks, key=lambda b: (b.top, b.left))
+
+    def _find_talk_anchor(no: int):
+        labels_by_no = {
+            1: ["講演1", "講演１", "講演①", "講演Ⅰ"],
+            2: ["講演2", "講演２", "講演②", "講演Ⅱ"],
+            3: ["講演3", "講演３", "講演③", "講演Ⅲ"],
+            4: ["講演4", "講演４", "講演④", "講演Ⅳ"],
+        }
+        labels = labels_by_no.get(no, [f"講演{no}"])
+        for b in ordered:
+            key = normalize_key(b.text or "")
+            if any(normalize_key(lb) in key for lb in labels):
+                return b
+        return None
+
+    def _extract_time_from_seg(seg):
+        for b in seg:
+            txt = normalize_time_colon(normalize_space(b.text or ""))
+            m = re.search(r"(\d{1,2}:\d{2})\s*[～〜~\-－—–]\s*(\d{1,2}:\d{2})", txt)
+            if m:
+                return f"{m.group(1)}~{m.group(2)}"
+        return ""
+
+    def _extract_title_from_seg(seg):
+        lines = []
+        for b in seg:
+            txt = normalize_space(b.text or "")
+            key = normalize_key(txt)
+
+            if not txt:
+                continue
+            if "講演" in key:
+                continue
+            if "演者" in key:
+                continue
+            if "座長" in key:
+                continue
+            if looks_like_affil_line(txt):
+                continue
+            if re.search(r"\d{1,2}:\d{2}\s*[～〜~\-－—–]\s*\d{1,2}:\d{2}", txt):
+                continue
+            if len(txt) < 6:
+                continue
+
+            lines.append(txt)
+
+        lines = normalize_lines_keep_order(lines)
+        return lines[:3]
+
+    def _extract_speaker_aff_from_seg(seg):
+        speaker = ""
+        affiliation = ""
+
+        for i, b in enumerate(seg):
+            txt = normalize_space(b.text or "")
+            key = normalize_key(txt)
+
+            if "演者" not in key:
+                continue
+
+            # 同一行: 演者 市田 晃佑 先生
+            m = re.search(r"演\s*者\s*([一-龥々]{1,4}\s*[一-龥々]{1,4})\s*先生?", txt)
+            if m:
+                speaker = norm_name(m.group(1))
+
+                # 同一行の所属
+                m2 = re.search(
+                    r"演\s*者\s*[一-龥々]{1,4}\s*[一-龥々]{1,4}\s*先生?\s*(.+)$",
+                    txt
+                )
+                if m2:
+                    cand_aff = normalize_space(m2.group(1))
+                    if looks_like_affil_line(cand_aff):
+                        affiliation = cand_aff
+                if speaker:
+                    return speaker, affiliation
+
+            # 改行型
+            lines = [normalize_space(x) for x in txt.split("\n") if normalize_space(x)]
+            for li, ln in enumerate(lines):
+                if "演者" not in normalize_key(ln):
+                    continue
+                if li + 1 < len(lines):
+                    cand = re.sub(r"\s*先生$", "", lines[li + 1]).strip()
+                    speaker = norm_name(cand)
+                if li + 2 < len(lines):
+                    cand_aff = normalize_space(lines[li + 2])
+                    if looks_like_affil_line(cand_aff):
+                        affiliation = cand_aff
+                if speaker:
+                    return speaker, affiliation
+
+            # 次ブロック fallback
+            if i + 1 < len(seg):
+                nxt = normalize_space(seg[i + 1].text or "")
+                cand = re.sub(r"\s*先生$", "", nxt).strip()
+                cand = norm_name(cand)
+                if re.fullmatch(r"[一-龥々]{2,8}", cand.replace(" ", "")):
+                    speaker = cand
+
+            if i + 2 < len(seg):
+                cand_aff = normalize_space(seg[i + 2].text or "")
+                if looks_like_affil_line(cand_aff):
+                    affiliation = cand_aff
+
+            if speaker:
+                return speaker, affiliation
+
+        return "", ""
+
+    new_talks = []
+
+    for no in [1, 2, 3, 4]:
+        anchor = _find_talk_anchor(no)
+        if not anchor:
+            continue
+
+        next_anchor = _find_talk_anchor(no + 1)
+
+        x0 = anchor.left - 3000000
+        x1 = anchor.left + 7000000
+        y0 = anchor.top - 200000
+        y1 = (next_anchor.top - 100000) if next_anchor else (anchor.top + 2500000)
+
+        seg = [b for b in ordered if x0 <= b.left <= x1 and y0 <= b.top <= y1]
+        seg = sorted(seg, key=lambda b: (b.top, b.left))
+
+        title_lines = _extract_title_from_seg(seg)
+        speaker, affiliation = _extract_speaker_aff_from_seg(seg)
+        time = _extract_time_from_seg(seg)
+
+        if not (title_lines or speaker or affiliation or time):
+            continue
+
+        title = "\n".join(title_lines).strip()
+
+        new_talks.append(
+            Talk(
+                time=time,
+                title=title,
+                title_lines=title_lines,
+                speaker=speaker,
+                speaker_display=build_speaker_display(speaker) if speaker else "",
+                affiliation=affiliation,
+                title_overrides=[],
+                honorific_title="先生",
+            )
+        )
+
+    if new_talks:
+        payload.talks = new_talks[:4]
+
+    return payload
+
 def dump_titles(tag, payload):
     print(f"--- {tag} ---")
     print(payload)
@@ -7403,6 +7547,22 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
 
     refined = await ai_refine_json(blocks, draft, speaker_map, time_candidates, vm_rows)
     dump_titles("after ai_refine_json", refined)
+
+    def has_chair_shift_pattern(payload: DesignJSON) -> bool:
+        talks = list(payload.talks or [])
+        if len(talks) < 2:
+            return False
+
+        chair_name = normalize_key(getattr(payload.chair, "name", "") or "").replace("先生", "")
+        if not chair_name:
+            return False
+
+        first_sp = normalize_key(getattr(talks[0], "speaker", "") or "").replace("先生", "")
+        return bool(first_sp and first_sp == chair_name)
+
+    if has_chair_shift_pattern(refined):
+        refined = rebuild_talks_from_anchors(blocks, refined)
+
 
     refined = clean_ai_talk_titles(refined)
     dump_titles("after clean_ai_talk_titles", refined)
