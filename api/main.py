@@ -1564,11 +1564,37 @@ def extract_session_times_from_blocks(blocks) -> list[str]:
     if not blocks:
         return []
 
+    ordered = sorted(
+        blocks,
+        key=lambda b: (
+            b.get("top", 0) if isinstance(b, dict) else getattr(b, "top", 0),
+            b.get("left", 0) if isinstance(b, dict) else getattr(b, "left", 0),
+        )
+    )
+
     out = []
-    for b in blocks:
+
+    for i, b in enumerate(ordered):
         t = (b.get("text") if isinstance(b, dict) else getattr(b, "text", "")) or ""
 
-        if not has_session_label(t):
+        # 1) 同一block内にセッションラベル + time
+        if has_session_label(t):
+            for m in TIME_RANGE_IN_TEXT_RE.finditer(t):
+                tt = normalize_time_range(m.group(1))
+                if tt and tt not in out:
+                    out.append(tt)
+            continue
+
+        # 2) セッションラベルが前後blockにあるケース
+        near_texts = [t]
+        if i > 0:
+            prev_t = (ordered[i-1].get("text") if isinstance(ordered[i-1], dict) else getattr(ordered[i-1], "text", "")) or ""
+            near_texts.append(prev_t)
+        if i + 1 < len(ordered):
+            next_t = (ordered[i+1].get("text") if isinstance(ordered[i+1], dict) else getattr(ordered[i+1], "text", "")) or ""
+            near_texts.append(next_t)
+
+        if not any(has_session_label(x) for x in near_texts):
             continue
 
         for m in TIME_RANGE_IN_TEXT_RE.finditer(t):
@@ -1659,26 +1685,35 @@ def fill_datetime_parts(payload, blocks=None):
 
     dt = str(pget(payload, "datetime", "") or "")
 
-    session_times = extract_session_times_from_datetime(blocks)
-    if not session_times:
-        session_times = extract_session_times_from_blocks(dt)
+    # 全体時間
+    full_dt = normalize_datetime_text(dt)
+    m_full = TIME_RANGE_RE.search(full_dt)
+    full_time = normalize_time_range(m_full.group(0)) if m_full else ""
 
-    talks = pget(payload, "talks", []) or []
-    if session_times and len(session_times) == 1 and talks:
-        first = talks[0] or {}
-        t2_raw = first.get("time") if isinstance(first, dict) else getattr(first, "time", "")
-        t2 = normalize_time_range(t2_raw or "")
-        if t2 and t2 not in session_times:
-            session_times.append(t2)
+    session_times = extract_session_times_from_blocks(blocks)
+    if not session_times:
+        session_times = extract_session_times_from_datetime(dt)
+
+    # 全体時間は除外
+    if full_time:
+        session_times = [t for t in session_times if normalize_time_range(t) != full_time]
+
+    # 重複除去
+    uniq = []
+    seen = set()
+    for t in session_times:
+        nt = normalize_time_range(t)
+        if nt and nt not in seen:
+            uniq.append(nt)
+            seen.add(nt)
+    session_times = uniq
 
     m = re.search(
         r"(?P<y>\d{4})\s*年\s*(?P<mo>\d{1,2})\s*月\s*(?P<d>\d{1,2})\s*日"
         r"(?:\s*[（(]\s*(?P<dow>[^）)\s]+)\s*[）)])?",
         normalize_datetime_text(dt)
     )
-    
 
-    # ★必ず DatetimeParts に統一
     parts = _ensure_datetime_parts(pget(payload, "datetime_parts", None))
 
     if m:
@@ -1686,7 +1721,6 @@ def fill_datetime_parts(payload, blocks=None):
         parts.year, parts.month, parts.day = y, mo, d
         parts.dow = dow or extract_dow_from_blocks(blocks)
     else:
-        # 必要なら blocks だけでも拾う
         dow = extract_dow_from_blocks(blocks)
         if dow:
             parts.dow = dow
@@ -1694,12 +1728,12 @@ def fill_datetime_parts(payload, blocks=None):
     if session_times:
         if len(session_times) == 1:
             time_joined = session_times[0]
+            newline = False
         else:
             time_joined = ", ".join([f"{i+1}回目{t}" for i, t in enumerate(session_times)])
-        newline = (len(session_times) >= 2)
+            newline = True
     else:
-        mt = TIME_RANGE_RE.search(normalize_datetime_text(dt))
-        time_joined = normalize_time_range(mt.group(0)) if mt else ""
+        time_joined = full_time
         newline = False
 
     parts.time = time_joined
@@ -1707,8 +1741,10 @@ def fill_datetime_parts(payload, blocks=None):
     pset(payload, "datetime_parts", parts)
     pset(payload, "datetime_time_newline", newline)
 
+    # 複数回表記の時だけ talk time を消す
     if should_hide_talk_times(payload):
-        clear_talk_times(payload)
+        if "1回目" in time_joined or "2回目" in time_joined:
+            clear_talk_times(payload)
 
     return payload
 
@@ -7135,9 +7171,32 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
                 t.speaker = sp
                 t.speaker_display = build_speaker_display(sp) or sp
 
+        def _affiliation_score(s: str) -> tuple[int, int]:
+            s = normalize_space(s or "")
+            key = normalize_key(s)
+
+            dept_words = [
+                "科", "内科", "外科", "産婦人科", "婦人科", "泌尿器科", "呼吸器内科",
+                "腫瘍内科", "循環器内科", "消化器内科", "教室", "講座", "部"
+            ]
+
+            has_dept = 1 if any(w in s for w in dept_words) else 0
+            return (has_dept, len(key))
+
         if affiliation:
             aff = clean_affiliation_text(affiliation)
-            t.affiliation = aff
+            cur_aff = normalize_space(getattr(t, "affiliation", "") or "")
+
+            if aff:
+                if not cur_aff:
+                    t.affiliation = aff
+                else:
+                    # 既存に候補が含まれるなら既存優先
+                    if normalize_key(aff) in normalize_key(cur_aff):
+                        t.affiliation = cur_aff
+                    # 候補の方が明らかに情報量が多い時だけ更新
+                    elif _affiliation_score(aff) > _affiliation_score(cur_aff):
+                        t.affiliation = aff
 
         # 最後の保険: speaker だけ取れて affiliation がない場合は speaker_map 相当を使いたいならここで補完
         # if t.speaker and not t.affiliation:
