@@ -1466,6 +1466,9 @@ def format_title_initial(
     return lines
 
 
+
+
+
 def format_affiliation_initial(raw: str, *, max_len: int, max_lines: int = 2) -> str:
     """
     affiliation 初期整形（最大2行）
@@ -5021,6 +5024,28 @@ async def ai_refine_json(
     def _same_len_talks(parsed_talks: Any, draft_talks: List[Talk]) -> bool:
         return isinstance(parsed_talks, list) and len(parsed_talks) == len(draft_talks)
 
+    def _looks_bad_talk_seed(t) -> bool:
+        title_lines = getattr(t, "title_lines", None) or []
+        title = normalize_space(getattr(t, "title", "") or "")
+        speaker = normalize_space(getattr(t, "speaker", "") or "")
+        affiliation = normalize_space(getattr(t, "affiliation", "") or "")
+
+        full_title = "\n".join([normalize_space(x) for x in title_lines if normalize_space(x)]) or title
+
+        # title/speaker が空 or 明らかに壊れてる
+        if not full_title:
+            return True
+        if not speaker:
+            return True
+        if any(x == speaker for x in ["胆道", "肝内胆管癌治療", "肝外胆管癌治療", "講演"]):
+            return True
+        if len(speaker.replace(" ", "").replace("　", "")) <= 1:
+            return True
+        if not affiliation:
+            return True
+
+        return False
+
     def _is_valid_ai_patch(parsed: dict, draft: DesignJSON) -> bool:
         if not isinstance(parsed, dict):
             return False
@@ -5031,33 +5056,81 @@ async def ai_refine_json(
             if not isinstance(parsed_talks, list):
                 return False
 
-            # draft に talks がある案件だけ長さ固定
-            if draft.talks:
-                if len(parsed_talks) != len(draft.talks):
-                    return False
+            if draft.talks and len(parsed_talks) != len(draft.talks):
+                return False
 
             for i, pt in enumerate(parsed_talks):
                 if not isinstance(pt, dict):
                     return False
 
-                sp = _norm_speaker_candidate(pt.get("speaker", "") or "")
-
-                # draft が既にある案件だけ speaker を厳格チェック
-                if draft.talks and sp and sp not in speaker_map:
-                    return False
-
-                # draft が既にある案件だけ time を厳格チェック
+                # draft が壊れてる talk は厳格チェックしない
                 if draft.talks and i < len(draft.talks):
+                    seed = draft.talks[i]
+                    if _looks_bad_talk_seed(seed):
+                        continue
+
+                    sp = _norm_speaker_candidate(pt.get("speaker", "") or "")
+                    if sp and sp not in speaker_map:
+                        return False
+
                     pt_time = normalize_time_range_talks(pt.get("time", "") or "")
-                    dr_time = normalize_time_range_talks(getattr(draft.talks[i], "time", "") or "")
+                    dr_time = normalize_time_range_talks(getattr(seed, "time", "") or "")
                     if pt_time and dr_time and pt_time != dr_time:
                         return False
 
         return True
 
     if not _is_valid_ai_patch(parsed, draft):
+        # draft が壊れている案件は、AI全採用にフォールバック
+        bad_seed = (
+            not draft.talks or
+            any(_looks_bad_talk_seed(t) for t in (draft.talks or []))
+        )
+
+        if bad_seed:
+            try:
+                refined = DesignJSON(**parsed)
+                refined.warnings = sorted(set((refined.warnings or []) + ["ai_refined_fallback"]))
+                return refined
+            except Exception:
+                pass
+
         draft.warnings = sorted(set((draft.warnings or []) + ["ai_patch_rejected"]))
         return draft
+
+    def fix_spaced_english(s: str) -> str:
+        s = normalize_space(s or "")
+
+        # 完全に1文字ずつ空いてる英字
+        if re.fullmatch(r"[A-Za-z](?:\s+[A-Za-z]){2,}", s):
+            return s.replace(" ", "")
+
+        # 1語ずつ判定して "U p d a t e" → "Update"
+        words = s.split(" ")
+        merged = []
+        buf = []
+
+        def flush_buf():
+            nonlocal buf, merged
+            if not buf:
+                return
+            token = " ".join(buf)
+            if re.fullmatch(r"[A-Za-z](?:\s+[A-Za-z]){1,}", token):
+                merged.append(token.replace(" ", ""))
+            else:
+                merged.append(token)
+            buf = []
+
+        for w in words:
+            if re.fullmatch(r"[A-Za-z]", w):
+                buf.append(w)
+            else:
+                flush_buf()
+                merged.append(w)
+
+        flush_buf()
+        return " ".join(merged)
+    
 
     # event_title_lines / event_title
     if "event_title_lines" in parsed:
@@ -5069,6 +5142,20 @@ async def ai_refine_json(
     elif getattr(refined, "event_title_lines", None):
         refined.event_title_lines = normalize_lines_keep_order(refined.event_title_lines or [])
         refined.event_title = "\n".join(refined.event_title_lines).strip()
+
+    refined.event_title_lines = [
+        fix_spaced_english(x.replace("\n", " "))
+        for x in (refined.event_title_lines or [])
+    ]
+
+    refined.event_title = fix_spaced_english(
+        (refined.event_title or "").replace("\n", " ")
+    )
+
+    if refined.event_title_lines:
+        refined.event_title = "\n".join(refined.event_title_lines).strip()
+    elif refined.event_title:
+        refined.event_title_lines = [refined.event_title]
 
     # chair
     chair_patch = parsed.get("chair")
