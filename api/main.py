@@ -5404,49 +5404,50 @@ async def ai_refine_json(
         )
 
     def extract_datetime_from_blocks_v2(blocks: List[TextBlock]) -> str:
-        lines = [normalize_space(x) for x in blocks_to_lines(blocks) if normalize_space(x)]
+        if not blocks:
+            return ""
 
-        for l in lines:
-            m_date = DATE_PAT.search(l)
-            m_time = TIME_RANGE_PAT2.search(normalize_time_colon(l))
-            if m_date and m_time:
-                return normalize_space(f"{m_date.group(1)} {m_time.group(1)}")
+        ordered = sorted(blocks, key=lambda b: (b.top, b.left))
 
-        for l in lines:
-            if "日時" in l:
-                s = re.sub(r"^.*日時\s*[:：]?\s*", "", normalize_space(l))
-                m_date = DATE_PAT.search(s)
-                m_time = TIME_RANGE_PAT2.search(normalize_time_colon(s))
-                if m_date and m_time:
-                    return normalize_space(f"{m_date.group(1)} {m_time.group(1)}")
-                if m_date:
-                    near_time = ""
-                    for l2 in lines:
-                        mt = TIME_RANGE_PAT2.search(normalize_time_colon(l2))
-                        if mt:
-                            near_time = mt.group(1)
-                            break
-                    return normalize_space(f"{m_date.group(1)} {near_time}".strip())
+        DATE_PAT = re.compile(r"(20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日(?:\s*[（(][^）)]+[）)])?)")
+        TIME_PAT = re.compile(r"(\d{1,2}[:：]\d{2}\s*[～〜\-ー−－—–~]\s*\d{1,2}[:：]\d{2})")
 
-                return normalize_space(s)
+        # 1) 同一block内に date+time があるものを最優先
+        for b in ordered:
+            txt = normalize_datetime_text(b.text or "")
+            md = DATE_PAT.search(txt)
+            mt = TIME_PAT.search(txt)
+            if md and mt:
+                return normalize_space(f"{md.group(1)} {normalize_time_range(mt.group(1))}")
 
+        # 2) date block と近傍 time block の結合
+        date_block = None
         date_str = ""
-        for l in lines:
-            md = DATE_PAT.search(l)
+        for b in ordered:
+            txt = normalize_datetime_text(b.text or "")
+            md = DATE_PAT.search(txt)
             if md:
+                date_block = b
                 date_str = md.group(1)
                 break
 
-        time_str = ""
-        for l in lines:
-            mt = TIME_RANGE_PAT2.search(normalize_time_colon(l))
-            if mt:
-                time_str = mt.group(1)
-                break
+        if date_block and date_str:
+            best_time = ""
+            best_score = None
+            for b in ordered:
+                txt = normalize_datetime_text(b.text or "")
+                mt = TIME_PAT.search(txt)
+                if not mt:
+                    continue
 
-        if date_str and time_str:
-            return normalize_space(f"{date_str} {time_str}")
-        if date_str:
+                tm = normalize_time_range(mt.group(1))
+                score = abs(b.top - date_block.top) + abs(b.left - date_block.left) * 0.15
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_time = tm
+
+            if best_time:
+                return normalize_space(f"{date_str} {best_time}")
             return normalize_space(date_str)
 
         return ""
@@ -5489,8 +5490,46 @@ async def ai_refine_json(
         s = re.sub(r"\s*先生$", "", s)
         return norm_name(s)
 
+    def compact_talk_title_lines(lines: list[str]) -> list[str]:
+        lines = [normalize_space(x) for x in (lines or []) if normalize_space(x)]
+        if not lines:
+            return []
+
+        out = []
+        i = 0
+        while i < len(lines):
+            cur = lines[i]
+
+            # 次行と結合したいパターン
+            if i + 1 < len(lines):
+                nxt = lines[i + 1]
+
+                # 英文 + 日本語の続き
+                if re.search(r"[A-Za-z]$", cur) and re.search(r"^[ぁ-んァ-ヶ一-龥A-Za-z]", nxt):
+                    cur = cur + nxt
+                    i += 1
+
+                # 極端に短い末尾語を前行に結合
+                elif len(nxt) <= 4 and re.fullmatch(r"[A-Za-zぁ-んァ-ヶ一-龥]+", nxt):
+                    cur = cur + nxt
+                    i += 1
+
+            out.append(cur)
+            i += 1
+
+        # さらに 2行目以降が短すぎるならまとめる
+        if len(out) >= 3:
+            merged = [out[0]]
+            tail = "".join(out[1:])
+            if len(tail) <= 28:
+                merged.append(tail)
+                return merged
+
+        return out
+
     for t in refined.talks:
         t.time = normalize_time_range_talks(t.time)
+        t.title_lines = compact_talk_title_lines(t.title_lines or [])
         t.title_lines = normalize_lines_keep_order(t.title_lines or [])
         if t.title_lines:
             t.title = "\n".join(t.title_lines).strip()
