@@ -6675,9 +6675,16 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
             return False
         return len(s) >= 6
 
-    def _extract_person_after_enja(seg: list[TextBlock]) -> tuple[str, str]:
+    def _extract_person_near_enja(
+    seg: list[TextBlock],
+    chair_name: str = "",
+    chair_aff: str = "",
+) -> tuple[str, str]:
         speaker = ""
         affiliation = ""
+
+        chair_name_key = normalize_key(chair_name or "").replace("先生", "")
+        chair_aff_key = normalize_key(chair_aff or "")
 
         bad_words = ["大学", "病院", "研究科", "医学部", "センター", "講師", "教授", "部長", "医長", "院長", "副部長"]
 
@@ -6690,53 +6697,99 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
                 return False
             return 2 <= len(s2) <= 8
 
+        def _clean_name_candidate(s: str) -> str:
+            s = clean_speaker_text(s)
+            s = s.replace("先生", "").strip()
+            return norm_name(s)
+
+        def _same_as_chair_name(s: str) -> bool:
+            if not chair_name_key:
+                return False
+            return normalize_key(s or "").replace("先生", "") == chair_name_key
+
+        def _same_as_chair_aff(s: str) -> bool:
+            if not chair_aff_key:
+                return False
+            return normalize_key(s or "") == chair_aff_key
+
+        def _score_name(block_idx: int, line_idx: int, anchor_idx: int, line: str) -> tuple:
+            dist = abs(block_idx - anchor_idx)
+            key = normalize_key(line or "")
+
+            # 演者と同一行なら最優先
+            same_line_bonus = 0 if "演者" in key else 10
+
+            # 「先生」付きは少し優先
+            sensei_bonus = 0 if "先生" in line else 1
+
+            return (dist, same_line_bonus, sensei_bonus, line_idx)
+
+        def _score_aff(block_idx: int, line_idx: int, anchor_idx: int, line: str) -> tuple:
+            dist = abs(block_idx - anchor_idx)
+            return (dist, line_idx)
+
         for i, b in enumerate(seg):
-            raw = _norm(b.text)
-            key = normalize_key(raw)
+            key = normalize_key(b.text or "")
             if "演者" not in key:
                 continue
 
-            lines = [_norm(x) for x in str(b.text).split("\n") if _norm(x)]
+            # 演者ブロックの前後を見る
+            start = max(0, i - 2)
+            end = min(len(seg), i + 4)
+            cand_blocks = seg[start:end]
 
-            # 1) 同一ブロック内の「演者」の次の行を最優先
-            for li, ln in enumerate(lines):
-                if "演者" not in normalize_key(ln):
-                    continue
+            name_cands = []
+            aff_cands = []
 
-                if li + 1 < len(lines):
-                    cand = _clean_speaker_line(lines[li + 1]).replace("先生", "").strip()
-                    if _is_name_only(cand):
-                        speaker = norm_name(cand)
+            for rel_idx, cb in enumerate(cand_blocks):
+                abs_idx = start + rel_idx
+                lines = [_norm(x) for x in str(cb.text).split("\n") if _norm(x)]
 
-                # 前の行に所属があるケース
-                for prev in lines[:li]:
-                    if looks_like_affil_line(prev):
-                        affiliation = prev
+                for li, ln in enumerate(lines):
+                    ln_key = normalize_key(ln)
 
-                # 後ろの行に所属があるケース
-                if li + 2 < len(lines):
-                    cand_aff = _norm(lines[li + 2])
-                    if looks_like_affil_line(cand_aff):
-                        affiliation = cand_aff
-
-                if speaker:
-                    return speaker, affiliation
-
-            # 2) 次ブロック fallback
-            if i + 1 < len(seg):
-                nxt = _norm(seg[i + 1].text)
-                nxt2 = _clean_speaker_line(nxt).replace("先生", "").strip()
-                if _is_name_only(nxt2):
-                    speaker = norm_name(nxt2)
-
-            if i + 1 < len(seg):
-                for j in range(i + 1, min(i + 4, len(seg))):
-                    cand = _norm(seg[j].text)
-                    if not cand:
+                    # 座長行は除外
+                    if "座長" in ln_key:
                         continue
-                    if looks_like_affil_line(cand):
-                        affiliation = cand
-                        break
+
+                    # 名前候補
+                    nm = _clean_name_candidate(ln)
+                    if _is_name_only(nm) and not _same_as_chair_name(nm):
+                        name_cands.append((_score_name(abs_idx, li, i, ln), nm))
+
+                    # 所属候補
+                    if looks_like_affil_line(ln) and not _same_as_chair_aff(ln):
+                        aff_cands.append((_score_aff(abs_idx, li, i, ln), ln))
+
+                # ブロック全体が「演者 石井 康隆先生 ...」型のときの補助
+                block_text = _norm(cb.text)
+                block_key = normalize_key(block_text)
+
+                if "演者" in block_key:
+                    # 演者の後ろの名前
+                    m = re.search(r"演者\s*([一-龥々]{1,4}\s*[一-龥々]{1,4})\s*先生?", block_text)
+                    if m:
+                        nm = norm_name(m.group(1))
+                        if nm and not _same_as_chair_name(nm):
+                            name_cands.append(((abs(abs_idx - i), 0, 0, 0), nm))
+
+                    # 演者の後ろに所属も続くケース
+                    m2 = re.search(
+                        r"演者\s*[一-龥々]{1,4}\s*[一-龥々]{1,4}\s*先生?\s+(.+)$",
+                        block_text
+                    )
+                    if m2:
+                        cand_aff = _norm(m2.group(1))
+                        if looks_like_affil_line(cand_aff) and not _same_as_chair_aff(cand_aff):
+                            aff_cands.append(((abs(abs_idx - i), 0), cand_aff))
+
+            if name_cands:
+                name_cands.sort(key=lambda x: x[0])
+                speaker = name_cands[0][1]
+
+            if aff_cands:
+                aff_cands.sort(key=lambda x: x[0])
+                affiliation = aff_cands[0][1]
 
             if speaker:
                 return speaker, affiliation
@@ -6980,12 +7033,17 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
             t.title = "\n".join(title_lines)
 
         # speaker / affiliation
-        speaker, affiliation = _extract_person_after_enja(seg)
+        speaker, affiliation = _extract_person_near_enja(seg,chair_name=getattr(payload.chair, "name", "") or "",chair_aff=getattr(payload.chair, "affiliation", "") or "",)
 
         if speaker and (not t.speaker or is_bad_speaker(t.speaker)):
             sp = clean_speaker_text(speaker)
-            t.speaker = sp
-            t.speaker_display = build_speaker_display(sp) or sp
+
+            chair_name_key = normalize_key(getattr(payload.chair, "name", "") or "").replace("先生", "")
+            sp_key = normalize_key(sp or "").replace("先生", "")
+
+            if sp_key and sp_key != chair_name_key:
+                t.speaker = sp
+                t.speaker_display = build_speaker_display(sp) or sp
 
         if affiliation:
             aff = clean_affiliation_text(affiliation)
@@ -7180,9 +7238,48 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
 
     refined = assign_talk_times_by_proximity(blocks, refined)
 
+    def _same_person(a: str, b: str) -> bool:
+        return normalize_key(a or "").replace("先生", "") == normalize_key(b or "").replace("先生", "")
 
+    def _title_key(t) -> str:
+        lines = [normalize_space(x) for x in (getattr(t, "title_lines", None) or []) if normalize_space(x)]
+        title = "\n".join(lines) if lines else normalize_space(getattr(t, "title", "") or "")
+        return normalize_key(title)
 
-    
+    def drop_chair_duplicate_talks(payload: DesignJSON) -> DesignJSON:
+        talks = list(payload.talks or [])
+        if len(talks) <= 1:
+            return payload
+
+        chair_name = getattr(payload.chair, "name", "") or ""
+        if not chair_name:
+            return payload
+
+        grouped = {}
+        for t in talks:
+            grouped.setdefault(_title_key(t), []).append(t)
+
+        kept = []
+        for _, group in grouped.items():
+            if len(group) == 1:
+                kept.append(group[0])
+                continue
+
+            # 同じタイトルが複数あるなら、chair本人を除外
+            non_chair = [
+                t for t in group
+                if not _same_person(getattr(t, "speaker", "") or "", chair_name)
+            ]
+
+            if non_chair:
+                kept.extend(non_chair)
+            else:
+                kept.extend(group[:1])
+
+        payload.talks = kept
+        return payload
+
+    refined = drop_chair_duplicate_talks(refined)
 
     vm_titles = _vm_speaker_titles(vm_rows)
     if vm_titles:
