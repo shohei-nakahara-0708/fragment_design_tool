@@ -4896,6 +4896,66 @@ async def ai_refine_json(
 
     content = (data["choices"][0]["message"]["content"] or "").strip()
 
+    def _looks_bad_talk_seed_strong(t) -> bool:
+        title_lines = getattr(t, "title_lines", None) or []
+        title = normalize_space(getattr(t, "title", "") or "")
+        speaker = normalize_space(getattr(t, "speaker", "") or "")
+        affiliation = normalize_space(getattr(t, "affiliation", "") or "")
+
+        full_title = "\n".join([normalize_space(x) for x in title_lines if normalize_space(x)]) or title
+
+        # title が無い
+        if not full_title:
+            return True
+
+        # speaker が無い
+        if not speaker:
+            return True
+
+        # title語っぽい speaker
+        bad_speakers = {
+            "課題", "腎移植", "逐次薬物治療", "治療", "講演", "演者",
+            "胆道", "肝内胆管癌治療", "肝外胆管癌治療"
+        }
+        if speaker in bad_speakers:
+            return True
+
+        # affiliation が無い or 生の演者行
+        if not affiliation:
+            return True
+        if "演者" in affiliation and "先生" in affiliation:
+            return True
+
+        return False
+
+    def _build_talks_from_parsed(parsed_talks: list[dict]) -> list[Talk]:
+        out = []
+
+        for pt in parsed_talks[:4]:
+            if not isinstance(pt, dict):
+                continue
+
+            title_lines = normalize_lines_keep_order(_safe_list_str(pt.get("title_lines")))
+            title = "\n".join(title_lines).strip() if title_lines else normalize_space(pt.get("title", "") or "")
+            speaker = _norm_speaker_candidate(pt.get("speaker", "") or "")
+            affiliation = normalize_space(pt.get("affiliation", "") or "")
+            time = normalize_time_range_talks(pt.get("time", "") or "")
+
+            out.append(
+                Talk(
+                    time=time,
+                    title=title,
+                    title_lines=title_lines if title_lines else ([title] if title else []),
+                    speaker=speaker,
+                    speaker_display=build_speaker_display(speaker) if speaker else "",
+                    affiliation=affiliation,
+                    title_overrides=[],
+                    honorific_title="先生",
+                )
+            )
+
+        return out
+
     def _extract_json_text(s: str) -> str:
         s = (s or "").strip()
         s = re.sub(r"^\s*```json\s*", "", s, flags=re.IGNORECASE)
@@ -5177,37 +5237,13 @@ async def ai_refine_json(
     # talks: 件数・順序固定で index ごとにパッチ
     parsed_talks = parsed.get("talks")
 
-    # draft が空なら AI の talks を新規採用
-    if isinstance(parsed_talks, list) and not refined.talks:
-        new_talks = []
+    draft_is_bad = bool(refined.talks) and any(_looks_bad_talk_seed_strong(t) for t in refined.talks)
 
-        for pt in parsed_talks[:4]:
-            if not isinstance(pt, dict):
-                continue
+    # 1) draft が空、または draft が壊れてるなら AI talks を丸ごと採用
+    if isinstance(parsed_talks, list) and (not refined.talks or draft_is_bad):
+        refined.talks = _build_talks_from_parsed(parsed_talks)
 
-            title_lines = normalize_lines_keep_order(_safe_list_str(pt.get("title_lines")))
-            speaker = _norm_speaker_candidate(pt.get("speaker", "") or "")
-            affiliation = normalize_space(pt.get("affiliation", "") or "")
-            time = normalize_time_range_talks(pt.get("time", "") or "")
-
-            title = "\n".join(title_lines).strip()
-
-            new_talks.append(
-                Talk(
-                    time=time,
-                    title=title,
-                    title_lines=title_lines,
-                    speaker=speaker,
-                    speaker_display=build_speaker_display(speaker) if speaker else "",
-                    affiliation=affiliation,
-                    title_overrides=[],
-                    honorific_title="先生",
-                )
-            )
-
-        refined.talks = new_talks
-
-    # draft が既にある案件は index ごとの patch
+    # 2) draft が健全な案件だけ index patch
     elif isinstance(parsed_talks, list) and len(parsed_talks) == len(refined.talks):
         for i, pt in enumerate(parsed_talks):
             if not isinstance(pt, dict):
@@ -5215,8 +5251,10 @@ async def ai_refine_json(
 
             t = refined.talks[i]
 
-            # time は draft がある案件では基本維持
-            t.time = normalize_time_range_talks(getattr(draft.talks[i], "time", "") or "")
+            # time は AI を採用
+            pt_time = normalize_time_range_talks(pt.get("time", "") or "")
+            if pt_time:
+                t.time = pt_time
 
             title_lines = normalize_lines_keep_order(_safe_list_str(pt.get("title_lines")))
             if title_lines:
@@ -5224,12 +5262,13 @@ async def ai_refine_json(
                 t.title = "\n".join(title_lines).strip()
 
             sp = _norm_speaker_candidate(pt.get("speaker", "") or "")
-            if sp and sp in speaker_map:
+            if sp:
                 t.speaker = sp
-                t.affiliation = normalize_space(speaker_map.get(sp, "") or "")
-            else:
-                t.speaker = norm_name(t.speaker)
-                t.affiliation = normalize_space(t.affiliation)
+                t.speaker_display = build_speaker_display(sp) or sp
+
+            aff = normalize_space(pt.get("affiliation", "") or "")
+            if aff:
+                t.affiliation = aff
 
     # confidence
     if "confidence" in parsed:
@@ -6052,7 +6091,51 @@ def normalize_talk_speakers(payload: DesignJSON) -> DesignJSON:
         t.speaker = cleaned.replace(" ", "")
     return payload
 
+def _talk_title_text(t) -> str:
+    return normalize_space("\n".join(t.title_lines or []).strip() or (t.title or ""))
 
+def _same_person(a: str, b: str) -> bool:
+    return normalize_key(a or "").replace("先生", "") == normalize_key(b or "").replace("先生", "")
+
+def _has_any_talk_signal(t) -> bool:
+    return any([
+        normalize_space(getattr(t, "title", "") or ""),
+        any(normalize_space(x) for x in (getattr(t, "title_lines", None) or [])),
+        normalize_space(getattr(t, "speaker", "") or ""),
+        normalize_space(getattr(t, "affiliation", "") or ""),
+        normalize_space(getattr(t, "time", "") or ""),
+    ])
+
+def _is_obviously_bad_talk(t, chair_name: str = "") -> bool:
+    title = _talk_title_text(t)
+    speaker = normalize_space(getattr(t, "speaker", "") or "")
+    affiliation = normalize_space(getattr(t, "affiliation", "") or "")
+
+    if not _has_any_talk_signal(t):
+        return True
+
+    if _is_unwanted_talk(title):
+        return True
+
+    # event title や注意書きだけ
+    if title.startswith("⚫") or "事前参加登録" in title or "担当者へご連絡" in title:
+        return True
+
+    # 座長行そのもの
+    if title.startswith("座長") and not speaker:
+        return True
+
+    # chair本人で、titleも弱いなら落とす
+    if chair_name and speaker and _same_person(speaker, chair_name):
+        # 本当に chair が講演している可能性もあるので title が薄い時だけ
+        if not title or "講演" in title or title == normalize_space(getattr(t, "title", "") or ""):
+            return True
+
+    # speakerもaffiliationもなく、titleだけ短い
+    if not speaker and not affiliation and len(title) < 12:
+        return True
+
+    return False
 
 
 def prune_talks_using_vm_titles(payload: DesignJSON, vm_rows: list[dict]) -> DesignJSON:
@@ -6060,50 +6143,43 @@ def prune_talks_using_vm_titles(payload: DesignJSON, vm_rows: list[dict]) -> Des
     if not talks:
         return payload
 
-    before_keys = [
-        _norm_title_key("\n".join(t.title_lines or []).strip() or (t.title or ""))
-        for t in talks
-    ]
+    chair_name = getattr(payload.chair, "name", "") or ""
 
-    # 1) 不要ワード除去
+    # 1) 明らかに不要なものだけ落とす
     filtered = []
     for t in talks:
-        tt = normalize_space("\n".join(t.title_lines or []).strip() or (t.title or ""))
-        if _is_unwanted_talk(tt):
+        if _is_obviously_bad_talk(t, chair_name=chair_name):
             continue
         filtered.append(t)
 
-    # 2) 重複除去
-    seen = set()
-    dedup = []
+    # 2) title重複を除去（同じtitleなら speaker/affiliation がある方を優先）
+    grouped = {}
     for t in filtered:
-        key = _norm_title_key("\n".join(t.title_lines or []).strip() or (t.title or ""))
-        if not key or key in seen:
+        key = _norm_title_key(_talk_title_text(t))
+        if not key:
+            key = f"__idx__{len(grouped)}"
+        grouped.setdefault(key, []).append(t)
+
+    dedup = []
+    for _, group in grouped.items():
+        if len(group) == 1:
+            dedup.append(group[0])
             continue
-        seen.add(key)
-        dedup.append(t)
 
-    vm_titles = _vm_speaker_titles(vm_rows)
-    if not vm_titles:
-        payload.talks = [t for t in dedup if looks_like_real_talk(t)]
-        return payload
+        def score_talk(x):
+            return (
+                1 if normalize_space(getattr(x, "speaker", "") or "") else 0,
+                1 if normalize_space(getattr(x, "affiliation", "") or "") else 0,
+                1 if normalize_space(getattr(x, "time", "") or "") else 0,
+                len(_talk_title_text(x)),
+            )
 
-    vm_keys = [_norm_title_key(x) for x in vm_titles]
+        group = sorted(group, key=score_talk, reverse=True)
+        dedup.append(group[0])
 
-    kept = []
-    for t in dedup:
-        k = _norm_title_key("\n".join(t.title_lines or []).strip() or (t.title or ""))
-        if any(k == vk or (vk and vk in k) or (k and k in vk) for vk in vm_keys):
-            kept.append(t)
-
-    # ★ここが重要
-    # VM側件数と talks件数が一致しないなら、消しすぎ防止で pruning しない
-    if kept and len(kept) == len(dedup):
-        payload.talks = kept[: min(len(vm_titles), 4)]
-        payload.warnings = sorted(set((payload.warnings or []) + ["talks_pruned_by_vm_hint"]))
-    else:
-        payload.talks = dedup[:4]
-
+    # 3) VMは削除には使わず、並びや件数の参考程度
+    payload.talks = dedup[:4]
+    payload.warnings = sorted(set((payload.warnings or []) + ["talks_pruned_by_vm_hint"]))
     return payload
 
 
@@ -6447,25 +6523,39 @@ def prune_talks_heuristic_only(payload: DesignJSON) -> DesignJSON:
     if not talks:
         return payload
 
-    # 不要語
+    chair_name = getattr(payload.chair, "name", "") or ""
+
     filtered = []
     for t in talks:
-        tt = normalize_space("\n".join(t.title_lines or []).strip() or (t.title or ""))
-        if _is_unwanted_talk(tt):
+        if _is_obviously_bad_talk(t, chair_name=chair_name):
             continue
         filtered.append(t)
 
-    # 重複
-    seen = set()
-    dedup = []
+    grouped = {}
     for t in filtered:
-        key = _norm_title_key(normalize_space("\n".join(t.title_lines or []).strip() or (t.title or "")))
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        dedup.append(t)
+        key = _norm_title_key(_talk_title_text(t))
+        if not key:
+            key = f"__idx__{len(grouped)}"
+        grouped.setdefault(key, []).append(t)
 
-    payload.talks = dedup
+    dedup = []
+    for _, group in grouped.items():
+        if len(group) == 1:
+            dedup.append(group[0])
+            continue
+
+        def score_talk(x):
+            return (
+                1 if normalize_space(getattr(x, "speaker", "") or "") else 0,
+                1 if normalize_space(getattr(x, "affiliation", "") or "") else 0,
+                1 if normalize_space(getattr(x, "time", "") or "") else 0,
+                len(_talk_title_text(x)),
+            )
+
+        group = sorted(group, key=score_talk, reverse=True)
+        dedup.append(group[0])
+
+    payload.talks = dedup[:4]
     payload.warnings = sorted(set((payload.warnings or []) + ["talks_pruned_heuristic_only"]))
     return payload
 
