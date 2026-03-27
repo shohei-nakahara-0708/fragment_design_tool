@@ -654,6 +654,26 @@ const pageNumbers = useMemo(() => {
             </div>
 
             <div style={ui.headerRight}>
+
+
+               <Link to="/diff" style={{ textDecoration: "none" }}>
+                <button
+                  style={ui.buttonPrimary}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.transform = "translateY(-1px)";
+                    e.currentTarget.style.background = "#1d4ed8";
+                    e.currentTarget.style.boxShadow = "0 14px 26px rgba(37,99,235,0.22)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.transform = "none";
+                    e.currentTarget.style.background = "#2563eb";
+                    e.currentTarget.style.boxShadow = "0 10px 22px rgba(37,99,235,0.18)";
+                  }}
+                >
+                  ＋ Diff
+                </button>
+              </Link>
+
               <Link to="/upload" style={{ textDecoration: "none" }}>
                 <button
                   style={ui.buttonPrimary}

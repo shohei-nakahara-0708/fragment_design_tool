@@ -4,6 +4,7 @@ import { Routes, Route, Navigate } from "react-router-dom";
 import JobListPage from "./pages/JobListPage.jsx";
 import UploadPage from "./pages/UploadPage.jsx";
 import JobEditorPage from "./pages/JobEditorPage.jsx";
+import DiffPage from "./pages/DiffPage.jsx";
 
 export default function App() {
   return (
@@ -16,6 +17,8 @@ export default function App() {
 
       {/* 編集 */}
       <Route path="/job/:jobId" element={<JobEditorPage />} />
+
+      <Route path="/diff" element={<DiffPage />} />
 
       {/* それ以外は一覧へ */}
       <Route path="*" element={<Navigate to="/" replace />} />

@@ -12,7 +12,7 @@ from typing import List, Optional, Dict, Any, Literal, Tuple
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body,Form, BackgroundTasks,Request,Response
+from fastapi import APIRouter,FastAPI, UploadFile, File, HTTPException, Body,Form, BackgroundTasks,Request,Response
 from fastapi.responses import FileResponse, JSONResponse,StreamingResponse,RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -54,7 +54,9 @@ import requests
 import io
 import asyncio
 
+import logging
 
+logger = logging.getLogger(__name__)
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -81,6 +83,9 @@ def resolve_data_dir() -> Path:
     return p
 
 DATA_DIR = resolve_data_dir()
+
+VM_DIFF_PREVIEW_DIR = DATA_DIR / "vm_diff_previews"
+VM_DIFF_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
 
 TEMPLATE_PATH = APP_DIR / "template.html"
 _cached_template: Optional[str] = None
@@ -735,6 +740,9 @@ class RenderReq(BaseModel):
     jobId: str
     design: DesignJSON
 
+class VmDiffByEventIdRequest(BaseModel):
+    event_id: str
+
 @dataclass
 class TimeCand:
     text: str
@@ -1039,62 +1047,110 @@ def assign_talk_times_by_proximity(blocks: list[TextBlock], payload: DesignJSON)
     payload.talks = talks
     return payload
 
-def extract_blocks_from_pdf(pdf_path: Path, first_page_only: bool = True) -> List[TextBlock]:
-    doc = fitz.open(str(pdf_path))
-    blocks: List[TextBlock] = []
+def extract_blocks_from_pdf(file_path: str) -> list[dict[str, Any]]:
+    """
+    PDFから line 単位でテキストブロックを抽出する。
+    返却座標は PyMuPDF の page 座標系（top-left基準）をそのまま使う。
 
-    pages = [doc[0]] if (first_page_only and doc.page_count > 0) else [doc[i] for i in range(doc.page_count)]
+    各 block は以下を含む:
+      - text
+      - left
+      - top
+      - width
+      - height
+      - max_font_pt
+      - page              # 1始まり
+      - _page_width
+      - _page_height
+      - _coord_unit="pdf_page"
+    """
+    doc = fitz.open(file_path)
+    out: list[dict[str, Any]] = []
 
-    for page in pages:
-        d = page.get_text("dict")
+    try:
+        for page_index, page in enumerate(doc):
+            page_no = page_index + 1
+            page_width = float(page.rect.width)
+            page_height = float(page.rect.height)
 
-        for b in d.get("blocks", []):
-            if b.get("type") != 0:  # 0=text
-                continue
+            text_dict = page.get_text("dict")
 
-            x0, y0, x1, y1 = b.get("bbox", (0, 0, 0, 0))
+            for block in text_dict.get("blocks", []):
+                # type=0 が text block
+                if block.get("type") != 0:
+                    continue
 
-            # 段落/行を組み立て（PDFのline/spansを尊重）
-            lines = []
-            max_font_pt = 0.0
+                for line in block.get("lines", []):
+                    spans = line.get("spans", [])
+                    if not spans:
+                        continue
 
-            for line in b.get("lines", []):
-                spans = line.get("spans", [])
-                # spanをそのまま連結（余計な空白は後でnormalize）
-                t = "".join(s.get("text", "") for s in spans)
-                if t and t.strip():
-                    lines.append(t.strip())
+                    parts: list[str] = []
+                    max_font_pt = 0.0
 
-                for s in spans:
-                    try:
-                        max_font_pt = max(max_font_pt, float(s.get("size") or 0.0))
-                    except Exception:
-                        pass
+                    x0s = []
+                    y0s = []
+                    x1s = []
+                    y1s = []
 
-            text = normalize_keep_newlines("\n".join(lines))
-            if not text:
-                continue
+                    for span in spans:
+                        text = str(span.get("text", "") or "")
+                        if not text:
+                            continue
 
-            # PDF(pt) -> EMU に変換
-            left_emu   = int(round(x0 * EMU_PER_PT))
-            top_emu    = int(round(y0 * EMU_PER_PT))
-            width_emu  = int(round((x1 - x0) * EMU_PER_PT))
-            height_emu = int(round((y1 - y0) * EMU_PER_PT))
+                        parts.append(text)
 
-            blocks.append(
-                TextBlock(
-                    text=text,
-                    left=left_emu,
-                    top=top_emu,
-                    width=width_emu,
-                    height=height_emu,
-                    max_font_pt=float(max_font_pt or 0.0),
-                )
-            )
+                        size = float(span.get("size", 0) or 0)
+                        if size > max_font_pt:
+                            max_font_pt = size
 
-    doc.close()
-    blocks.sort(key=lambda b: (b.top, b.left))
-    return blocks
+                        bbox = span.get("bbox")
+                        if bbox and len(bbox) == 4:
+                            x0, y0, x1, y1 = bbox
+                            x0s.append(float(x0))
+                            y0s.append(float(y0))
+                            x1s.append(float(x1))
+                            y1s.append(float(y1))
+
+                    text = "".join(parts).strip()
+                    if not text:
+                        continue
+
+                    # span bbox 優先。無ければ line bbox を使う
+                    if x0s and y0s and x1s and y1s:
+                        left = min(x0s)
+                        top = min(y0s)
+                        right = max(x1s)
+                        bottom = max(y1s)
+                    else:
+                        bbox = line.get("bbox")
+                        if not bbox or len(bbox) != 4:
+                            continue
+                        left, top, right, bottom = map(float, bbox)
+
+                    width = max(0.0, right - left)
+                    height = max(0.0, bottom - top)
+
+                    if width <= 0 or height <= 0:
+                        continue
+
+                    out.append({
+                        "text": text,
+                        "left": left,
+                        "top": top,
+                        "width": width,
+                        "height": height,
+                        "max_font_pt": max_font_pt,
+                        "page": page_no,
+                        "_page_width": page_width,
+                        "_page_height": page_height,
+                        "_coord_unit": "pdf_page",
+                    })
+
+        return out
+
+    finally:
+        doc.close()
 
 def merge_event_title_blocks_strict(blocks: list[TextBlock]) -> list[TextBlock]:
     # 上部の大フォントだけ抽出
@@ -3099,47 +3155,55 @@ def iter_shapes(shapes):
                 yield sub
 
 
-def extract_blocks_from_pptx(pptx_path: Path, first_slide_only: bool = True) -> List[TextBlock]:
-    prs = Presentation(str(pptx_path))
-    blocks: List[TextBlock] = []
 
-    slides = [prs.slides[0]] if (first_slide_only and len(prs.slides) > 0) else prs.slides
-    for slide in slides:
-        for sh in iter_shapes(slide.shapes):
-            if not getattr(sh, "has_text_frame", False):
-                continue
-            tf = sh.text_frame
-            if not tf:
-                continue
 
-            paras = []
-            max_font = 0.0
-            for p in tf.paragraphs:
-                t = (p.text or "").strip()
-                if t:
-                    paras.append(t)
+def extract_blocks_from_pptx(file_path: str) -> list[dict]:
+    prs = Presentation(file_path)
+    out: list[dict] = []
+
+    if not prs.slides:
+        return out
+
+    slide = prs.slides[0]
+
+    slide_w = float(prs.slide_width or 1)
+    slide_h = float(prs.slide_height or 1)
+
+    for shape in slide.shapes:
+        if not getattr(shape, "has_text_frame", False):
+            continue
+
+        text = "\n".join(
+            p.text.strip()
+            for p in shape.text_frame.paragraphs
+            if (p.text or "").strip()
+        ).strip()
+
+        if not text:
+            continue
+
+        max_size = 0.0
+        try:
+            for p in shape.text_frame.paragraphs:
                 for run in p.runs:
-                    if run.font and run.font.size:
-                        max_font = max(max_font, run.font.size / EMU_PER_PT)
+                    if run.font.size:
+                        max_size = max(max_size, float(run.font.size.pt))
+        except Exception:
+            pass
 
-            # ★改行保持する
-            text = normalize_keep_newlines("\n".join(paras))
-            if not text:
-                continue
+        out.append({
+            "text": text,
+            "left": float(shape.left),
+            "top": float(shape.top),
+            "width": float(shape.width),
+            "height": float(shape.height),
+            "max_font_pt": round(max_size, 2),
+            "_coord_unit": "emu",
+            "_slide_width": slide_w,
+            "_slide_height": slide_h,
+        })
 
-            blocks.append(
-                TextBlock(
-                    text=text,
-                    left=int(sh.left),
-                    top=int(sh.top),
-                    width=int(sh.width),
-                    height=int(sh.height),
-                    max_font_pt=float(max_font or 0.0),
-                )
-            )
-
-    blocks.sort(key=lambda b: (b.top, b.left))
-    return blocks
+    return out
 
 
 def blocks_to_lines(blocks: List[TextBlock]) -> List[str]:
@@ -7020,6 +7084,9 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
             if not s:
                 return False
 
+            if is_non_talk_heading(s):
+                return False
+
             if any(x in s for x in ["講演", "演者", "座長"]):
                 return False
 
@@ -7519,6 +7586,34 @@ def dump_titles(tag, payload):
         print("speaker=", repr(getattr(t, "speaker", "")))
         print("affiliation=", repr(getattr(t, "affiliation", "")))
         
+def is_non_talk_heading(s: str) -> bool:
+    s = normalize_space(s or "")
+    key = normalize_key(s)
+
+    if not s:
+        return True
+
+    exact_ng = {
+        "program", "p r o g r a m",
+        "一般講演", "特別講演", "講演", "座長", "演者",
+        "主催", "共催", "日時", "形式", "開催",
+    }
+    if s.lower() in exact_ng or key in {normalize_key(x) for x in exact_ng}:
+        return True
+
+    # PROGRAM のような英字ばらし
+    if re.fullmatch(r"(?:[A-Za-z]\s*){4,}", s):
+        return True
+
+    # 開催形式系
+    if "live配信" in s.lower() or "web" in s.lower() and "開催" in s:
+        return True
+
+    # 注意書き系
+    if "ご視聴" in s or "事前参加予約" in s or "旅費の負担" in s:
+        return True
+
+    return False
 
 async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_blocks_path: Optional[Path] = None) -> DesignJSON:
     """PPTX優先。VMは精度を上げるヒントとして blocks からの拾い直しにのみ使用し、欠損時のみVMで補完する。"""
@@ -8900,6 +8995,443 @@ async def export_pdf(req: ExportPdfReq, background_tasks: BackgroundTasks):
         filename=f"selected_{len(req.jobIds)}items.pdf",
     )
 
+
+def cleanup_old_vm_diff_previews(ttl_sec: int = 60 * 100) -> None:
+    """
+    念のための掃除。
+    10分以上前の preview を削除。
+    """
+    now = time.time()
+    for f in VM_DIFF_PREVIEW_DIR.glob("*"):
+        try:
+            if f.is_file() and (now - f.stat().st_mtime > ttl_sec):
+                f.unlink()
+        except Exception:
+            pass
+
+
+def delete_file_quietly(path: Path | str) -> None:
+    try:
+        p = Path(path)
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+def blocks_to_dicts(blocks: list[Any]) -> list[dict]:
+    out: list[dict] = []
+
+    for b in blocks or []:
+        if isinstance(b, dict):
+            out.append({
+                "text": b.get("text", "") or "",
+                "left": b.get("left", 0) or 0,
+                "top": b.get("top", 0) or 0,
+                "width": b.get("width", 0) or 0,
+                "height": b.get("height", 0) or 0,
+                "max_font_pt": b.get("max_font_pt", 0) or 0,
+                "page": b.get("page", 1) or 1,
+                "page_width": b.get("_page_width", 0) or 0,
+                "page_height": b.get("_page_height", 0) or 0,
+                "coord_unit": b.get("_coord_unit", "") or "",
+            })
+        else:
+            out.append({
+                "text": getattr(b, "text", "") or "",
+                "left": getattr(b, "left", 0) or 0,
+                "top": getattr(b, "top", 0) or 0,
+                "width": getattr(b, "width", 0) or 0,
+                "height": getattr(b, "height", 0) or 0,
+                "max_font_pt": getattr(b, "max_font_pt", 0) or 0,
+                "page": getattr(b, "page", 1) or 1,
+                "page_width": getattr(b, "_page_width", 0) or 0,
+                "page_height": getattr(b, "_page_height", 0) or 0,
+                "coord_unit": getattr(b, "_coord_unit", "") or "",
+            })
+
+    return out
+
+
+# =========================
+# VM取得
+# =========================
+
+def get_endai_enja_vm_rows_by_event_id(event_id: str) -> tuple[list[str], list[dict]]:
+    event_id = normalize_space(event_id or "")
+    if not event_id:
+        return [], []
+
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    credentials = get_gsa_credentials(scope)
+    gc = gspread.authorize(credentials)
+
+    spreadsheet_key = "1hiV0Ve2cnYyrPkBuZcZIcLWeAnJ-ucNiB0P4owZpXug"
+    workbook = gc.open_by_key(spreadsheet_key)
+    ws = workbook.worksheet("演題演者（VM）")
+
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        return [], []
+
+    # header row = 1
+    headers = make_unique(values[0])
+
+    id_col_candidates = ["講演会ID", "システムID", "event_id", "Event ID"]
+    id_col = next((c for c in id_col_candidates if c in headers), None)
+    if not id_col:
+        return headers, []
+
+    rows: list[dict] = []
+    for raw in values[1:]:
+        row = {
+            headers[i]: raw[i] if i < len(raw) else ""
+            for i in range(len(headers))
+        }
+        rid = normalize_space(row.get(id_col, ""))
+        if rid == event_id:
+            rows.append(row)
+
+    return headers, rows
+
+
+def shape_vm_rows_for_diff(rows: list[dict], headers_in_sheet_order: list[str]) -> list[dict]:
+    out: list[dict] = []
+
+    for r in rows or []:
+        r = r or {}
+        shaped: dict[str, str] = {}
+
+        for header in headers_in_sheet_order:
+            shaped[header] = normalize_space(r.get(header, ""))
+
+        out.append(shaped)
+
+    return out
+
+
+
+# =========================
+# blocks抽出 wrapper
+# ここは既存関数名に合わせて差し替え
+# =========================
+
+def extract_text_blocks_for_vm_diff(file_path: str) -> list[Any]:
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext == ".pdf":
+        if not pdf_has_extractable_text(file_path):
+            raise ValueError(
+                "このPDFはテキスト抽出できません。"
+                "スキャンPDFや画像PDFの可能性があります。"
+                "テキスト抽出可能なPDFをご使用ください。"
+            )
+
+        return extract_blocks_from_pdf(file_path)
+
+    raise ValueError(
+        "このファイル形式は対応していません。"
+        "テキスト抽出可能な PDF を使用してください。"
+    )
+
+PDF_PREVIEW_ZOOM = 2.0
+
+def render_first_pdf_page_to_image(file_path: str) -> tuple[str, int, int]:
+    doc = fitz.open(file_path)
+    try:
+        if len(doc) == 0:
+            raise ValueError("pdf has no pages")
+
+        page = doc.load_page(0)
+        mat = fitz.Matrix(PDF_PREVIEW_ZOOM, PDF_PREVIEW_ZOOM)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+
+        out_path = DATA_DIR / f"pdf_preview_{uuid.uuid4().hex}.jpg"
+        pix.save(str(out_path))
+
+        return str(out_path), pix.width, pix.height
+    finally:
+        doc.close()
+
+
+def render_first_slide_to_image(file_path: str) -> tuple[str, int, int]:
+    """
+    PPTX -> PDF (LibreOffice) -> first page JPG
+    """
+    src = Path(file_path)
+    work_dir = DATA_DIR / f"pptx_preview_{uuid.uuid4().hex}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    pdf_path = work_dir / (src.stem + ".pdf")
+
+    try:
+        cmd = [
+            "soffice",
+            "--headless",
+            "--convert-to", "pdf",
+            "--outdir", str(work_dir),
+            str(src),
+        ]
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"LibreOffice convert failed: {proc.stderr or proc.stdout}")
+
+        if not pdf_path.exists():
+            raise RuntimeError("converted pdf not found")
+
+        preview_img_path, width, height = render_first_pdf_page_to_image(str(pdf_path))
+        return preview_img_path, width, height
+
+    finally:
+        # pdf は後で不要なので掃除
+        try:
+            if pdf_path.exists():
+                pdf_path.unlink()
+        except Exception:
+            pass
+        try:
+            if work_dir.exists():
+                work_dir.rmdir()
+        except Exception:
+            pass
+
+def normalize_blocks_to_preview_pixels(
+    blocks: list[Any],
+    preview_width: int,
+    preview_height: int,
+    coord_unit: str | None = None,
+    slide_width: float | None = None,
+    slide_height: float | None = None,
+) -> list[dict]:
+    out = []
+
+    for b in blocks or []:
+        if isinstance(b, dict):
+            getv = b.get
+        else:
+            getv = lambda k, d=None: getattr(b, k, d)
+
+        unit = coord_unit or getv("_coord_unit", "px")
+
+        left_raw = float(getv("left", 0) or 0)
+        top_raw = float(getv("top", 0) or 0)
+        width_raw = float(getv("width", 0) or 0)
+        height_raw = float(getv("height", 0) or 0)
+
+        if unit == "emu":
+            sw = float(slide_width or getv("_slide_width", 1) or 1)
+            sh = float(slide_height or getv("_slide_height", 1) or 1)
+
+            scale_x = preview_width / sw
+            scale_y = preview_height / sh
+
+            left = left_raw * scale_x
+            top = top_raw * scale_y
+            width = width_raw * scale_x
+            height = height_raw * scale_y
+
+        elif unit == "pdf_page":
+            pw = float(getv("_page_width", 1) or 1)
+            ph = float(getv("_page_height", 1) or 1)
+
+            scale_x = preview_width / pw
+            scale_y = preview_height / ph
+
+            left = left_raw * scale_x
+            top = top_raw * scale_y
+            width = width_raw * scale_x
+            height = height_raw * scale_y
+
+        else:
+            left = left_raw
+            top = top_raw
+            width = width_raw
+            height = height_raw
+
+        out.append({
+            "text": getv("text", "") or "",
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height,
+            "max_font_pt": getv("max_font_pt", 0) or 0,
+        })
+
+    return out
+# =========================
+# preview画像生成 wrapper
+# ここも既存関数名に合わせて差し替え
+# 戻り値: (preview_image_path, width, height)
+# =========================
+
+def pdf_has_extractable_text(file_path: str) -> bool:
+    try:
+        doc = fitz.open(file_path)
+        try:
+            for page in doc:
+                text = page.get_text("text")
+                if text and text.strip():
+                    return True
+            return False
+        finally:
+            doc.close()
+    except Exception:
+        return False
+
+
+
+def extract_text_blocks_for_vm_diff(file_path: str) -> list[Any]:
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext == ".pdf":
+        if not pdf_has_extractable_text(file_path):
+            raise ValueError(
+                "このPDFはテキスト抽出できません。"
+                "スキャンPDFや画像PDFの可能性があります。"
+                "テキスト抽出可能なPDFをご使用ください。"
+            )
+
+        return extract_blocks_from_pdf(file_path)
+
+    raise ValueError(
+        "このファイル形式は対応していません。"
+        "テキスト抽出可能な PDF を使用してください。"
+    )
+
+
+def blocks_to_dicts(blocks: list[Any]) -> list[dict]:
+    out: list[dict] = []
+
+    for b in blocks or []:
+        if isinstance(b, dict):
+            out.append({
+                "text": b.get("text", "") or "",
+                "left": b.get("left", 0) or 0,
+                "top": b.get("top", 0) or 0,
+                "width": b.get("width", 0) or 0,
+                "height": b.get("height", 0) or 0,
+                "max_font_pt": b.get("max_font_pt", 0) or 0,
+                "page": b.get("page", 1) or 1,
+                "page_width": b.get("_page_width", 0) or 0,
+                "page_height": b.get("_page_height", 0) or 0,
+                "coord_unit": b.get("_coord_unit", "") or "",
+            })
+        else:
+            out.append({
+                "text": getattr(b, "text", "") or "",
+                "left": getattr(b, "left", 0) or 0,
+                "top": getattr(b, "top", 0) or 0,
+                "width": getattr(b, "width", 0) or 0,
+                "height": getattr(b, "height", 0) or 0,
+                "max_font_pt": getattr(b, "max_font_pt", 0) or 0,
+                "page": getattr(b, "page", 1) or 1,
+                "page_width": getattr(b, "_page_width", 0) or 0,
+                "page_height": getattr(b, "_page_height", 0) or 0,
+                "coord_unit": getattr(b, "_coord_unit", "") or "",
+            })
+
+    return out
+
+# =========================
+# endpoint: event_id -> VM rows
+# =========================
+@app.post("/vm-diff/by-event-id")
+async def vm_diff_by_event_id(event_id: str = Form(...)):
+    event_id = normalize_space(event_id or "")
+    if not event_id:
+        raise HTTPException(status_code=400, detail="講演会IDを入力してください。")
+
+    try:
+        headers, vm_rows = get_endai_enja_vm_rows_by_event_id(event_id)
+
+        return {
+            "ok": True,
+            "event_id": event_id,
+            "headers": headers,
+            "vm_rows": shape_vm_rows_for_diff(vm_rows, headers),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"VM取得に失敗しました: {e}")
+
+
+@app.post("/vm-diff/extract-text-blocks")
+async def extract_text_blocks_endpoint(
+    file: UploadFile = File(...),
+    eventId: str = Form(""),
+):
+    suffix = os.path.splitext(file.filename or "")[1].lower()
+    if suffix != ".pdf":
+        raise HTTPException(
+            status_code=400,
+            detail="このファイル形式は対応していません。テキスト抽出可能な PDF を使用してください。"
+        )
+
+    tmp_path = ""
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=str(DATA_DIR)) as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        event_id = normalize_space(eventId or "")
+
+        headers: list[str] = []
+        vm_rows: list[dict] = []
+        if event_id:
+            try:
+                headers, vm_rows = get_endai_enja_vm_rows_by_event_id(event_id)
+            except Exception:
+                headers, vm_rows = [], []
+
+        blocks = extract_text_blocks_for_vm_diff(tmp_path)
+
+        return {
+            "ok": True,
+            "event_id": event_id,
+            "headers": headers,
+            "vm_rows": shape_vm_rows_for_diff(vm_rows, headers),
+            "blocks": blocks_to_dicts(blocks),
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("extract_text_blocks_endpoint failed")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"failed to extract text blocks: {type(e).__name__}: {e}")
+    finally:
+        if tmp_path:
+            delete_file_quietly(tmp_path)
+
+# =========================
+# endpoint: preview 取得後に削除
+# =========================
+
+@app.get("/vm-diff/preview/{filename}")
+def get_vm_diff_preview(filename: str, background_tasks: BackgroundTasks):
+    path = VM_DIFF_PREVIEW_DIR / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="preview not found")
+
+    # 返却後に削除
+    background_tasks.add_task(delete_file_quietly, path)
+
+    return FileResponse(path)
+
+
 class JobDeleteReq(BaseModel):
     delete_files: bool = True
     force: bool = False  # lockedでも消したい場合だけTrue
@@ -8914,7 +9446,6 @@ def delete_storage_file(remote_path: str):
     res = requests.delete(url, headers=headers, timeout=30)
     if res.status_code not in (200, 204, 404):
         raise RuntimeError(f"storage delete failed: {res.status_code} {res.text}")
-
 
 @app.delete("/job/{job_id}")
 async def delete_job(job_id: str, req: JobDeleteReq = JobDeleteReq()):
