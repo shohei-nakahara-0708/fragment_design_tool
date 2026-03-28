@@ -581,13 +581,36 @@ function compareValueToBlocks(value, blocks, fieldLabel) {
     return { status: "missing", hits: [] };
   }
 
+  const rawKey = normalizeForCompare(raw);
+
   const hits = blocks
     .map((b) => {
       const score = scoreBlockMatch(value, b.text || "", fieldLabel);
+
+      const blockText = String(b.text || "");
+      const blockNorm = normalizeForCompare(blockText);
+
+      let matchStart = -1;
+      let matchLength = 0;
+      let matchedText = blockText;
+
+      if (rawKey && blockNorm) {
+        const idx = blockNorm.indexOf(rawKey);
+        if (idx !== -1) {
+          matchStart = idx;
+          matchLength = rawKey.length;
+          matchedText = raw;
+        }
+      }
+
       return {
         ...b,
         score,
         matchType: score >= 100 ? "exact" : score >= 40 ? "partial" : "weak",
+        matchedText,
+        matchStart,
+        matchLength,
+        keyword: raw,
       };
     })
     .filter((b) => b.score > 0)
@@ -853,8 +876,8 @@ function DiffText({ parts, side }) {
 
 function SideBySideComparePanel({ selectedField, manualCompareText, setManualCompareText }) {
   const sheetValue = selectedField?.value || "";
-  const compareTargetText =
-    manualCompareText.trim() || selectedField?.hits?.[0]?.text || "";
+const compareTargetText =
+  manualCompareText.trim() || selectedField?.hits?.[0]?.matchedText || selectedField?.hits?.[0]?.text || "";
 
   const diff = useMemo(
     () => diffChars(sheetValue, compareTargetText),
@@ -1479,7 +1502,15 @@ function SpreadsheetLikeTable({
                   return (
                     <td
                       key={`${row.id}-${header}`}
-                      onClick={() => field && onSelect(field, cellRef)}
+                      onClick={() => {
+                        if (!field) return;
+
+                        if (selectedKey === field.key) {
+                          onSelect(null, null); // ← 解除
+                        } else {
+                          onSelect(field, cellRef); // ← 通常選択
+                        }
+                      }}
                       style={{
                         ...ui.sheetCell,
                         ...(isAux ? ui.auxCell : null),
@@ -1528,10 +1559,12 @@ function SpreadsheetLikeTable({
 }
 
 function PdfPreview({ file, selectedField, activePreviewHitKey }) {
-  const hits = useMemo(
-    () => [...(selectedField?.hits || [])].sort((a, b) => (b.score || 0) - (a.score || 0)),
-    [selectedField]
-  );
+ const keyword = selectedField?.value || "";
+
+const hits = useMemo(
+  () => [...(selectedField?.hits || [])].sort((a, b) => (b.score || 0) - (a.score || 0)),
+  [selectedField]
+);
 
   const [numPages, setNumPages] = useState(0);
   const [containerRef, viewWidth] = useElementWidth();
@@ -1563,32 +1596,44 @@ function PdfPreview({ file, selectedField, activePreviewHitKey }) {
     }));
   }
 
-  function getScaledRect(hit, pageNumber) {
-    const vp = pageViewports[pageNumber];
-    if (!vp?.width) return null;
+function getScaledRect(hit, pageNumber) {
+  const vp = pageViewports[pageNumber];
+  if (!vp?.width) return null;
 
-    const xScale = renderedWidth / vp.width;
-    const yScale = xScale;
+  const xScale = renderedWidth / vp.width;
+  const yScale = xScale;
 
-    const rawLeft = Number(hit.left || 0);
-    const rawTop = Number(hit.top || 0);
-    const rawWidth = Number(hit.width || 0);
-    const rawHeight = Number(hit.height || 0);
+  const rawLeft = Number(hit.left || 0);
+  const rawTop = Number(hit.top || 0);
+  const rawWidth = Number(hit.width || 0);
+  const rawHeight = Number(hit.height || 0);
 
-    let left = rawLeft * xScale;
-    let top = rawTop * yScale;
-    let width = Math.max(8, rawWidth * xScale);
-    let height = Math.max(8, rawHeight * yScale);
+  let left = rawLeft * xScale;
+  let top = rawTop * yScale;
+  let width = Math.max(8, rawWidth * xScale);
+  let height = Math.max(8, rawHeight * yScale);
 
-    const inset = 1;
-    left += inset;
-    top += inset;
-    width = Math.max(6, width - inset * 2);
-    height = Math.max(6, height - inset * 2);
+  const fullText = String(hit.text || "");
+  const matchStart = Number(hit.matchStart ?? -1);
+  const matchLength = Number(hit.matchLength ?? 0);
 
-    return { left, top, width, height };
+  if (fullText && matchStart >= 0 && matchLength > 0) {
+    const totalLen = Array.from(fullText).length || 1;
+    const startRatio = matchStart / totalLen;
+    const widthRatio = matchLength / totalLen;
+
+    left += width * startRatio;
+    width = Math.max(8, width * widthRatio);
   }
 
+  const inset = 1;
+  left += inset;
+  top += inset;
+  width = Math.max(6, width - inset * 2);
+  height = Math.max(6, height - inset * 2);
+
+  return { left, top, width, height };
+}
   if (!file) {
     return <div style={ui.textPane}>プレビューがありません。</div>;
   }
@@ -1701,7 +1746,7 @@ function PdfPreview({ file, selectedField, activePreviewHitKey }) {
       </Document>
 
       <div style={ui.previewHint}>
-        PDF上のテキストは選択可能です。ハイライトは実 viewport を基準に変換しています。
+        PDF上のテキストは選択可能です。
       </div>
     </div>
   );
@@ -1970,6 +2015,14 @@ export default function VmDiffPage() {
   }, [allFields]);
 
   function handleSelectField(field, cellRef) {
+
+     if (!field) {
+    setSelectedFieldKey("");
+    setActivePreviewHitKey("");
+    return;
+  }
+
+    
     setSelectedFieldKey(field.key);
     setSelectedCellRef(cellRef || "");
 
@@ -2036,7 +2089,7 @@ export default function VmDiffPage() {
                 対応形式はテキスト抽出可能な PDF のみです。スキャンPDF・画像PDFは対応外です。
               </div>
               <button type="button" style={ui.btn("primary")} onClick={analyzeUploadedFlyerTextOnly} disabled={loading}>
-                {loadingAnalyze ? "読込中..." : "案内状を読み込む"}
+                {loadingAnalyze ? "読込中..." : "シート、案内状を読み込む"}
               </button>
             </div>
 
