@@ -590,15 +590,26 @@ function compareValueToBlocks(value, blocks, fieldLabel) {
       const blockText = String(b.text || "");
       const blockNorm = normalizeForCompare(blockText);
 
-      let matchStart = -1;
-      let matchLength = 0;
       let matchedText = blockText;
 
-      if (rawKey && blockNorm) {
-        const idx = blockNorm.indexOf(rawKey);
-        if (idx !== -1) {
-          matchStart = idx;
-          matchLength = rawKey.length;
+      let rawMatchStart = -1;
+      let rawMatchLength = 0;
+
+      let normMatchStart = -1;
+      let normMatchLength = 0;
+
+      // まずは生文字列で探す
+      const rawIdx = blockText.indexOf(raw);
+      if (rawIdx !== -1) {
+        rawMatchStart = Array.from(blockText.slice(0, rawIdx)).length;
+        rawMatchLength = Array.from(raw).length;
+        matchedText = raw;
+      } else {
+        // ダメなら正規化後文字列で探す
+        const normIdx = blockNorm.indexOf(rawKey);
+        if (normIdx !== -1) {
+          normMatchStart = normIdx;
+          normMatchLength = Array.from(rawKey).length;
           matchedText = raw;
         }
       }
@@ -607,10 +618,14 @@ function compareValueToBlocks(value, blocks, fieldLabel) {
         ...b,
         score,
         matchType: score >= 100 ? "exact" : score >= 40 ? "partial" : "weak",
-        matchedText,
-        matchStart,
-        matchLength,
         keyword: raw,
+        matchedText,
+        rawTextLength: Array.from(blockText).length,
+        normalizedTextLength: Array.from(blockNorm).length,
+        rawMatchStart,
+        rawMatchLength,
+        normMatchStart,
+        normMatchLength,
       };
     })
     .filter((b) => b.score > 0)
@@ -1578,6 +1593,8 @@ const hits = useMemo(
     setNumPages(pdf.numPages || 0);
     setPdfError("");
     setPageViewports({});
+
+    
   }
 
   function onLoadError(error) {
@@ -1613,20 +1630,29 @@ function getScaledRect(hit, pageNumber) {
   let width = Math.max(8, rawWidth * xScale);
   let height = Math.max(8, rawHeight * yScale);
 
-  const fullText = String(hit.text || "");
-  const matchStart = Number(hit.matchStart ?? -1);
-  const matchLength = Number(hit.matchLength ?? 0);
+  // 生文字列で位置が取れていればそれを最優先
+  if (Number(hit.rawMatchStart) >= 0 && Number(hit.rawMatchLength) > 0 && Number(hit.rawTextLength) > 0) {
+    const startRatio = Number(hit.rawMatchStart) / Number(hit.rawTextLength);
+    const widthRatio = Number(hit.rawMatchLength) / Number(hit.rawTextLength);
 
-  if (fullText && matchStart >= 0 && matchLength > 0) {
-    const totalLen = Array.from(fullText).length || 1;
-    const startRatio = matchStart / totalLen;
-    const widthRatio = matchLength / totalLen;
+    left += width * startRatio;
+    width = Math.max(8, width * widthRatio);
+  }
+  // 生文字列で無理だった時だけ normalized 比率で寄せる
+  else if (
+    Number(hit.normMatchStart) >= 0 &&
+    Number(hit.normMatchLength) > 0 &&
+    Number(hit.normalizedTextLength) > 0
+  ) {
+    const startRatio = Number(hit.normMatchStart) / Number(hit.normalizedTextLength);
+    const widthRatio = Number(hit.normMatchLength) / Number(hit.normalizedTextLength);
 
     left += width * startRatio;
     width = Math.max(8, width * widthRatio);
   }
 
-  const inset = 1;
+  // inset はズレを強めるのでかなり小さくするか、いったん外す
+  const inset = 0;
   left += inset;
   top += inset;
   width = Math.max(6, width - inset * 2);
@@ -1634,6 +1660,7 @@ function getScaledRect(hit, pageNumber) {
 
   return { left, top, width, height };
 }
+  
   if (!file) {
     return <div style={ui.textPane}>プレビューがありません。</div>;
   }
@@ -1799,6 +1826,36 @@ export default function VmDiffPage() {
   const [columnSort, setColumnSort] = useState({ header: "", direction: "" });
 
   const loading = loadingVm || loadingAnalyze;
+
+  function resetForNewFlyer() {
+  setVmRows([]);
+  setVmHeaders([]);
+  setBlocks([]);
+
+  setSelectedFieldKey("");
+  setSelectedCellRef("");
+  setActivePreviewHitKey("");
+
+  setManualCompareText("");
+
+  setHeaderMenu(null);
+  setColumnFilters({});
+  setColumnSort({ header: "", direction: "" });
+
+  setSheetQuery("");
+  setStatusFilter("all");
+  setShowOnlyRowsWithDiff(false);
+
+  setVisibleHeaders([]);
+  setPinnedHeaders(DEFAULT_PINNED_HEADERS);
+
+  setError("");
+}
+
+function handleFlyerFileChange(file) {
+  resetForNewFlyer();
+  setUploadFile(file || null);
+}
 
   function isSupportedFlyerFile(file) {
     if (!file) return false;
@@ -2083,13 +2140,13 @@ export default function VmDiffPage() {
               <input
                 type="file"
                 accept=".pdf,application/pdf"
-                onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
+                onChange={(e) => handleFlyerFileChange(e.target.files?.[0] || null)}
               />
               <div style={ui.muted}>
                 対応形式はテキスト抽出可能な PDF のみです。スキャンPDF・画像PDFは対応外です。
               </div>
               <button type="button" style={ui.btn("primary")} onClick={analyzeUploadedFlyerTextOnly} disabled={loading}>
-                {loadingAnalyze ? "読込中..." : "シート、案内状を読み込む"}
+                {loadingAnalyze ? "読込中..." : "シートを読み込む"}
               </button>
             </div>
 

@@ -1047,22 +1047,12 @@ def assign_talk_times_by_proximity(blocks: list[TextBlock], payload: DesignJSON)
     payload.talks = talks
     return payload
 
+
+
 def extract_blocks_from_pdf(file_path: str) -> list[dict[str, Any]]:
     """
     PDFから line 単位でテキストブロックを抽出する。
-    返却座標は PyMuPDF の page 座標系（top-left基準）をそのまま使う。
-
-    各 block は以下を含む:
-      - text
-      - left
-      - top
-      - width
-      - height
-      - max_font_pt
-      - page              # 1始まり
-      - _page_width
-      - _page_height
-      - _coord_unit="pdf_page"
+    さらに各 line の spans も返す。
     """
     doc = fitz.open(file_path)
     out: list[dict[str, Any]] = []
@@ -1076,15 +1066,15 @@ def extract_blocks_from_pdf(file_path: str) -> list[dict[str, Any]]:
             text_dict = page.get_text("dict")
 
             for block in text_dict.get("blocks", []):
-                # type=0 が text block
                 if block.get("type") != 0:
                     continue
 
                 for line in block.get("lines", []):
-                    spans = line.get("spans", [])
-                    if not spans:
+                    raw_spans = line.get("spans", [])
+                    if not raw_spans:
                         continue
 
+                    line_spans: list[dict[str, Any]] = []
                     parts: list[str] = []
                     max_font_pt = 0.0
 
@@ -1093,40 +1083,43 @@ def extract_blocks_from_pdf(file_path: str) -> list[dict[str, Any]]:
                     x1s = []
                     y1s = []
 
-                    for span in spans:
+                    for span in raw_spans:
                         text = str(span.get("text", "") or "")
                         if not text:
                             continue
 
-                        parts.append(text)
-
-                        size = float(span.get("size", 0) or 0)
-                        if size > max_font_pt:
-                            max_font_pt = size
-
                         bbox = span.get("bbox")
-                        if bbox and len(bbox) == 4:
-                            x0, y0, x1, y1 = bbox
-                            x0s.append(float(x0))
-                            y0s.append(float(y0))
-                            x1s.append(float(x1))
-                            y1s.append(float(y1))
-
-                    text = "".join(parts).strip()
-                    if not text:
-                        continue
-
-                    # span bbox 優先。無ければ line bbox を使う
-                    if x0s and y0s and x1s and y1s:
-                        left = min(x0s)
-                        top = min(y0s)
-                        right = max(x1s)
-                        bottom = max(y1s)
-                    else:
-                        bbox = line.get("bbox")
                         if not bbox or len(bbox) != 4:
                             continue
-                        left, top, right, bottom = map(float, bbox)
+
+                        x0, y0, x1, y1 = map(float, bbox)
+                        size = float(span.get("size", 0) or 0)
+
+                        parts.append(text)
+                        max_font_pt = max(max_font_pt, size)
+
+                        x0s.append(x0)
+                        y0s.append(y0)
+                        x1s.append(x1)
+                        y1s.append(y1)
+
+                        line_spans.append({
+                            "text": text,
+                            "left": x0,
+                            "top": y0,
+                            "width": max(0.0, x1 - x0),
+                            "height": max(0.0, y1 - y0),
+                            "font_size": size,
+                        })
+
+                    line_text = "".join(parts).strip()
+                    if not line_text or not line_spans:
+                        continue
+
+                    left = min(x0s)
+                    top = min(y0s)
+                    right = max(x1s)
+                    bottom = max(y1s)
 
                     width = max(0.0, right - left)
                     height = max(0.0, bottom - top)
@@ -1135,7 +1128,7 @@ def extract_blocks_from_pdf(file_path: str) -> list[dict[str, Any]]:
                         continue
 
                     out.append({
-                        "text": text,
+                        "text": line_text,
                         "left": left,
                         "top": top,
                         "width": width,
@@ -1145,12 +1138,49 @@ def extract_blocks_from_pdf(file_path: str) -> list[dict[str, Any]]:
                         "_page_width": page_width,
                         "_page_height": page_height,
                         "_coord_unit": "pdf_page",
+                        "spans": line_spans,
                     })
 
         return out
 
     finally:
         doc.close()
+
+
+def blocks_to_dicts(blocks: list[Any]) -> list[dict]:
+    out: list[dict] = []
+
+    for b in blocks or []:
+        if isinstance(b, dict):
+            out.append({
+                "text": b.get("text", "") or "",
+                "left": b.get("left", 0) or 0,
+                "top": b.get("top", 0) or 0,
+                "width": b.get("width", 0) or 0,
+                "height": b.get("height", 0) or 0,
+                "max_font_pt": b.get("max_font_pt", 0) or 0,
+                "page": b.get("page", 1) or 1,
+                "page_width": b.get("_page_width", 0) or 0,
+                "page_height": b.get("_page_height", 0) or 0,
+                "coord_unit": b.get("_coord_unit", "") or "",
+                "spans": b.get("spans", []) or [],
+            })
+        else:
+            out.append({
+                "text": getattr(b, "text", "") or "",
+                "left": getattr(b, "left", 0) or 0,
+                "top": getattr(b, "top", 0) or 0,
+                "width": getattr(b, "width", 0) or 0,
+                "height": getattr(b, "height", 0) or 0,
+                "max_font_pt": getattr(b, "max_font_pt", 0) or 0,
+                "page": getattr(b, "page", 1) or 1,
+                "page_width": getattr(b, "_page_width", 0) or 0,
+                "page_height": getattr(b, "_page_height", 0) or 0,
+                "coord_unit": getattr(b, "_coord_unit", "") or "",
+                "spans": getattr(b, "spans", []) or [],
+            })
+
+    return out
 
 def merge_event_title_blocks_strict(blocks: list[TextBlock]) -> list[TextBlock]:
     # 上部の大フォントだけ抽出
@@ -9019,38 +9049,7 @@ def delete_file_quietly(path: Path | str) -> None:
         pass
 
 
-def blocks_to_dicts(blocks: list[Any]) -> list[dict]:
-    out: list[dict] = []
 
-    for b in blocks or []:
-        if isinstance(b, dict):
-            out.append({
-                "text": b.get("text", "") or "",
-                "left": b.get("left", 0) or 0,
-                "top": b.get("top", 0) or 0,
-                "width": b.get("width", 0) or 0,
-                "height": b.get("height", 0) or 0,
-                "max_font_pt": b.get("max_font_pt", 0) or 0,
-                "page": b.get("page", 1) or 1,
-                "page_width": b.get("_page_width", 0) or 0,
-                "page_height": b.get("_page_height", 0) or 0,
-                "coord_unit": b.get("_coord_unit", "") or "",
-            })
-        else:
-            out.append({
-                "text": getattr(b, "text", "") or "",
-                "left": getattr(b, "left", 0) or 0,
-                "top": getattr(b, "top", 0) or 0,
-                "width": getattr(b, "width", 0) or 0,
-                "height": getattr(b, "height", 0) or 0,
-                "max_font_pt": getattr(b, "max_font_pt", 0) or 0,
-                "page": getattr(b, "page", 1) or 1,
-                "page_width": getattr(b, "_page_width", 0) or 0,
-                "page_height": getattr(b, "_page_height", 0) or 0,
-                "coord_unit": getattr(b, "_coord_unit", "") or "",
-            })
-
-    return out
 
 
 # =========================
@@ -9309,38 +9308,7 @@ def extract_text_blocks_for_vm_diff(file_path: str) -> list[Any]:
     )
 
 
-def blocks_to_dicts(blocks: list[Any]) -> list[dict]:
-    out: list[dict] = []
 
-    for b in blocks or []:
-        if isinstance(b, dict):
-            out.append({
-                "text": b.get("text", "") or "",
-                "left": b.get("left", 0) or 0,
-                "top": b.get("top", 0) or 0,
-                "width": b.get("width", 0) or 0,
-                "height": b.get("height", 0) or 0,
-                "max_font_pt": b.get("max_font_pt", 0) or 0,
-                "page": b.get("page", 1) or 1,
-                "page_width": b.get("_page_width", 0) or 0,
-                "page_height": b.get("_page_height", 0) or 0,
-                "coord_unit": b.get("_coord_unit", "") or "",
-            })
-        else:
-            out.append({
-                "text": getattr(b, "text", "") or "",
-                "left": getattr(b, "left", 0) or 0,
-                "top": getattr(b, "top", 0) or 0,
-                "width": getattr(b, "width", 0) or 0,
-                "height": getattr(b, "height", 0) or 0,
-                "max_font_pt": getattr(b, "max_font_pt", 0) or 0,
-                "page": getattr(b, "page", 1) or 1,
-                "page_width": getattr(b, "_page_width", 0) or 0,
-                "page_height": getattr(b, "_page_height", 0) or 0,
-                "coord_unit": getattr(b, "_coord_unit", "") or "",
-            })
-
-    return out
 
 # =========================
 # endpoint: event_id -> VM rows
