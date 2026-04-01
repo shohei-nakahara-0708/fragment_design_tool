@@ -2393,12 +2393,7 @@ function handleSelectField(field, cellRef) {
           </div>
         ) : (
             
-            filteredRows.length === 0 ? (
-              <div style={ui.card}>
-                <div style={ui.muted}>条件に一致する行がありません。<br />演題演者（VM）シートに該当するデータがあるか確認してください。</div>
-              </div>
-            ) : ( 
-          <SpreadsheetLikeTable
+         <SpreadsheetLikeTable
             rows={filteredRows}
             headers={headers.filter((h) => visibleHeaders.includes(h))}
             selectedKey={selectedField?.key || ""}
@@ -2409,8 +2404,7 @@ function handleSelectField(field, cellRef) {
             onOpenHeaderMenu={setHeaderMenu}
             columnFilters={columnFilters}
             columnSort={columnSort}
-          />
-        ))}
+          />)}
 
         <CollapseSection
           title="文字比較"
