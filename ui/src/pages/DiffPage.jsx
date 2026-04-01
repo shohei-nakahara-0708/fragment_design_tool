@@ -819,13 +819,15 @@ const isPureExact =
       return b.score - a.score || a.top - b.top || a.left - b.left;
     });
 
-  if (hits.some((h) => h.isPureExact)) {
-    return { status: "match", hits };
-  }
-  if (hits[0]?.score >= 28) {
-    return { status: "partial", hits };
-  }
-  return { status: "mismatch", hits };
+if (hits.some((h) => h.isPureExact)) {
+  return { status: "match", hits };
+}
+
+if (hits.length > 0) {
+  return { status: "partial", hits };
+}
+
+return { status: "mismatch", hits };
 }
 
 function getVmHeaders(rows) {
