@@ -771,14 +771,12 @@ function compareValueToBlocks(value, blocks, fieldLabel) {
       let normMatchStart = -1;
       let normMatchLength = 0;
 
-      // まずは生文字列で探す
       const rawIdx = blockText.indexOf(raw);
       if (rawIdx !== -1) {
         rawMatchStart = Array.from(blockText.slice(0, rawIdx)).length;
         rawMatchLength = Array.from(raw).length;
         matchedText = raw;
       } else {
-        // ダメなら正規化後文字列で探す
         const normIdx = blockNorm.indexOf(rawKey);
         if (normIdx !== -1) {
           normMatchStart = normIdx;
@@ -787,10 +785,21 @@ function compareValueToBlocks(value, blocks, fieldLabel) {
         }
       }
 
+      const blockRaw = normalizeText(blockText);
+      const blockKey = normalizeKey(blockText);
+      const blockCompact = blockRaw.replace(/\s+/g, "");
+      const rawCompact = raw.replace(/\s+/g, "");
+
+      const isPureExact =
+        blockRaw === raw ||
+        blockKey === normalizeKey(raw) ||
+        blockCompact === rawCompact;
+
       return {
         ...b,
         score,
-        matchType: score >= 100 ? "exact" : score >= 40 ? "partial" : "weak",
+        isPureExact,
+        matchType: isPureExact ? "exact" : score >= 28 ? "partial" : "weak",
         keyword: raw,
         matchedText,
         rawTextLength: Array.from(blockText).length,
@@ -801,16 +810,21 @@ function compareValueToBlocks(value, blocks, fieldLabel) {
         normMatchLength,
       };
     })
-    .filter((b) => b.score > 0)
-    .sort((a, b) => b.score - a.score || a.top - b.top || a.left - b.left);
+    .filter((b) => b.score > 0 || b.isPureExact)
+    .sort((a, b) => {
+      if (Boolean(b.isPureExact) !== Boolean(a.isPureExact)) {
+        return b.isPureExact ? 1 : -1;
+      }
+      return b.score - a.score || a.top - b.top || a.left - b.left;
+    });
 
-  if (hits[0]?.score >= 110) {
-  return { status: "match", hits };
-}
-if (hits[0]?.score >= 28) {
-  return { status: "partial", hits };
-}
-return { status: "mismatch", hits };
+  if (hits[0]?.isPureExact) {
+    return { status: "match", hits };
+  }
+  if (hits[0]?.score >= 28) {
+    return { status: "partial", hits };
+  }
+  return { status: "mismatch", hits };
 }
 
 function getVmHeaders(rows) {
