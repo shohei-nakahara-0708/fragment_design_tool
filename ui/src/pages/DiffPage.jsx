@@ -440,7 +440,10 @@ const ui = {
 auxCell: {
   background: "#f8f9fb",
   color: "#6b7280",
-},
+  },
+  sheetFooter: {
+    padding: "5px 10px",
+  }
 };
 
 function normalizeText(s) {
@@ -535,9 +538,26 @@ async function readErrorMessage(res, fallback) {
   }
 }
 
+function splitJapaneseNameParts(name) {
+  const compact = normalizeText(name).replace(/\s+/g, "");
+  if (!compact) return [];
+
+  if (compact.length <= 2) return [compact];
+
+  // 雑でも、姓2〜3文字 + 残り の候補を作る
+  const parts = [];
+  if (compact.length >= 2) parts.push(compact.slice(0, 2));
+  if (compact.length >= 3) parts.push(compact.slice(0, 3));
+  parts.push(compact.slice(2));
+  if (compact.length >= 3) parts.push(compact.slice(3));
+
+  return Array.from(new Set(parts.filter(Boolean)));
+}
+
 function scoreBlockMatch(value, blockText, fieldLabel) {
   const raw = normalizeText(value);
   const key = normalizeKey(value);
+
   const blockRaw = normalizeText(blockText);
   const blockKey = normalizeKey(blockText);
 
@@ -545,31 +565,50 @@ function scoreBlockMatch(value, blockText, fieldLabel) {
 
   let score = 0;
 
-  if (blockKey === key) score += 100;
-  if (blockRaw === raw) score += 25;
-  if (blockRaw.includes(raw)) score += 60;
-  if (raw.includes(blockRaw) && blockRaw.length >= 4) score += 15;
-  if (blockKey.includes(key)) score += 40;
-  if (key.includes(blockKey) && blockKey.length >= 4) score += 20;
+  const rawCompact = raw.replace(/\s+/g, "");
+  const blockCompact = blockRaw.replace(/\s+/g, "");
 
   const label = normalizeText(fieldLabel);
 
-  if (label.includes("医師名") || label === "speaker") {
-    if (/先生|医師|dr\.?/i.test(blockRaw)) score += 10;
-    if (blockKey.length <= 2) score -= 30;
+  // 完全一致系
+  if (blockKey === key) score += 120;
+  if (blockRaw === raw) score += 40;
+  if (blockCompact === rawCompact) score += 60;
+
+  // 包含系
+  if (blockRaw.includes(raw)) score += 60;
+  if (raw.includes(blockRaw) && blockRaw.length >= 2) score += 25;
+
+  if (blockKey.includes(key)) score += 55;
+  if (key.includes(blockKey) && blockKey.length >= 2) score += 30;
+
+  if (blockCompact.includes(rawCompact)) score += 50;
+  if (rawCompact.includes(blockCompact) && blockCompact.length >= 2) score += 25;
+
+  // 人名は姓だけ/名だけでも多少拾う
+if (label.includes("医師名") || label === "speaker") {
+  const parts = splitJapaneseNameParts(raw);
+  for (const p of parts) {
+    if (p.length >= 2 && blockCompact.includes(p)) {
+      score += 12;
+    }
+  }
+}
+
+  // 施設名は大学・病院などの語があると加点
+  if (label.includes("施設名") || label === "facility" || label.includes("所属")) {
+    if (/病院|大学|クリニック|センター|科|部|医院|学部/.test(blockRaw)) score += 15;
   }
 
-  if (label.includes("施設名") || label === "facility") {
-    if (/病院|大学|クリニック|センター|科|部/.test(blockRaw)) score += 15;
-  }
-
+  // 役職は役職語を含むと加点
   if (label.includes("役職") || label === "role") {
-    if (/教授|部長|医長|院長|講師|助教|准教授|センター長/.test(blockRaw)) score += 15;
-    if (blockKey.length <= 2) score -= 15;
+    if (/教授|部長|医長|院長|講師|助教|准教授|センター長|科長/.test(blockRaw)) score += 18;
   }
 
+  // 演題は短すぎる候補を少し減点
   if (label.includes("演題") || label === "title") {
     if (blockRaw.length >= 8) score += 5;
+    if (blockRaw.length <= 3) score -= 20;
   }
 
   return score;
@@ -631,13 +670,13 @@ function compareValueToBlocks(value, blocks, fieldLabel) {
     .filter((b) => b.score > 0)
     .sort((a, b) => b.score - a.score || a.top - b.top || a.left - b.left);
 
-  if (hits[0]?.score >= 100) {
-    return { status: "match", hits };
-  }
-  if (hits[0]?.score >= 40) {
-    return { status: "partial", hits };
-  }
-  return { status: "mismatch", hits: [] };
+  if (hits[0]?.score >= 110) {
+  return { status: "match", hits };
+}
+if (hits[0]?.score >= 28) {
+  return { status: "partial", hits };
+}
+return { status: "mismatch", hits };
 }
 
 function getVmHeaders(rows) {
@@ -1569,6 +1608,9 @@ function SpreadsheetLikeTable({
           </tbody>
         </table>
       </div>
+      <div style={ui.sheetFooter}>
+        <span style={ui.muted}>※案内状から情報確認できる列はヘッダーが青色で表示されます。</span>
+      </div>
     </div>
   );
 }
@@ -2117,7 +2159,7 @@ function handleFlyerFileChange(file) {
 
             <div style={ui.h2}>シート値 × 案内状比較</div>
             <div style={ui.muted}>
-              左で条件設定とシート確認、右でPDFプレビューを表示します。
+              左でシート確認、右でPDFプレビューを表示します。
             </div>
 
             <div style={{ display: "grid", gap: 8 }}>
@@ -2197,6 +2239,12 @@ function handleFlyerFileChange(file) {
             </div>
           </div>
         ) : (
+            
+            filteredRows.length === 0 ? (
+              <div style={ui.card}>
+                <div style={ui.muted}>条件に一致する行がありません。<br />演題演者（VM）シートに該当するデータがあるか確認してください。</div>
+              </div>
+            ) : ( 
           <SpreadsheetLikeTable
             rows={filteredRows}
             headers={headers.filter((h) => visibleHeaders.includes(h))}
@@ -2209,7 +2257,7 @@ function handleFlyerFileChange(file) {
             columnFilters={columnFilters}
             columnSort={columnSort}
           />
-        )}
+        ))}
 
         <CollapseSection
           title="文字比較"
