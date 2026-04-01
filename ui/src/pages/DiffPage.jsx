@@ -755,6 +755,8 @@ function compareValueToBlocks(value, blocks, fieldLabel) {
   }
 
   const rawKey = normalizeForCompare(raw);
+  const rawNormalizedKey = normalizeKey(raw);
+  const rawCompact = raw.replace(/\s+/g, "");
 
   const hits = blocks
     .map((b) => {
@@ -785,15 +787,14 @@ function compareValueToBlocks(value, blocks, fieldLabel) {
         }
       }
 
-      const blockRaw = normalizeText(blockText);
-      const blockKey = normalizeKey(blockText);
-      const blockCompact = blockRaw.replace(/\s+/g, "");
-      const rawCompact = raw.replace(/\s+/g, "");
+const candidateRaw = normalizeText(matchedText || "");
+const candidateKey = normalizeKey(matchedText || "");
+const candidateCompact = candidateRaw.replace(/\s+/g, "");
 
-      const isPureExact =
-        blockRaw === raw ||
-        blockKey === normalizeKey(raw) ||
-        blockCompact === rawCompact;
+const isPureExact =
+  candidateRaw === raw ||
+  candidateKey === rawNormalizedKey ||
+  candidateCompact === rawCompact;
 
       return {
         ...b,
@@ -812,13 +813,13 @@ function compareValueToBlocks(value, blocks, fieldLabel) {
     })
     .filter((b) => b.score > 0 || b.isPureExact)
     .sort((a, b) => {
-      if (Boolean(b.isPureExact) !== Boolean(a.isPureExact)) {
-        return b.isPureExact ? 1 : -1;
+      if (a.isPureExact !== b.isPureExact) {
+        return a.isPureExact ? -1 : 1;
       }
       return b.score - a.score || a.top - b.top || a.left - b.left;
     });
 
-  if (hits[0]?.isPureExact) {
+  if (hits.some((h) => h.isPureExact)) {
     return { status: "match", hits };
   }
   if (hits[0]?.score >= 28) {
