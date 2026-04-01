@@ -482,11 +482,10 @@ headerIconBtn: {
   height: 20,
   border: "1px solid #6b7280",
   borderRadius: 4,
-  background: "transparent",
   cursor: "pointer",
   padding: 0,
   flex: "0 0 auto",
-    background: "#eeeeee",
+  background: "#eeeeee",
 },
 headerIconBtnActive: {
   borderColor: "#6b7280",
