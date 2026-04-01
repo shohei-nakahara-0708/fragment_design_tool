@@ -285,16 +285,19 @@ const ui = {
     userSelect: "none",
   },
   sheetHeaderCell: {
-    background: "#f8fafc",
-    borderRight: "1px solid #e5e7eb",
-    borderBottom: "1px solid #dfe3e8",
-    padding: "8px 10px",
-    fontWeight: 700,
-    color: "#222",
-    whiteSpace: "nowrap",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-  },
+  background: "#f8fafc",
+  borderRight: "1px solid #e5e7eb",
+  borderBottom: "1px solid #dfe3e8",
+  padding: "8px 10px",
+  fontWeight: 700,
+  color: "#222",
+  whiteSpace: "nowrap",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  height: 36,
+  minHeight: 36,
+  boxSizing: "border-box",
+},
   sheetCell: {
     position: "relative",
     borderRight: "1px solid #e5e7eb",
@@ -443,7 +446,70 @@ auxCell: {
   },
   sheetFooter: {
     padding: "5px 10px",
-  }
+  },
+  filteredHeaderCell: {
+  background: "#dbeafe",
+  color: "#1d4ed8",
+  boxShadow: "inset 0 -2px 0 #60a5fa",
+},
+headerMeta: {
+  display: "flex",
+  alignItems: "center",
+  gap: 4,
+  fontSize: 11,
+  color: "#1d4ed8",
+  marginTop: 4,
+  whiteSpace: "nowrap",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+},
+filterDot: {
+  display: "inline-block",
+  width: 8,
+  height: 8,
+  borderRadius: 999,
+  background: "#2563eb",
+},
+headerLabelWrap: {
+  display: "grid",
+  minWidth: 0,
+},
+headerIconBtn: {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  width: 20,
+  height: 20,
+  border: "1px solid #6b7280",
+  borderRadius: 4,
+  background: "transparent",
+  cursor: "pointer",
+  padding: 0,
+  flex: "0 0 auto",
+    background: "#eeeeee",
+},
+headerIconBtnActive: {
+  borderColor: "#6b7280",
+},
+headerRightIcons: {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 4,
+  flex: "0 0 auto",
+},
+headerLabelRow: {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 8,
+  height: "100%",
+},
+headerLabelText: {
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+  minWidth: 0,
+},
 };
 
 function normalizeText(s) {
@@ -485,6 +551,71 @@ function statusText(status) {
   return "未入力";
 }
 
+function getFilterSummary(filter) {
+  if (!filter) return "";
+
+  const parts = [];
+
+  if (filter.query) parts.push(`検索:${filter.query}`);
+  if (filter.onlyBlank) parts.push("空白のみ");
+  if (filter.onlyNonBlank) parts.push("空白以外");
+  if (Array.isArray(filter.selectedValues) && filter.selectedValues.length > 0) {
+    parts.push(`値:${filter.selectedValues.length}`);
+  }
+
+  return parts.join(" / ");
+}
+
+function FilterFunnelIcon({ active = false }) {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <path
+        d="M2 3h12l-5 6v3.5a.5.5 0 0 1-.223.416l-2 1.333A.5.5 0 0 1 6 13.833V9L2 3z"
+        fill={active ? "#2563eb" : "#6b7280"}
+      />
+    </svg>
+  );
+}
+
+function SortArrowIcon({ direction }) {
+  if (direction !== "asc" && direction !== "desc") return null;
+
+  return (
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      {direction === "asc" ? (
+        <path d="M8 4l4 6H4l4-6z" fill="#2563eb" />
+      ) : (
+        <path d="M8 12L4 6h8l-4 6z" fill="#2563eb" />
+      )}
+    </svg>
+  );
+}
+
+function isColumnFilterActive(filter) {
+  if (!filter) return false;
+
+  const hasQuery = !!String(filter.query || "").trim();
+  const hasStatuses = Array.isArray(filter.statuses) && filter.statuses.length > 0;
+  const hasOnlyBlank = !!filter.onlyBlank;
+  const hasOnlyNonBlank = !!filter.onlyNonBlank;
+  const hasSelectedValues =
+    Array.isArray(filter.selectedValues) && filter.selectedValues.length > 0;
+
+  return hasQuery || hasStatuses || hasOnlyBlank || hasOnlyNonBlank || hasSelectedValues;
+}
+
 function flattenBlocks(blocks) {
   const arr = Array.isArray(blocks) ? blocks : [];
   return arr
@@ -508,6 +639,10 @@ function flattenBlocks(blocks) {
       page_height: Number(b.page_height || b._page_height || 0),
       coord_unit: b.coord_unit || b._coord_unit || "",
     }));
+}
+
+function cleanupColumnFilter(nextFilter) {
+  return isColumnFilterActive(nextFilter) ? nextFilter : null;
 }
 
 function colLetter(n) {
@@ -1480,65 +1615,74 @@ function SpreadsheetLikeTable({
             </tr>
             <tr>
               <th style={ui.sheetRowHeader}>1</th>
-              {filteredHeaders.map((header) => {
-                    const hasFilter = !!columnFilters?.[header];
-                    const isSorted = columnSort?.header === header;
-                    const isAux = AUXILIARY_COLUMN_NAMES.has(header);
+          {filteredHeaders.map((header) => {
+      const hasFilter = isColumnFilterActive(columnFilters?.[header]);
+  const isSorted = columnSort?.header === header;
+  const sortDirection = isSorted ? columnSort.direction : "";
+  const filterSummary = getFilterSummary(columnFilters?.[header]);
 
-                    return (
-                      <th
-                        key={`col-header-${header}`}
-                        style={{
-                          ...ui.sheetHeaderCell,
-                          ...(isAux ? ui.auxHeaderCell : null),
-                          background: hasFilter
-                            ? "#e8f0fe"
-                            : isAux
-                            ? "#f3f4f6"
-                            : IMPORTANT_COLUMN_NAMES.has(header)
-                            ? "#eef5ff"
-                            : "#f8fafc",
-                        }}
-                        title={header}
-                      >
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: 8,
-                      }}
-                    >
-                      <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{header}</span>
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          const rect = e.currentTarget.getBoundingClientRect();
-                          onOpenHeaderMenu?.({
-                            header,
-                            anchorX: Math.max(8, rect.left - 220),
-                            anchorY: rect.bottom + 4,
-                          });
-                        }}
-                        style={{
-                          border: "none",
-                          background: "transparent",
-                          cursor: "pointer",
-                          fontSize: 12,
-                          color: isSorted ? "#1a73e8" : "#666",
-                          padding: 0,
-                        }}
-                      >
-                        {isSorted
-                          ? columnSort.direction === "asc"
-                            ? "▲"
-                            : "▼"
-                          : "▾"}
-                      </button>
-                    </div>
-                  </th>
-                );
-              })}
+  return (
+    <th
+      key={`col-header-${header}`}
+      style={{
+        ...ui.sheetHeaderCell,
+        background: hasFilter
+          ? "#e8f0fe"
+          : IMPORTANT_COLUMN_NAMES.has(header)
+          ? "#eef5ff"
+          : "#f8fafc",
+        color: hasFilter ? "#1d4ed8" : "#222",
+        boxShadow: hasFilter ? "inset 0 -2px 0 #60a5fa" : "none",
+      }}
+      title={
+        [
+          header,
+          hasFilter ? `絞り込み: ${filterSummary || "あり"}` : "",
+          isSorted
+            ? `並び順: ${sortDirection === "asc" ? "昇順" : "降順"}`
+            : "",
+        ]
+          .filter(Boolean)
+          .join("\n")
+      }
+    >
+      <div style={ui.headerLabelRow}>
+        <span style={ui.headerLabelText}>{header}</span>
+
+        <div style={ui.headerRightIcons}>
+          {hasFilter ? <FilterFunnelIcon active /> : null}
+          {isSorted ? <SortArrowIcon direction={sortDirection} /> : null}
+
+          <button
+            type="button"
+            onClick={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              onOpenHeaderMenu?.({
+                header,
+                anchorX: Math.max(8, rect.left - 220),
+                anchorY: rect.bottom + 4,
+              });
+            }}
+            style={{
+              ...ui.headerIconBtn,
+              ...(hasFilter || isSorted ? ui.headerIconBtnActive : null),
+            }}
+          >
+            <svg
+              width="20"
+              height="20"
+              viewBox="0 0 16 16"
+              aria-hidden="true"
+              style={{ display: "block" }}
+            >
+              <path d="M4 6l4 4 4-4H4z" fill="#6b7280" />
+            </svg>
+          </button>
+        </div>
+      </div>
+    </th>
+  );
+})}
             </tr>
           </thead>
 
