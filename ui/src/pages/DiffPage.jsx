@@ -2113,38 +2113,48 @@ function handleFlyerFileChange(file) {
     return { match, partial, mismatch, missing, total: allFields.length };
   }, [allFields]);
 
-  function handleSelectField(field, cellRef) {
+function handleSelectField(field, cellRef) {
+  // 別セルへ移動時も、解除時も比較用の手動文字はクリア
+  setManualCompareText("");
 
-     if (!field) {
+  if (!field) {
     setSelectedFieldKey("");
+    setSelectedCellRef("");
     setActivePreviewHitKey("");
     return;
   }
 
-    
-    setSelectedFieldKey(field.key);
-    setSelectedCellRef(cellRef || "");
-
-    const firstHit = field?.hits?.[0];
-    if (firstHit) {
-      const page = Number(firstHit.page || firstHit.page_number || 1);
-      const key = `page-${page}-hit-${firstHit.index}`;
-      setActivePreviewHitKey(key);
-
-      requestAnimationFrame(() => {
-        const el = document.getElementById(key);
-        if (el) {
-          el.scrollIntoView({
-            behavior: "smooth",
-            block: "center",
-            inline: "nearest",
-          });
-        }
-      });
-    } else {
-      setActivePreviewHitKey("");
-    }
+  // 同じセルを再クリックしたら解除
+  if (selectedFieldKey === field.key) {
+    setSelectedFieldKey("");
+    setSelectedCellRef("");
+    setActivePreviewHitKey("");
+    return;
   }
+
+  setSelectedFieldKey(field.key);
+  setSelectedCellRef(cellRef || "");
+
+  const firstHit = field?.hits?.[0];
+  if (firstHit) {
+    const page = Number(firstHit.page || firstHit.page_number || 1);
+    const key = `page-${page}-hit-${firstHit.index}`;
+    setActivePreviewHitKey(key);
+
+    requestAnimationFrame(() => {
+      const el = document.getElementById(key);
+      if (el) {
+        el.scrollIntoView({
+          behavior: "smooth",
+          block: "center",
+          inline: "nearest",
+        });
+      }
+    });
+  } else {
+    setActivePreviewHitKey("");
+  }
+}
 
   return (
     <div style={ui.page}>
