@@ -787,14 +787,11 @@ function compareValueToBlocks(value, blocks, fieldLabel) {
         }
       }
 
-const candidateRaw = normalizeText(matchedText || "");
-const candidateKey = normalizeKey(matchedText || "");
-const candidateCompact = candidateRaw.replace(/\s+/g, "");
 
-const isPureExact =
-  candidateRaw === raw ||
-  candidateKey === rawNormalizedKey ||
-  candidateCompact === rawCompact;
+const rawOriginal = String(value || "").trim();
+const candidateOriginal = String(matchedText || "").trim();
+
+const isPureExact = candidateOriginal === rawOriginal;
 
       return {
         ...b,
