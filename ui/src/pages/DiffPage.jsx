@@ -688,8 +688,175 @@ function splitJapaneseNameParts(name) {
   return Array.from(new Set(parts.filter(Boolean)));
 }
 
+
+function longestCommonSubstringLength(a, b) {
+  if (!a || !b) return 0;
+
+  const dp = Array(b.length + 1).fill(0);
+  let maxLen = 0;
+
+  for (let i = 1; i <= a.length; i++) {
+    let prev = 0;
+    for (let j = 1; j <= b.length; j++) {
+      const temp = dp[j];
+      if (a[i - 1] === b[j - 1]) {
+        dp[j] = prev + 1;
+        if (dp[j] > maxLen) maxLen = dp[j];
+      } else {
+        dp[j] = 0;
+      }
+      prev = temp;
+    }
+  }
+
+  return maxLen;
+}
+
+
+
+function extractDateParts(text) {
+  const s = normalizeText(text);
+
+  // 2026/05/29(金)
+  let m = s.match(
+    /(20\d{2})\s*\/\s*(\d{1,2})\s*\/\s*(\d{1,2})(?:\s*[（(]?\s*([月火水木金土日])\s*[）)]?)?/
+  );
+  if (m) {
+    return {
+      year: m[1],
+      month: String(Number(m[2])),
+      day: String(Number(m[3])),
+      dow: m[4] || "",
+    };
+  }
+
+  // 2026年5月29日（金）
+  m = s.match(
+    /(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日(?:\s*[（(]?\s*([月火水木金土日])\s*[）)]?)?/
+  );
+  if (m) {
+    return {
+      year: m[1],
+      month: String(Number(m[2])),
+      day: String(Number(m[3])),
+      dow: m[4] || "",
+    };
+  }
+
+  return { year: "", month: "", day: "", dow: "" };
+}
+
+
+function scoreDateLike(value, blockText) {
+  const v = extractDateParts(value);
+  const b = extractDateParts(blockText);
+
+  if (!v.year && !v.month && !v.day) return 0;
+  if (!b.year && !b.month && !b.day) return 0;
+
+  let score = 0;
+
+  if (v.year && b.year && v.year === b.year) score += 35;
+  if (v.month && b.month && v.month === b.month) score += 30;
+  if (v.day && b.day && v.day === b.day) score += 30;
+  if (v.dow && b.dow && v.dow === b.dow) score += 8;
+
+  if (
+    v.year && b.year && v.year === b.year &&
+    v.month && b.month && v.month === b.month &&
+    v.day && b.day && v.day === b.day
+  ) {
+    score += 40;
+  }
+
+  return score;
+}
+
+
+function scoreTimeLike(value, blockText) {
+  const v = extractTimeRange(value);
+  const b = extractTimeRange(blockText);
+
+  if (!v.start && !v.end) return 0;
+  if (!b.start && !b.end) return 0;
+
+  let score = 0;
+
+  if (v.start && b.start && v.start === b.start) score += 45;
+  if (v.end && b.end && v.end === b.end) score += 45;
+
+  if (v.start && b.start && v.start === b.start && v.end && b.end && v.end === b.end) {
+    score += 30;
+  }
+
+  return score;
+}
+
+function extractTimeRange(text) {
+  const s = normalizeTimeText(text);
+
+  // 18:30~20:00
+  let m = s.match(/(\d{1,2}:\d{2})\s*[~]\s*(\d{1,2}:\d{2})/);
+  if (m) {
+    return { start: m[1], end: m[2] };
+  }
+
+  // 単独時刻
+  m = s.match(/(\d{1,2}:\d{2})/);
+  if (m) {
+    return { start: m[1], end: "" };
+  }
+
+  return { start: "", end: "" };
+}
+
+function normalizeTimeText(text) {
+  return String(text || "")
+    .replace(/：/g, ":")
+    .replace(/[〜～ー－‐—–\-]/g, "~")
+    .replace(/[ \t　]+/g, " ")
+    .trim();
+}
+
+function buildTitleParts(text) {
+  const raw = normalizeText(text);
+  const compact = raw.replace(/\s+/g, "");
+  if (!compact) return [];
+
+  const out = new Set();
+
+  // 元全文
+  out.add(raw);
+
+  // よくある区切りで分割
+  raw
+    .split(/[〜~\-ー－:：/／]/)
+    .map(v => normalizeText(v))
+    .filter(Boolean)
+    .forEach(v => out.add(v));
+
+  // 「・」区切りは細かくなりすぎるので長めだけ採用
+  raw
+    .split(/[・]/)
+    .map(v => normalizeText(v))
+    .filter(v => v.length >= 6)
+    .forEach(v => out.add(v));
+
+  // 長いタイトルは前半/後半も候補にする
+  if (compact.length >= 18) {
+    const mid = Math.floor(raw.length / 2);
+    const left = normalizeText(raw.slice(0, mid));
+    const right = normalizeText(raw.slice(mid));
+
+    if (left.length >= 6) out.add(left);
+    if (right.length >= 6) out.add(right);
+  }
+
+  return Array.from(out);
+}
+
 function scoreBlockMatch(value, blockText, fieldLabel) {
-  const raw = normalizeText(value);
+ const raw = normalizeText(value);
   const key = normalizeKey(value);
 
   const blockRaw = normalizeText(blockText);
@@ -697,55 +864,245 @@ function scoreBlockMatch(value, blockText, fieldLabel) {
 
   if (!raw || !key || !blockKey) return 0;
 
-  let score = 0;
-
   const rawCompact = raw.replace(/\s+/g, "");
   const blockCompact = blockRaw.replace(/\s+/g, "");
-
   const label = normalizeText(fieldLabel);
 
-  // 完全一致系
-  if (blockKey === key) score += 120;
-  if (blockRaw === raw) score += 40;
-  if (blockCompact === rawCompact) score += 60;
+  const isDateField = label.includes("開催日") || label.includes("日時");
+  const isTimeField = label === "時間" || label.includes("開始") || label.includes("終了");
 
-  // 包含系
-  if (blockRaw.includes(raw)) score += 60;
-  if (raw.includes(blockRaw) && blockRaw.length >= 2) score += 25;
+  if (isDateField) {
+    return scoreDateLike(raw, blockRaw);
+  }
 
-  if (blockKey.includes(key)) score += 55;
-  if (key.includes(blockKey) && blockKey.length >= 2) score += 30;
+  if (isTimeField) {
+    return scoreTimeLike(raw, blockRaw);
+  }
 
-  if (blockCompact.includes(rawCompact)) score += 50;
-  if (rawCompact.includes(blockCompact) && blockCompact.length >= 2) score += 25;
 
-  // 人名は姓だけ/名だけでも多少拾う
-if (label.includes("医師名") || label === "speaker") {
-  const parts = splitJapaneseNameParts(raw);
-  for (const p of parts) {
-    if (p.length >= 2 && blockCompact.includes(p)) {
-      score += 12;
+  const isRole = label.includes("役職") || label === "role";
+const isShortRoleLabel =
+  isRole && /^(座長|演者|司会|講演|演題)$/.test(rawCompact);
+
+if (isShortRoleLabel) {
+  const escaped = rawCompact.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  // 例: 座長 -> ^座\s*長(?:[:：]|\s|　|$)
+  const flexiblePrefixPattern = new RegExp(
+    "^" +
+      escaped.split("").join("[ \\t　]*") +
+      "(?:[:：]|[ \\t　]|$)"
+  );
+
+  const blockNoTrim = String(blockText || "");
+  const blockCompactNoSpace = blockNoTrim.replace(/[ \t　]+/g, "");
+
+  // 原文一致
+  if (blockNoTrim.trim() === String(value || "").trim()) return 160;
+
+  // 空白違いのみ
+  if (blockCompact === rawCompact) return 145;
+
+  // normalizeKey一致
+  if (blockKey === key) return 130;
+
+  // 先頭ラベル一致
+  // 座長 / 座 長 / 座長: / 座 長： / 座長 田村 / 座 長 田村
+  if (flexiblePrefixPattern.test(blockNoTrim)) return 120;
+
+  // 念のため、空白全部除去後でも先頭一致
+  if (blockCompactNoSpace.startsWith(rawCompact)) return 115;
+
+  return 0;
+}
+
+  const isVeryShort = rawCompact.length <= 2;
+  const isShort = rawCompact.length <= 4;
+
+  const isCodeLike =
+    /^[A-Za-z0-9/_-]+$/.test(rawCompact) &&
+    rawCompact.length <= 6;
+
+  const isTitle =
+    label.includes("演題") ||
+    label.includes("講演会名") ||
+    label === "title" ||
+    label === "event_title";
+
+  // ============================
+  // コード値（PF/ONCなど）は厳格一致のみ
+  // ============================
+  if (isCodeLike || label === "PF/ONC") {
+    if (blockRaw === raw) return 140;
+    if (blockCompact === rawCompact) return 120;
+    if (blockKey === key) return 100;
+    return 0;
+  }
+
+  let score = 0;
+
+  // ============================
+  // 完全一致系（最重要）
+  // ============================
+  if (blockRaw === raw) score += 140;
+  else if (blockCompact === rawCompact) score += 110;
+  else if (blockKey === key) score += 90;
+
+  // ============================
+  // 部分一致（弱め）
+  // ============================
+  const rawInBlock = blockRaw.includes(raw);
+  const keyInBlock = blockKey.includes(key);
+  const compactInBlock = blockCompact.includes(rawCompact);
+
+  if (rawInBlock) score += isVeryShort ? 6 : isShort ? 14 : 28;
+  if (keyInBlock) score += isVeryShort ? 4 : isShort ? 12 : 24;
+  if (compactInBlock) score += isVeryShort ? 4 : isShort ? 10 : 20;
+
+  if (raw.includes(blockRaw) && blockRaw.length >= 2)
+    score += isVeryShort ? 2 : 8;
+
+  if (key.includes(blockKey) && blockKey.length >= 2)
+    score += isVeryShort ? 2 : 6;
+
+  if (rawCompact.includes(blockCompact) && blockCompact.length >= 2)
+    score += isVeryShort ? 2 : 6;
+
+  // ============================
+  // 人名補正
+  // ============================
+  if (label.includes("医師名") || label === "speaker") {
+    const parts = splitJapaneseNameParts(raw);
+    let hit = 0;
+
+    for (const p of parts) {
+      if (p.length >= 2 && blockCompact.includes(p)) {
+        hit++;
+      }
     }
+
+    score += Math.min(hit * 10, 20);
+
+    // 長すぎる候補は減点
+    if (blockCompact.length > rawCompact.length * 3) {
+      score -= 18;
+    }
+  }
+
+  // ============================
+  // 施設名補正
+  // ============================
+  if (
+    label.includes("施設名") ||
+    label === "facility" ||
+    label.includes("所属")
+  ) {
+    if (/病院|大学|クリニック|センター|科|部|医院|学部/.test(blockRaw)) {
+      score += 10;
+    }
+  }
+
+  // ============================
+  // 役職補正
+  // ============================
+  if (label.includes("役職") || label === "role") {
+    if (/教授|部長|医長|院長|講師|助教|准教授|センター長|科長/.test(blockRaw)) {
+      score += 10;
+    }
+  }
+
+  // ============================
+  // 🔥 タイトル系（演題・講演会名）
+  // ============================
+if (isTitle) {
+  // includesを弱める（誤爆防止）
+  if (rawInBlock) score -= 15;
+  if (keyInBlock) score -= 10;
+
+  // タイトル全体との比較は少し弱める
+  const lenRatio =
+    Math.min(blockCompact.length, rawCompact.length) /
+    Math.max(blockCompact.length, rawCompact.length);
+  score += lenRatio * 12;
+
+  const rawSoft = rawCompact.replace(/[〜~\-ー－・「」『』（）()]/g, "");
+  const blockSoft = blockCompact.replace(/[〜~\-ー－・「」『』（）()]/g, "");
+
+  if (rawSoft && blockSoft) {
+    const commonLen = longestCommonSubstringLength(rawSoft, blockSoft);
+    const coverage = commonLen / Math.max(rawSoft.length, 1);
+    score += coverage * 18;
+  }
+
+  // 改行・区切りごとの片を作る
+  const lineParts = raw
+    .split(/\n+/)
+    .map(v => normalizeText(v))
+    .filter(Boolean);
+
+  const splitParts = raw
+    .split(/[\n〜~\-ー－]/)
+    .map(v => normalizeText(v))
+    .filter(Boolean);
+
+  let parts = Array.from(new Set([...lineParts, ...splitParts]));
+
+  let bestPartScore = 0;
+
+  parts = buildTitleParts(raw);
+
+  for (const p of parts) {
+    const pCompact = p.replace(/\s+/g, "");
+    if (!pCompact) continue;
+
+    let partScore = 0;
+
+    // 片そのものを含むならかなり強く
+    if (blockCompact.includes(pCompact)) {
+      partScore += pCompact.length >= 6 ? 36 : 24;
+    }
+
+    // 片単位の長さ比
+    const partLenRatio =
+      Math.min(blockCompact.length, pCompact.length) /
+      Math.max(blockCompact.length, pCompact.length);
+    partScore += partLenRatio * 22;
+
+    // 片単位の共通部分
+    const pSoft = pCompact.replace(/[〜~\-ー－・「」『』（）()]/g, "");
+    if (pSoft && blockSoft) {
+      const partCommonLen = longestCommonSubstringLength(pSoft, blockSoft);
+      const partCoverage = partCommonLen / Math.max(pSoft.length, 1);
+      partScore += partCoverage * 42;
+    }
+
+    // 片の先頭一致は少し強め
+    if (
+      pCompact.length >= 4 &&
+      blockSoft.startsWith(pSoft.slice(0, Math.min(8, pSoft.length)))
+    ) {
+      partScore += 10;
+    }
+
+    if (partScore > bestPartScore) {
+      bestPartScore = partScore;
+    }
+  }
+
+  score += bestPartScore;
+
+  // 長すぎる候補は減点
+  if (blockCompact.length > rawCompact.length * 1.8) {
+    score -= 20;
+  }
+
+  // 短い行を殺しすぎない
+  if (blockCompact.length <= 5) {
+    score -= 8;
   }
 }
 
-  // 施設名は大学・病院などの語があると加点
-  if (label.includes("施設名") || label === "facility" || label.includes("所属")) {
-    if (/病院|大学|クリニック|センター|科|部|医院|学部/.test(blockRaw)) score += 15;
-  }
-
-  // 役職は役職語を含むと加点
-  if (label.includes("役職") || label === "role") {
-    if (/教授|部長|医長|院長|講師|助教|准教授|センター長|科長/.test(blockRaw)) score += 18;
-  }
-
-  // 演題は短すぎる候補を少し減点
-  if (label.includes("演題") || label === "title") {
-    if (blockRaw.length >= 8) score += 5;
-    if (blockRaw.length <= 3) score -= 20;
-  }
-
-  return score;
+  return Math.round(score);
 }
 
 function compareValueToBlocks(value, blocks, fieldLabel) {
@@ -1812,6 +2169,38 @@ const hits = useMemo(
     }));
   }
 
+
+ function clamp(num, min, max) {
+  return Math.min(Math.max(num, min), max);
+}
+
+function getHitHighlightStyle(score, isTop, isActiveJump) {
+  if (isActiveJump) {
+    return {
+      background: "rgba(255,80,80,0.24)",
+      border: "3px solid #ff4d4f",
+      boxShadow: "0 0 0 4px rgba(255,77,79,0.18)",
+    };
+  }
+
+  // score を 0〜100 に丸める
+  const s = clamp(Number(score || 0), 0, 100);
+
+  // 低スコアはかなり薄く、高スコアはかなり濃く
+  const alpha = 0.04 + (s / 100) * 0.22; // 0.04〜0.26
+  const borderAlpha = 0.35 + (s / 100) * 0.55; // 0.35〜0.90
+  const borderWidth = 1 + (s / 100) * 2; // 1〜3px
+
+  // top候補は少しだけ強める
+  const boost = isTop ? 0.05 : 0;
+
+  return {
+    background: `rgba(255, 170, 0, ${Math.min(alpha + boost, 0.32)})`,
+    border: `${borderWidth}px solid rgba(255, 140, 0, ${Math.min(borderAlpha + boost, 1)})`,
+    boxShadow: isTop ? "0 0 0 3px rgba(255,140,0,0.12)" : "none",
+  };
+}
+
 function getScaledRect(hit, pageNumber) {
   const vp = pageViewports[pageNumber];
   if (!vp?.width) return null;
@@ -1934,32 +2323,23 @@ function getScaledRect(hit, pageNumber) {
                       const isTop = Number(hit.score || 0) === maxScore;
                       const hitKey = `page-${pageNumber}-hit-${hit.index}`;
                       const isActiveJump = activePreviewHitKey === hitKey;
+                     const hitStyle = getHitHighlightStyle(Number(hit.score || 0), isTop, isActiveJump);
 
                       return (
                         <div
                           id={hitKey}
                           key={hitKey}
-                          style={{
-                            position: "absolute",
-                            left: rect.left,
-                            top: rect.top,
-                            width: rect.width,
-                            minHeight: rect.height,
-                            background: isActiveJump
-                              ? "rgba(255,80,80,0.22)"
-                              : isTop
-                              ? "rgba(255,140,0,0.16)"
-                              : "rgba(255,200,0,0.05)",
-                            border: isActiveJump
-                              ? "3px solid #ff4d4f"
-                              : isTop
-                              ? "2px solid #ff8c00"
-                              : "1px solid rgba(255,180,0,0.55)",
-                            borderRadius: 3,
-                            boxSizing: "border-box",
-                            boxShadow: isActiveJump ? "0 0 0 4px rgba(255,77,79,0.18)" : "none",
-                            transition: "all 0.2s ease",
-                          }}
+                         style={{
+                          position: "absolute",
+                          left: rect.left,
+                          top: rect.top,
+                          width: rect.width,
+                          minHeight: rect.height,
+                          ...hitStyle,
+                          borderRadius: 3,
+                          boxSizing: "border-box",
+                          transition: "all 0.2s ease",
+                        }}
                         />
                       );
                     })}
