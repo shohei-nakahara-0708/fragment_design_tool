@@ -1048,8 +1048,65 @@ def assign_talk_times_by_proximity(blocks: list[TextBlock], payload: DesignJSON)
     return payload
 
 
+def extract_blocks_from_pdf(pdf_path: Path, first_page_only: bool = True) -> List[TextBlock]:
+    doc = fitz.open(str(pdf_path))
+    blocks: List[TextBlock] = []
 
-def extract_blocks_from_pdf(file_path: str) -> list[dict[str, Any]]:
+    pages = [doc[0]] if (first_page_only and doc.page_count > 0) else [doc[i] for i in range(doc.page_count)]
+
+    for page in pages:
+        d = page.get_text("dict")
+
+        for b in d.get("blocks", []):
+            if b.get("type") != 0:  # 0=text
+                continue
+
+            x0, y0, x1, y1 = b.get("bbox", (0, 0, 0, 0))
+
+            # 段落/行を組み立て（PDFのline/spansを尊重）
+            lines = []
+            max_font_pt = 0.0
+
+            for line in b.get("lines", []):
+                spans = line.get("spans", [])
+                # spanをそのまま連結（余計な空白は後でnormalize）
+                t = "".join(s.get("text", "") for s in spans)
+                if t and t.strip():
+                    lines.append(t.strip())
+
+                for s in spans:
+                    try:
+                        max_font_pt = max(max_font_pt, float(s.get("size") or 0.0))
+                    except Exception:
+                        pass
+
+            text = normalize_keep_newlines("\n".join(lines))
+            if not text:
+                continue
+
+            # PDF(pt) -> EMU に変換
+            left_emu   = int(round(x0 * EMU_PER_PT))
+            top_emu    = int(round(y0 * EMU_PER_PT))
+            width_emu  = int(round((x1 - x0) * EMU_PER_PT))
+            height_emu = int(round((y1 - y0) * EMU_PER_PT))
+
+            blocks.append(
+                TextBlock(
+                    text=text,
+                    left=left_emu,
+                    top=top_emu,
+                    width=width_emu,
+                    height=height_emu,
+                    max_font_pt=float(max_font_pt or 0.0),
+                )
+            )
+
+    doc.close()
+    blocks.sort(key=lambda b: (b.top, b.left))
+    return blocks
+
+
+def extract_blocks_from_pdf2(file_path: str) -> list[dict[str, Any]]:
     """
     PDFから line 単位でテキストブロックを抽出する。
     さらに各 line の spans も返す。
@@ -9130,7 +9187,7 @@ def extract_text_blocks_for_vm_diff(file_path: str) -> list[Any]:
                 "テキスト抽出可能なPDFをご使用ください。"
             )
 
-        return extract_blocks_from_pdf(file_path)
+        return extract_blocks_from_pdf2(file_path)
 
     raise ValueError(
         "このファイル形式は対応していません。"
@@ -9300,7 +9357,7 @@ def extract_text_blocks_for_vm_diff(file_path: str) -> list[Any]:
                 "テキスト抽出可能なPDFをご使用ください。"
             )
 
-        return extract_blocks_from_pdf(file_path)
+        return extract_blocks_from_pdf2(file_path)
 
     raise ValueError(
         "このファイル形式は対応していません。"
