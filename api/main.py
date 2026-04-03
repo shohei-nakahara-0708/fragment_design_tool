@@ -39,6 +39,7 @@ import random
 from gspread.exceptions import APIError
 import psycopg
 from psycopg.rows import dict_row
+from psycopg import OperationalError
 
 import fitz  # pymupdf
 
@@ -61,6 +62,12 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "")
+
+# データベース接続設定
+DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "30"))  # 接続タイムアウト（秒）
+DB_QUERY_TIMEOUT = int(os.getenv("DB_QUERY_TIMEOUT", "60"))      # クエリタイムアウト（秒）
+DB_RETRY_ATTEMPTS = int(os.getenv("DB_RETRY_ATTEMPTS", "3"))     # リトライ回数
+DB_RETRY_DELAY = float(os.getenv("DB_RETRY_DELAY", "2.0"))        # リトライ間隔（秒）
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -99,15 +106,57 @@ EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 MAX_HEIGHT = 2000
 BASE_VIEWPORT = {"width": 600, "height": 800}
 
-AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# より高性能なモデルを使用して精度向上
+AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # gpt-4o-mini → gpt-4o
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-AI_TIMEOUT = 120
+AI_TIMEOUT = 180  # より複雑な処理に対してタイムアウトを延長
 
 # EMU -> pt (pptx uses EMU units for font size)
 EMU_PER_PT = 12700
 
 TIME_PAT = re.compile(r"(\d{1,2}:\d{2}\s*[～〜\-ー~]\s*\d{1,2}:\d{2})")
+
+# 医療用語の標準化辞書（精度向上のため）
+MEDICAL_ORGANIZATION_NORMALIZATION = {
+    "東京大学医学部附属病院": ["東大病院", "東大医学部", "東京大医学部", "東大附属病院"],
+    "慶應義塾大学病院": ["慶應病院", "慶大病院", "慶応大学病院"],
+    "順天堂大学医学部附属順天堂病院": ["順天堂病院", "順天堂大病院"],
+    "国立がん研究センター": ["がん研", "国がん"],  # 「がんセンター」を削除（他の機関との混同を避ける）
+    "日本医科大学付属病院": ["日医大病院", "日本医大病院"],
+    "大阪国際がんセンター": ["大阪国際がんセンター"],  # 正式名称を追加
+}
+
+MEDICAL_TITLE_NORMALIZATION = {
+    "教授": ["prof", "Prof", "Professor", "教授"],
+    "准教授": ["准教授", "準教授", "Associate Professor"],
+    "講師": ["講師", "Lecturer"],
+    "助教": ["助教", "Assistant Professor"],
+    "部長": ["部長", "Director"],
+    "主任": ["主任", "Chief"],
+    "センター長": ["センター長", "Center Director"],
+}
+
+def normalize_medical_terms(text: str) -> str:
+    """医療用語を標準化（より精密な処理）"""
+    import re
+    result = text
+    
+    # 組織名の標準化（完全一致または境界を考慮）
+    for standard, variants in MEDICAL_ORGANIZATION_NORMALIZATION.items():
+        for variant in variants:
+            # 完全一致または前後に区切り文字がある場合のみ置換
+            pattern = r'\b' + re.escape(variant) + r'\b'
+            result = re.sub(pattern, standard, result)
+    
+    # 役職名の標準化（完全一致または境界を考慮）
+    for standard, variants in MEDICAL_TITLE_NORMALIZATION.items():
+        for variant in variants:
+            # 完全一致または前後に区切り文字がある場合のみ置換  
+            pattern = r'\b' + re.escape(variant) + r'\b'
+            result = re.sub(pattern, standard, result)
+    
+    return result
 
 ORG_CANON = {
     "MSD": "MSD株式会社",
@@ -214,20 +263,62 @@ TYPESET_JS = r"""
   // =========================================================
   const hasJapanese = (s) => /[ぁ-んァ-ヶ一-龠々]/.test(String(s ?? ""));
 
+  // 医学・専門用語の境界を考慮した改行位置決定
   const breakPositions = (s) => {
     const out = [];
     const jp = hasJapanese(s);
 
-    // 日本語が入っているときは半角スペースを安易な改行候補にしない
+    // 基本的な区切り文字
     const breakers = new Set(
       jp
         ? ["、", "。", ",", "，", ":", "：", "/", "／"]
         : [" ", "、", "。", ",", "，", ":", "：", "/", "／"]
     );
 
+    // 医学用語・専門用語のパターン（途中で改行を避けるべき）
+    const medicalTerms = [
+      /GLP-1受容体作動薬/, /SGLT-2阻害薬/, /DPP-4阻害薬/, 
+      /ACE阻害薬/, /ARB/, /β遮断薬/, /Ca拮抗薬/,
+      /2型糖尿病/, /1型糖尿病/, /糖尿病性腎症/, /糖尿病性網膜症/,
+      /心血管疾患/, /循環器疾患/, /虚血性心疾患/, /心不全/,
+      /エビデンス/, /ガイドライン/, /プロトコル/, /アルゴリズム/,
+      /バイオマーカー/, /リスクファクター/, /アウトカム/,
+      /webセミナー/, /Webセミナー/, /WEBセミナー/,
+    ];
+
+    // 意味のある境界で改行候補を追加
+    const meaningfulBreaks = [
+      /における/, /について/, /に関する/, /による/, /からの/, 
+      /への/, /との/, /での/, /としての/, /という/,
+      /〜/, /～/, /から/, /まで/, /より/, /など/,
+    ];
+
+    // 基本的な区切り文字での改行候補
     for (let i = 0; i < s.length; i++) {
       const ch = s[i];
       if (breakers.has(ch)) out.push(i + 1);
+    }
+
+    // 意味のある境界での改行候補（医学用語の途中でなければ）
+    for (const pattern of meaningfulBreaks) {
+      let match;
+      while ((match = pattern.exec(s)) !== null) {
+        const pos = match.index + match[0].length;
+        
+        // 医学用語の途中でないかチェック
+        let inMedicalTerm = false;
+        for (const medPattern of medicalTerms) {
+          const medMatch = s.match(medPattern);
+          if (medMatch && pos > medMatch.index && pos < medMatch.index + medMatch[0].length) {
+            inMedicalTerm = true;
+            break;
+          }
+        }
+        
+        if (!inMedicalTerm) {
+          out.push(pos);
+        }
+      }
     }
 
     // 前後に空白がある dash だけ候補にする
@@ -238,10 +329,24 @@ TYPESET_JS = r"""
       out.push(m.index + m[0].length - 1);
     }
 
-    // 助詞
-    const re = /(を|の|に|と|へ|や|で|が|は|も)/g;
-    while ((m = re.exec(s)) !== null) {
-      out.push(m.index + m[0].length);
+    // 助詞の後（ただし医学用語の途中でなければ）
+    const particleRe = /(を|の|に|と|へ|や|で|が|は|も)/g;
+    while ((m = particleRe.exec(s)) !== null) {
+      const pos = m.index + m[0].length;
+      
+      // 医学用語の途中でないかチェック
+      let inMedicalTerm = false;
+      for (const medPattern of medicalTerms) {
+        const medMatch = s.match(medPattern);
+        if (medMatch && pos > medMatch.index && pos < medMatch.index + medMatch[0].length) {
+          inMedicalTerm = true;
+          break;
+        }
+      }
+      
+      if (!inMedicalTerm) {
+        out.push(pos);
+      }
     }
 
     return Array.from(new Set(out)).sort((a, b) => a - b);
@@ -373,11 +478,27 @@ TYPESET_JS = r"""
 
     if (!t) p += 9999;
 
-    // 最終行1語だけ
+    // 医学用語・専門用語の途中で改行されている場合は重いペナルティ
+    const medicalTerms = [
+      'GLP-1', 'SGLT-2', 'DPP-4', 'ACE阻害', 'β遮断', 'Ca拮抗',
+      '糖尿病性', '心血管', '循環器', '虚血性', 'バイオマーカー',
+      'エビデンス', 'ガイドライン', 'プロトコル', 'アルゴリズム',
+      'webセミナー', 'Webセミナー', 'WEBセミナー'
+    ];
+    
+    for (const term of medicalTerms) {
+      if (t.includes(term.slice(0, -1)) && !t.includes(term)) {
+        p += 5000; // 医学用語の途中改行は避ける
+      }
+    }
+
+    // 最終行1語だけ（英語の場合）
     if (idx === total - 1 && wc === 1 && isMostlyAscii(t)) p += 1600;
 
-    // 最終行が短すぎる
-    if (idx === total - 1 && t.length <= 8) p += 900;
+    // 最終行が短すぎる（ただし意味のある単語なら許容）
+    if (idx === total - 1 && t.length <= 8 && !medicalTerms.some(term => t.includes(term))) {
+      p += 900;
+    }
 
     // 最終行が記号だけはほぼ禁止
     if (idx === total - 1 && isOnlySymbols(t)) p += 100000;
@@ -385,18 +506,31 @@ TYPESET_JS = r"""
     // 最終行が弱い記号スタートで極端に短いのも避ける
     if (idx === total - 1 && startsWithWeakSymbol(t) && t.length <= 2) p += 50000;
 
-    // 先頭が記号っぽい
-    if (/^[-–—−－:：,，/／]+/.test(t)) p += 700;
+    // 先頭が記号っぽい（ただし医学用語の一部なら軽減）
+    if (/^[-–—−－:：,，/／]+/.test(t)) {
+      const hasImportantContent = medicalTerms.some(term => t.includes(term));
+      p += hasImportantContent ? 200 : 700;
+    }
 
-    // GLP- みたいな行末を避ける
-    if (/^[A-Za-z0-9]+-$/.test(t)) p += 1800;
-    if (/[A-Za-z0-9]-$/.test(t)) p += 1200;
+    // GLP-1 みたいな医学用語で終わる場合は許容
+    if (/^[A-Za-z0-9]+-$/.test(t)) {
+      const isMedicalAbbrev = /^(GLP|SGLT|DPP|ACE|ARB)-$/.test(t);
+      p += isMedicalAbbrev ? 300 : 1800;
+    }
+    if (/[A-Za-z0-9]-$/.test(t) && !/^(GLP|SGLT|DPP|ACE|ARB)-/.test(t)) {
+      p += 1200;
+    }
 
-    // 行末が中途半端
+    // 行末が中途半端（助詞で終わる）
     if (/[のにとへやではがも]$/.test(t)) p += 120;
 
     // ・終わり
     if (/[・･]$/.test(t)) p += 800;
+
+    // 意味のある医学用語を保持している行は優先
+    if (medicalTerms.some(term => t.includes(term))) {
+      p -= 100; // ボーナス
+    }
 
     if (opts.preferBalancedAscii && isMostlyAscii(t) && wc === 1) {
       p += 250;
@@ -412,14 +546,34 @@ TYPESET_JS = r"""
       return acc + linePenalty(line, i, lines.length, opts);
     }, 0);
 
+    // より均等な行に対するボーナス（医学コンテンツでは読みやすさ重視）
+    let balanceBonus = 0;
+    if (widths.length >= 2) {
+      const avg = widths.reduce((sum, w) => sum + w, 0) / widths.length;
+      const variance = widths.reduce((sum, w) => sum + (w - avg) ** 2, 0) / widths.length;
+      
+      // 分散が小さい（均等）ほどボーナス
+      if (variance < 2000) balanceBonus = -200;
+      else if (variance < 5000) balanceBonus = -100;
+    }
+
     let raggedPenalty = 0;
     if (widths.length >= 2) {
       const mx = Math.max(...widths);
       const mn = Math.min(...widths);
-      raggedPenalty = (mx - mn) * 2;
+      raggedPenalty = (mx - mn) * 1.5; // ペナルティを少し軽減（内容重視）
     }
 
-    return slackScore + penalties + raggedPenalty;
+    // 医学用語が適切に配置されている場合のボーナス
+    let medicalTermBonus = 0;
+    const medicalTerms = ['GLP-1', 'SGLT-2', 'DPP-4', '糖尿病', '循環器', 'エビデンス'];
+    for (const line of lines) {
+      if (medicalTerms.some(term => line.includes(term))) {
+        medicalTermBonus -= 50; // 医学用語を含む行にボーナス
+      }
+    }
+
+    return slackScore + penalties + raggedPenalty + balanceBonus + medicalTermBonus;
   };
 
   // =========================================================
@@ -570,10 +724,14 @@ TYPESET_JS = r"""
 
     const ascii = isMostlyAscii(s);
 
+    // 医学セミナータイトルの特別な処理
+    const isMedicalSeminar = /セミナー|webinar|symposium|conference/i.test(s);
+    const hasMedicalTerms = /GLP-1|SGLT-2|DPP-4|糖尿病|循環器|腎臓|心血管/.test(s);
+
     return wrapPx(s, maxPx, style, 8, {
       forceSubtitle2ndHead: true,
-      preferBalancedAscii: ascii,
-      avoidSingleWordLastLine: ascii,
+      preferBalancedAscii: ascii && !hasMedicalTerms, // 医学用語がある場合はバランスより内容重視
+      avoidSingleWordLastLine: ascii && !isMedicalSeminar,
     });
   };
 
@@ -581,10 +739,13 @@ TYPESET_JS = r"""
     const s = unifyTilde(oneLine(line));
     if (!s) return [];
 
+    const hasMedicalTerms = /GLP-1|SGLT-2|DPP-4|糖尿病|循環器|腎臓|心血管|エビデンス|ガイドライン/.test(s);
+    const hasLongMedicalPhrase = /受容体作動薬|阻害薬|合併症|バイオマーカー|プロトコル/.test(s);
+
     return wrapPx(s, maxPx, style, 5, {
       forceSubtitle2ndHead: true,
-      preferBalancedAscii: isMostlyAscii(s),
-      avoidSingleWordLastLine: isMostlyAscii(s),
+      preferBalancedAscii: isMostlyAscii(s) && !hasMedicalTerms,
+      avoidSingleWordLastLine: isMostlyAscii(s) && !hasLongMedicalPhrase,
     });
   };
 
@@ -756,25 +917,43 @@ DROP_AT_BREAK = set(["－", "—", "–"])
 
 EMU_PER_PT = 12700
 
-TIME_RE = re.compile(r"(\d{1,2}\s*:\s*\d{2})\s*[~〜～\-–—]\s*(\d{1,2}\s*:\s*\d{2})")
+TIME_RE = re.compile(r"(\d{1,2}\s*[:\：]\s*\d{2})\s*[~〜～\-–—−－]\s*(\d{1,2}\s*[:\：]\s*\d{2})")
 
 def _norm_time(s: str) -> str:
+    """時間表記の正規化（全角・半角・記号統一）"""
     s = str(s or "").replace("\u3000", " ")
-    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    
+    # 全角数字・コロンを半角に変換
     s = s.translate(str.maketrans("０１２３４５６７８９：", "0123456789:"))
+    
+    # ダッシュ類の統一
+    s = re.sub(r"[–—−－\-]", "~", s)
     s = s.replace("～", "~").replace("〜", "~")
-    s = re.sub(r"[–—−－\-]", "-", s)
+    
     return s
 
 def extract_time_cands_with_pos(blocks: list[TextBlock]) -> list[TimeCand]:
+    """ブロックから時間範囲を抽出（位置情報付き）"""
     out = []
     for b in blocks:
         t = _norm_time(b.text)
-        m = TIME_RE.search(t.replace("-", "~"))  # ダッシュも許容してまとめる
+        
+        # 時間範囲のパターンを探す
+        m = TIME_RE.search(t)
         if not m:
             continue
-        a, c = m.group(1), m.group(2)
-        out.append(TimeCand(text=f"{a}~{c}", top=b.top, left=b.left))
+            
+        start_time = m.group(1).replace(" ", "")
+        end_time = m.group(2).replace(" ", "")
+        
+        # HH:MM形式に正規化
+        start_norm = re.sub(r"(\d{1,2}):(\d{2})", r"\1:\2", start_time)
+        end_norm = re.sub(r"(\d{1,2}):(\d{2})", r"\1:\2", end_time)
+        
+        time_text = f"{start_norm}~{end_norm}"
+        out.append(TimeCand(text=time_text, top=b.top, left=b.left))
+    
     out.sort(key=lambda x: (x.top, x.left))
     return out
 
@@ -977,7 +1156,8 @@ def assign_talk_times_by_anchor(blocks: list[TextBlock], payload: DesignJSON) ->
 
 
 def assign_talk_times_by_proximity(blocks: list[TextBlock], payload: DesignJSON) -> DesignJSON:
-    # 1) イベント全体の時間枠（VM由来のdatetimeでも、blocks由来でもOK）
+    """講演と時間の近接性による割り当て（既存の時間は保持）"""
+    # 1) イベント全体の時間枠
     ev = parse_event_time_range(getattr(payload, "datetime", "") or "")
 
     # 2) time候補を抽出＆イベント範囲でフィルタ
@@ -985,34 +1165,68 @@ def assign_talk_times_by_proximity(blocks: list[TextBlock], payload: DesignJSON)
     if not cands or not getattr(payload, "talks", None):
         return payload
 
-    # 3) talkアンカー(top)を作る：ここは既存の「talkを当てる」ロジックがあるならそれを使ってOK
-    #    最低限、title_lines/title/speakerが含まれるブロックのtopを探す（雑でも効く）
-    def find_anchor_top(talk) -> int:
-        keys = []
-        if getattr(talk, "title", ""): keys += [talk.title]
-        if getattr(talk, "speaker_display", ""): keys += [talk.speaker_display]
-        if getattr(talk, "speaker", ""): keys += [talk.speaker]
-        keys = [k for k in keys if k]
-        if not keys:
-            return 10**18
+    # 3) 講演のアンカー位置を精密に特定
+    def find_precise_anchor_top(talk) -> int:
+        search_terms = []
+        
+        # 講演者名（複数パターン）
+        if getattr(talk, "speaker", ""):
+            speaker = talk.speaker.strip()
+            search_terms.append(speaker)
+            search_terms.append(speaker.replace(" ", ""))  # スペース無し
+            if " " in speaker:
+                search_terms.append(" ".join(speaker.split()))  # 正規化
+        
+        if getattr(talk, "speaker_display", ""):
+            search_terms.append(talk.speaker_display.strip())
+            search_terms.append(talk.speaker_display.replace(" ", ""))
+        
+        # タイトル（部分マッチも考慮）
+        if getattr(talk, "title_lines", []):
+            for line in talk.title_lines:
+                if line.strip():
+                    search_terms.append(line.strip())
+        elif getattr(talk, "title", ""):
+            title_lines = talk.title.split('\n')
+            for line in title_lines:
+                if line.strip():
+                    search_terms.append(line.strip())
+        
         best_top = 10**18
         best_score = 0
+        
         for b in blocks:
-            bt = b.text or ""
+            bt = normalize_space(b.text or "")
+            if not bt:
+                continue
+                
             score = 0
-            for k in keys:
-                kk = k.replace(" ", "")
-                if kk and kk in bt.replace(" ", ""):
-                    score += 2
+            # より精密なマッチング
+            for term in search_terms:
+                term_norm = normalize_space(term).replace(" ", "")
+                bt_norm = bt.replace(" ", "").replace("\n", "")
+                
+                if term_norm and term_norm in bt_norm:
+                    # 完全一致は高得点
+                    if term_norm == bt_norm:
+                        score += 10
+                    # 部分一致
+                    elif len(term_norm) >= 3:
+                        score += 5
+                    else:
+                        score += 2
+            
             if score > best_score:
                 best_score = score
                 best_top = b.top
+        
         return best_top
 
     talks = list(payload.talks or [])
     talk_infos = []
     for idx, t in enumerate(talks):
-        talk_infos.append((idx, find_anchor_top(t)))
+        talk_infos.append((idx, find_precise_anchor_top(t)))
+    
     # 上→下に並べる
     talk_infos.sort(key=lambda x: x[1])
 
@@ -1020,26 +1234,33 @@ def assign_talk_times_by_proximity(blocks: list[TextBlock], payload: DesignJSON)
 
     for idx, anchor_top in talk_infos:
         t = talks[idx]
+        # 既に時間が設定されている場合はスキップ
         if _norm_time(getattr(t, "time", "")):
             continue
 
-        # ルール：アンカーより上側の候補のうち、最も近いものを優先（未使用）
+        # アンカーに最も近い未使用の時間候補を探す
         best = None
         best_dist = None
 
         for ci, c in enumerate(cands):
             if ci in used:
                 continue
-            # timeはアンカーより少し上にあることが多いので、上側は距離を軽く優遇
-            dist = abs(anchor_top - c.top)
+                
+            # 距離計算（縦方向優先、横方向も少し考慮）
+            vert_dist = abs(anchor_top - c.top)
+            horiz_dist = abs(c.left - 500000)  # 左側を少し優遇
+            
+            # 時間は講演の少し上にあることが多い
             if c.top <= anchor_top:
-                dist *= 0.7
-            # leftも少しだけ効かせたいならここで加点（time列は左寄り）
-            if best_dist is None or dist < best_dist:
-                best_dist = dist
+                vert_dist *= 0.7  # 上側を優遇
+            
+            total_dist = vert_dist + horiz_dist * 0.3
+            
+            if best_dist is None or total_dist < best_dist:
+                best_dist = total_dist
                 best = (ci, c)
 
-        if best:
+        if best and best_dist is not None and best_dist < 2000000:  # 距離制限
             ci, c = best
             used.add(ci)
             t.time = c.text
@@ -1869,14 +2090,20 @@ def fill_datetime_parts(payload, blocks=None):
             parts.dow = dow
 
     if session_times:
-        if len(session_times) == 1:
+        # イベント全体の時間（full_time）が優先
+        # 個別セッション時間は talks の time フィールドで管理
+        if full_time:
+            time_joined = full_time
+            newline = False
+        elif len(session_times) == 1:
             time_joined = session_times[0]
             newline = False
         else:
+            # 全体時間が不明で複数セッションがある場合のみ「〇回目」表記
             time_joined = ", ".join([f"{i+1}回目{t}" for i, t in enumerate(session_times)])
             newline = True
     else:
-        time_joined = full_time
+        time_joined = full_time or ""
         newline = False
 
     parts.time = time_joined
@@ -2444,12 +2671,30 @@ def normalize_key(s: str) -> str:
 
 
 ROLE_PREFIXES = [
-    "総合司会", "座長"
+    # 司会・進行系
+    "総合司会", "座長", "司会", "進行",
+    # 学術・医療肩書き
+    "教授", "准教授", "準教授", "客員教授", "名誉教授", "特任教授", "臨床教授",
+    "講師", "助教", "特任講師", "臨床講師", "助手",
+    # 医療機関肩書き
+    "院長", "副院長", "名誉院長", "理事長", "副理事長",
+    "部長", "副部長", "医長", "副医長", "課長", "副課長", "主任", "副主任",
+    "センター長", "科長", "室長", "技師長", "看護師長",
+    "診療部長", "診療科長", "診療科部長",
+    # 学会・組織肩書き
+    "会長", "副会長", "理事", "副理事", "監事", "評議員", "幹事", "委員長", "副委員長",
+    # 医師資格・専門医
+    "医師", "歯科医師", "薬剤師", "看護師", "専門医", "認定医", "指導医",
+    # その他
+    "博士", "Dr.", "Professor", "Prof.", "講 師", "教 授", "部 長"
 ]
 
 
 def strip_role_prefix(s: str) -> str:
+    """名前から肩書きを除去（前置・後置両方対応）"""
     x = normalize_space(s or "").replace("\n", "")
+    
+    # 前置肩書きの除去（繰り返し処理）
     changed = True
     while changed and x:
         changed = False
@@ -2457,6 +2702,16 @@ def strip_role_prefix(s: str) -> str:
             if x.startswith(p):
                 x = x[len(p):].strip()
                 changed = True
+    
+    # 後置肩書きの除去
+    changed = True
+    while changed and x:
+        changed = False
+        for p in ROLE_PREFIXES:
+            if x.endswith(p):
+                x = x[:-len(p)].strip()
+                changed = True
+    
     return x
 
 
@@ -2476,6 +2731,28 @@ def normalize_person_name(s: str) -> str:
     x = x.replace("　", " ")
     x = x.replace(" ", "")
     return x
+
+
+def normalize_affiliation(s: str) -> str:
+    """所属から肩書きを除去し、適切に正規化"""
+    x = normalize_space(s or "").replace("\n", " ")
+    
+    # 先頭の肩書き除去
+    changed = True
+    while changed and x:
+        changed = False
+        for p in ROLE_PREFIXES:
+            if x.startswith(p):
+                x = x[len(p):].strip()
+                changed = True
+                break
+    
+    # 「講 師」のようなスペース入り肩書きも除去
+    x = re.sub(r'^(講\s*師|教\s*授|部\s*長|院\s*長|課\s*長)\s*', '', x)
+    
+    # 医療用語の標準化は呼び出し元で実行（重複を避ける）
+    
+    return x.strip()
 
 
 def normalize_person_display(s: str) -> str:
@@ -2961,54 +3238,160 @@ def row_to_job_item(r) -> Dict[str, Any]:
 
 
 
-# ---------------- SQLite index ----------------
-
-# def db_connect() -> sqlite3.Connection:
-#     con = sqlite3.connect(DB_PATH)
-#     con.row_factory = sqlite3.Row
-#     return con
+# ---------------- Database Connection with Retry ----------------
 
 def db_connect():
-    # row_factory = dict_row で r["job_id"] 形式を維持
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    """
+    PostgreSQL接続をタイムアウト設定とリトライ機構付きで行う
+    """
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL is not set")
+        
+    for attempt in range(DB_RETRY_ATTEMPTS):
+        try:
+            logger.info(f"Database connection attempt {attempt + 1}/{DB_RETRY_ATTEMPTS}")
+            
+            # 接続パラメータにタイムアウト設定を追加
+            conn = psycopg.connect(
+                DATABASE_URL, 
+                row_factory=dict_row,
+                connect_timeout=DB_CONNECT_TIMEOUT,
+                options=f"-c statement_timeout={DB_QUERY_TIMEOUT}s"
+            )
+            
+            # 接続テスト
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            
+            logger.info("Database connection established successfully")
+            return conn
+            
+        except OperationalError as e:
+            error_msg = str(e)
+            logger.warning(f"Database connection attempt {attempt + 1} failed: {error_msg}")
+            
+            if attempt < DB_RETRY_ATTEMPTS - 1:
+                # 最後の試行でなければ待機
+                delay = DB_RETRY_DELAY * (2 ** attempt)  # 指数バックオフ
+                logger.info(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                # 最後の試行でも失敗した場合
+                logger.error(f"Database connection failed after {DB_RETRY_ATTEMPTS} attempts")
+                if "timed out" in error_msg.lower():
+                    raise OperationalError(
+                        f"Database connection timeout after {DB_RETRY_ATTEMPTS} attempts. "
+                        f"Please check network connectivity and database server status. "
+                        f"Original error: {error_msg}"
+                    )
+                else:
+                    raise
+                    
+        except Exception as e:
+            logger.error(f"Unexpected database connection error: {e}")
+            if attempt < DB_RETRY_ATTEMPTS - 1:
+                delay = DB_RETRY_DELAY * (2 ** attempt)
+                time.sleep(delay)
+            else:
+                raise
+
+def safe_db_operation(operation_func, *args, **kwargs):
+    """
+    データベース操作を安全に実行するヘルパー関数
+    """
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            return operation_func(*args, **kwargs)
+        except OperationalError as e:
+            if "connection" in str(e).lower() and attempt < max_retries - 1:
+                logger.warning(f"Database operation failed, retrying: {e}")
+                time.sleep(1)
+                continue
+            raise
+        except Exception:
+            raise
+
+class SafeDBConnection:
+    """
+    安全なデータベース接続のコンテキストマネージャー
+    """
+    def __init__(self, max_retries=2):
+        self.max_retries = max_retries
+        self.connection = None
+        
+    def __enter__(self):
+        def _get_connection():
+            self.connection = db_connect()
+            return self.connection
+            
+        return safe_db_operation(_get_connection)
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.connection:
+            try:
+                if exc_type is None:
+                    self.connection.commit()
+                else:
+                    self.connection.rollback()
+            except Exception as e:
+                logger.error(f"Error during connection cleanup: {e}")
+            finally:
+                try:
+                    self.connection.close()
+                except Exception as e:
+                    logger.error(f"Error closing connection: {e}")
+
+def safe_db_connect():
+    """
+    安全なデータベース接続のコンテキストマネージャーを返す
+    """
+    return SafeDBConnection()
 
 
 def init_db():
-    con = db_connect()
-    try:
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS jobs (
-            job_id TEXT PRIMARY KEY,
-            filename TEXT,
-            session_id TEXT,
-            event_id TEXT NOT NULL,     
-            status TEXT NOT NULL,                 -- ok / error
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
+    """データベース初期化（リトライ機構付き）"""
+    def _init_operation():
+        con = db_connect()
+        try:
+            logger.info("Initializing database tables...")
+            con.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                filename TEXT,
+                session_id TEXT,
+                event_id TEXT NOT NULL,     
+                status TEXT NOT NULL,                 -- ok / error
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
 
-            title TEXT,
-            organizer TEXT,
-            datetime TEXT,
-            
-            region TEXT,
-            unit TEXT,
+                title TEXT,
+                organizer TEXT,
+                datetime TEXT,
+                
+                region TEXT,
+                unit TEXT,
 
-            confidence REAL,
-            warnings_json TEXT,
+                confidence REAL,
+                warnings_json TEXT,
 
-            manual_override INTEGER NOT NULL DEFAULT 0,
-            note TEXT NOT NULL DEFAULT '',
-            locked INTEGER NOT NULL DEFAULT 0,
+                manual_override INTEGER NOT NULL DEFAULT 0,
+                note TEXT NOT NULL DEFAULT '',
+                locked INTEGER NOT NULL DEFAULT 0,
 
-            error_message TEXT
-            
-        );
-        """)
-        con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at);")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);")
-        con.commit()
-    finally:
-        con.close()
+                error_message TEXT
+            );
+            """)
+            con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at);")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);")
+            con.commit()
+            logger.info("Database tables initialized successfully")
+        finally:
+            con.close()
+
+    # 安全な実行でリトライ機構を利用
+    safe_db_operation(_init_operation)
 
 # def upsert_job_ok(
 #     job_id: str,
@@ -3652,8 +4035,14 @@ def split_name_affil_inline(text: str) -> tuple[str, str]:
         return "", ""
     raw_name = normalize_space(m.group(1))
     raw_aff = normalize_space(m.group(2))
+    
+    # 名前から肩書き除去
     key = norm_name(raw_name)
-    return key, raw_aff
+    
+    # 所属から肩書き除去
+    clean_aff = normalize_affiliation(raw_aff)
+    
+    return key, clean_aff
 
 def is_overall_datetime(tm: str, overall: str) -> bool:
     if not tm or not overall:
@@ -3869,7 +4258,9 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
                 continue
             s = normalize_space(b.text.replace("\n", " "))
             if looks_like_affil(s):
-                below.append((abs(b.top - nb.top), s))
+                # 所属から肩書き除去を適用
+                clean_s = normalize_affiliation(s)
+                below.append((abs(b.top - nb.top), clean_s))
         below.sort(key=lambda x: x[0])
         if below:
             mp[key] = below[0][1]
@@ -3891,6 +4282,9 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
             if not looks_like_affil(s):
                 continue
 
+            # 所属から肩書き除去を適用
+            clean_s = normalize_affiliation(s)
+
             cx = b.left + b.width / 2.0
             cy = b.top + b.height / 2.0
             nx = nb.left + nb.width / 2.0
@@ -3901,7 +4295,7 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
             dx = abs(cx - nx)
             dist = dx + dy * 0.6  # 下を優遇
 
-            cand.append((dist, s))
+            cand.append((dist, clean_s))
 
         cand.sort(key=lambda x: x[0])
         if cand:
@@ -4849,35 +5243,69 @@ def build_ai_prompt(
 
     draft_obj = json.loads(draft.model_dump_json() if hasattr(draft, "model_dump_json") else draft.json(ensure_ascii=False))
 
+    # 医療用語辞書を追加（精度向上のため）
+    medical_terms = {
+        "よくある肩書き": ["教授", "准教授", "講師", "助教", "医師", "部長", "課長", "主任", "センター長"],
+        "組織名パターン": ["大学", "病院", "クリニック", "医院", "研究所", "センター", "機構", "学会"],
+        "講演タイプ": ["特別講演", "招請講演", "教育講演", "シンポジウム", "ランチョンセミナー", "イブニングセミナー"],
+        "時間表記パターン": ["9:00~10:00", "13:30~14:30", "18:00~19:00"],
+        "講演として認識しない内容": [
+            "Opening Remarks", "Closing Remarks", "開会の辞", "閉会の辞", 
+            "開会挨拶", "閉会挨拶", "Welcome", "開催挨拶", "挨拶", 
+            "Break", "Coffee Break", "休憩", "Reception", "懇親会",
+            "Registration", "受付", "Photo Session", "集合写真",
+            "Discussion", "ディスカッション", "Q&A", "質疑応答",
+            "パネルディスカッション", "総合討論", "総合討議",
+            "Panel Discussion", "General Discussion"
+        ]
+    }
+
     # AIには「差分だけ」返させる
     # talks は draft と同じ長さ・同じ順序の配列で返す
     return f"""あなたは、日本語の医療セミナー案内スライドから抽出済みの下書きJSONを、
-根拠が明確な箇所だけ最小限修正するアシスタントです。
+根拠が明確な箇所だけ最小限修正する専門アシスタントです。
 
 # 最重要ルール
 - 出力は JSONのみ
-- 推測禁止
-- blocks に明示されていない内容は生成禁止
+- 推測禁止 - blocks に明示されていない内容は生成禁止
 - 下書きJSON(draft)をベースに、必要最小限だけ修正すること
 - draft にある情報を勝手に消さないこと
 - 不確実な場合は draft の値をそのまま残すこと
+- 医療用語の知識を活用して精度を向上させること
 
-# 配列・構造の固定ルール（厳守）
-- talks 配列の長さを変更してはいけない
-- talks の順序を変更してはいけない
-- talks を追加・削除してはいけない
-- event_title_lines の要素数を増減しないこと
-- draft に存在しない新しいフィールドを追加してはいけない
+# 重要: 講演ではない内容の除外
+下記のような内容は講演ではないので talks から除外してください：
+- "Opening Remarks", "Closing Remarks", "開会の辞", "閉会の辞"
+- "開会挨拶", "閉会挨拶", "Welcome", "開催挨拶", "挨拶"
+- "Break", "Coffee Break", "休憩", "Reception", "懇親会"
+- "Registration", "受付", "Photo Session", "集合写真"
+これらのタイトルを持つ talks 要素は配列から削除すること
 
-# 修正可能な項目
+# 医療セミナー特有の知識
+{json.dumps(medical_terms, ensure_ascii=False, indent=2)}
+
+# 配列・構造の調整ルール
+- talks から不適切な内容（挨拶、休憩等）は除外すること
+- 実際の講演のみを talks に含めること
+- talks の順序は時系列に従って調整可
+- event_title_lines の要素数は必要に応じて調整可
+
+# 修正可能な項目（根拠必須）
 - event_title_lines: blocks に明示根拠がある場合のみ微修正可
 - event_title: event_title_lines を "\\n" で結合したものにする
 - chair.role / chair.name / chair.affiliation: blocks に根拠がある場合のみ修正可
 - talks[i].title_lines: blocks に根拠がある場合のみ修正可
 - talks[i].speaker: speaker_map のキーに完全一致する名前に限り修正可
 - talks[i].affiliation: speaker_map[talks[i].speaker] の値のみ使用可
-- confidence: 0.0〜1.0 の範囲で設定可
+- confidence: 0.0〜1.0 の範囲で設定可（医療情報処理の確実性を反映）
 - warnings: 必要なら維持・追加可
+
+# 精度向上のための追加ガイドライン
+1. 講演者名は必ず「姓 名」形式で統一
+2. 所属は正式名称を優先（略称ではなく）
+3. 講演タイトルは改行を適切に保持
+4. 時間表記は「HH:MM~HH:MM」形式に統一
+5. 敬称（先生、教授など）は適切に処理
 
 # 修正禁止の項目
 - talks[i].time は変更禁止
@@ -4898,14 +5326,14 @@ def build_ai_prompt(
 # time_candidates（参考のみ。talk.time は変更禁止）
 {json.dumps(time_candidates, ensure_ascii=False, indent=2)}
 
-# 抽出ブロック
+# 抽出ブロック（位置情報も参考にして文脈を理解）
 {json.dumps(blocks_json, ensure_ascii=False, indent=2)}
 
 # 下書きJSON(draft)
 {json.dumps(draft_obj, ensure_ascii=False, indent=2)}
 
 # 出力形式
-- draft と同じ talks 件数・同じ順序で返すこと
+- 実際の講演のみを talks に含めること（挨拶、休憩等は除外）
 - 各 talks[i] は少なくとも以下を含めること:
   - time
   - title_lines
@@ -4914,6 +5342,7 @@ def build_ai_prompt(
 - event_title_lines は配列で返す
 - event_title は文字列で返す
 - JSON以外の文は禁止
+- 修正した項目については confidence を高めに設定
 """
 
 def normalize_chair_role(role: str) -> str:
@@ -5004,7 +5433,7 @@ def clean_ai_title_lines(lines: list[str]) -> list[str]:
 
 
 def clean_ai_talk_titles(payload: DesignJSON) -> DesignJSON:
-
+    """AI処理後のタイトルクリーニング + 医療用語標準化"""
     def _clean_title_text(s: str) -> str:
         s = normalize_space(s or "")
 
@@ -5018,6 +5447,9 @@ def clean_ai_talk_titles(payload: DesignJSON) -> DesignJSON:
         if s.count("(") > s.count(")"):
             s += ")"
 
+        # 医療用語の標準化を適用
+        s = normalize_medical_terms(s)
+
         return s.strip()
 
     for t in payload.talks or []:
@@ -5027,6 +5459,54 @@ def clean_ai_talk_titles(payload: DesignJSON) -> DesignJSON:
         if cleaned:
             t.title_lines = cleaned
             t.title = "\n".join(cleaned)
+            
+        # 講演者名・所属の肩書き除去と標準化
+        if t.speaker:
+            # 肩書き除去 → 医療用語標準化
+            cleaned_speaker = normalize_person_name(t.speaker)
+            t.speaker = normalize_medical_terms(cleaned_speaker).strip()
+        if t.affiliation:
+            # 所属から肩書き除去 → 医療用語標準化
+            cleaned_affiliation = normalize_affiliation(t.affiliation)
+            t.affiliation = normalize_medical_terms(cleaned_affiliation).strip()
+    
+    # 座長情報の肩書き除去と標準化
+    if payload.chair:
+        if payload.chair.name:
+            cleaned_chair_name = normalize_person_name(payload.chair.name)
+            payload.chair.name = normalize_medical_terms(cleaned_chair_name).strip()
+        if payload.chair.affiliation:
+            cleaned_chair_affiliation = normalize_affiliation(payload.chair.affiliation)
+            payload.chair.affiliation = normalize_medical_terms(cleaned_chair_affiliation).strip()
+        if payload.chair.role:
+            payload.chair.role = normalize_medical_terms(normalize_space(payload.chair.role)).strip()
+            
+    # 講演ではない内容を除外（Opening/Closing Remarks等）
+    if payload.talks:
+        non_lecture_keywords = [
+            "opening remarks", "closing remarks", "開会の辞", "閉会の辞",
+            "開会挨拶", "閉会挨拶", "welcome", "開催挨拶", "挨拶",
+            "break", "coffee break", "休憩", "reception", "懇親会",
+            "registration", "受付", "photo session", "集合写真",
+            "discussion", "ディスカッション", "q&a", "質疑応答",
+            "パネルディスカッション", "総合討論", "総合討議",
+            "panel discussion", "general discussion"
+        ]
+        
+        # フィルタリング: 講演として適切でない内容を除去
+        filtered_talks = []
+        for talk in payload.talks:
+            talk_title = (talk.title or "").lower().strip()
+            
+            # 講演タイトルが除外キーワードに該当するかチェック
+            is_non_lecture = any(keyword in talk_title for keyword in non_lecture_keywords)
+            
+            # タイトルが短すぎる場合（3文字以下）や空の場合も除外
+            if not is_non_lecture and len(talk_title.replace(" ", "")) > 3:
+                filtered_talks.append(talk)
+        
+        payload.talks = filtered_talks
+            
     return payload
 
 async def ai_refine_json(
@@ -5052,18 +5532,21 @@ async def ai_refine_json(
             {
                 "role": "system",
                 "content": (
-                    "Return ONLY valid JSON object. "
+                    "You are a medical seminar document processing specialist. "
+                    "Return ONLY valid JSON object based on the precise instructions. "
+                    "Focus on accuracy and consistency in medical terminology. "
                     "Do not add explanations. "
                     "Do not wrap in markdown."
                 ),
             },
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.0,
-        "top_p": 1,
-        "presence_penalty": 0,
-        "frequency_penalty": 0,
+        "temperature": 0.1,  # 少しだけ創造性を残して、より自然な結果を得る
+        "top_p": 0.9,        # 高品質なトークンを優先
+        "presence_penalty": -0.1,  # 医療用語の正確性を重視
+        "frequency_penalty": 0.1,  # 繰り返しを減らして品質向上
         "response_format": {"type": "json_object"},
+        "max_tokens": 4000,  # 十分な応答長を確保
     }
 
     async with httpx.AsyncClient(timeout=AI_TIMEOUT) as client:
@@ -5084,6 +5567,7 @@ async def ai_refine_json(
     content = (data["choices"][0]["message"]["content"] or "").strip()
 
     def _looks_bad_talk_seed_strong(t) -> bool:
+        """強化された講演データ品質チェック"""
         title_lines = getattr(t, "title_lines", None) or []
         title = normalize_space(getattr(t, "title", "") or "")
         speaker = normalize_space(getattr(t, "speaker", "") or "")
@@ -5099,18 +5583,35 @@ async def ai_refine_json(
         if not speaker:
             return True
 
-        # title語っぽい speaker
+        # 医療セミナー特有の無効パターンをチェック
         bad_speakers = {
             "課題", "腎移植", "逐次薬物治療", "治療", "講演", "演者",
-            "胆道", "肝内胆管癌治療", "肝外胆管癌治療"
+            "胆道", "肝内胆管癌治療", "肝外胆管癌治療", "休憩", "質疑応答",
+            "開会", "閉会", "挨拶", "司会", "座長", "コーヒーブレイク"
         }
         if speaker in bad_speakers:
+            return True
+
+        # 講演者名の妥当性チェック（日本人名のパターン）
+        if len(speaker.replace(" ", "").replace("　", "")) <= 1:
+            return True
+        
+        # 明らかに講演者でない文字列
+        if any(x in speaker for x in ["時間", "分", "場所", "会場", "Ｘ", "○", "●"]):
             return True
 
         # affiliation が無い or 生の演者行
         if not affiliation:
             return True
         if "演者" in affiliation and "先生" in affiliation:
+            return True
+            
+        # 所属の妥当性チェック
+        if len(affiliation.replace(" ", "").replace("　", "")) <= 2:
+            return True
+            
+        # タイトルの妥当性チェック
+        if any(x in full_title for x in ["休憩", "コーヒー", "質疑", "開会", "閉会"]):
             return True
 
         return False
@@ -5756,14 +6257,25 @@ def sort_talks_by_layout(blocks: list[TextBlock], talks: list[Talk]) -> list[Tal
     return [t for _, t in items]
 
 def assign_talk_times_by_nearest_upper_time(blocks: list[TextBlock], talks: list[Talk]) -> list[Talk]:
+    """講演の上側にある最も近い時間を割り当て"""
     time_blocks = []
     for b in blocks:
-        txt = normalize_time_colon(normalize_space(b.text or ""))
-        m = re.search(r"(\d{1,2}:\d{2})\s*[～〜~\-－]\s*(\d{1,2}:\d{2})", txt)
+        txt = _norm_time(b.text or "")
+        # 改善された正規表現を使用
+        m = TIME_RE.search(txt)
         if m:
-            time_blocks.append((b.top, b.left, f"{m.group(1)}~{m.group(2)}"))
+            start_time = m.group(1).replace(" ", "")
+            end_time = m.group(2).replace(" ", "")
+            # HH:MM形式に正規化
+            start_norm = re.sub(r"(\d{1,2}):(\d{2})", r"\1:\2", start_time)
+            end_norm = re.sub(r"(\d{1,2}):(\d{2})", r"\1:\2", end_time)
+            time_blocks.append((b.top, b.left, f"{start_norm}~{end_norm}"))
 
     for t in talks:
+        # 既に時間が設定されている場合はスキップ
+        if normalize_space(t.time):
+            continue
+            
         anchor_top = find_talk_anchor_top(blocks, t)
 
         best = None
@@ -5775,11 +6287,15 @@ def assign_talk_times_by_nearest_upper_time(blocks: list[TextBlock], talks: list
                 continue
 
             dist = anchor_top - top
+            # 距離制限を追加（あまり遠い時間は関連付けない）
+            if dist > 1500000:  # 15cm相当
+                continue
+                
             if best_score is None or dist < best_score:
                 best_score = dist
                 best = tm
 
-        if best and not normalize_space(t.time):
+        if best:
             t.time = best
 
     return talks
@@ -7757,16 +8273,16 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
 
     refined = repair_talks_from_blocks(refined, blocks)
     dump_titles("after repair_talks_from_blocks", refined)
-    for t in refined.talks:
-        t.time = ""
-
     refined = assign_talk_times_by_anchor(blocks, refined)
     dump_titles("after assign_talk_times_by_anchor", refined)
 
-    refined = assign_talk_times_by_order_fallback(refined, blocks)
-    dump_titles("after assign_talk_times_by_order_fallback", refined)
-
+    # 近接性による時間割り当て（既存の時間をリセットしない）
     refined = assign_talk_times_by_proximity(blocks, refined)
+    dump_titles("after assign_talk_times_by_proximity", refined)
+    
+    # 最終手段：上位の時間による割り当て
+    refined.talks = assign_talk_times_by_nearest_upper_time(blocks, refined.talks)
+    dump_titles("after assign_talk_times_by_nearest_upper_time", refined)
 
     def _same_person(a: str, b: str) -> bool:
         return normalize_key(a or "").replace("先生", "") == normalize_key(b or "").replace("先生", "")
@@ -8244,11 +8760,63 @@ app.add_middleware(
 
 app.mount("/fonts", StaticFiles(directory=str(APP_DIR / "fonts")), name="fonts")
 
+# データベース接続エラーのグローバルハンドラー
+@app.exception_handler(OperationalError)
+async def database_exception_handler(request: Request, exc: OperationalError):
+    error_msg = str(exc)
+    logger.error(f"Database operational error: {error_msg}")
+    
+    if "timed out" in error_msg.lower():
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "database_timeout",
+                "message": "データベースへの接続がタイムアウトしました。しばらく待ってから再試行してください。",
+                "details": "Database connection timeout. Please try again later."
+            }
+        )
+    elif "connection" in error_msg.lower():
+        return JSONResponse(
+            status_code=503, 
+            content={
+                "error": "database_connection_failed",
+                "message": "データベースに接続できません。システム管理者にお問い合わせください。",
+                "details": "Database connection failed. Please contact system administrator."
+            }
+        )
+    else:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "database_error",
+                "message": "データベースエラーが発生しました。",
+                "details": f"Database error: {error_msg}"
+            }
+        )
+
 @app.on_event("startup")
 async def startup():
     global _cached_template, _pw, _browser
 
-    init_db()
+    # データベース初期化（エラーハンドリング付き）
+    try:
+        logger.info("Starting database initialization...")
+        init_db()
+        logger.info("Database initialization completed successfully")
+    except OperationalError as e:
+        error_msg = f"Database connection failed during startup: {e}"
+        logger.error(error_msg)
+        if "timed out" in str(e).lower():
+            logger.error("This appears to be a connection timeout issue. Please check:")
+            logger.error("1. Network connectivity to the database server")
+            logger.error("2. Database server status")
+            logger.error("3. Firewall settings")
+            logger.error("4. DATABASE_URL configuration")
+        raise RuntimeError(error_msg) from e
+    except Exception as e:
+        error_msg = f"Unexpected error during database initialization: {e}"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg) from e
 
     if not TEMPLATE_PATH.exists():
         raise RuntimeError(f"template.html not found: {TEMPLATE_PATH}")
