@@ -4182,8 +4182,10 @@ def extract_event_title_lines_from_blocks(blocks: List[TextBlock]) -> List[str]:
     def title_head_score(b: TextBlock) -> tuple:
         s = normalize_space(b.text)
         dt_penalty = 1 if looks_like_date_title_block(s) else 0
-        # penalty が小さい方が優先、次にフォント、次に上側
-        return (dt_penalty, -(b.max_font_pt or 0), b.top)
+        # フォントサイズは1pt単位で丸める（36.0 vs 36.03 の誤差吸収）
+        rounded_pt = round(b.max_font_pt or 0)
+        # penalty が小さい方が優先、次にフォント（大きい方優先）、次に上側
+        return (dt_penalty, -rounded_pt, b.top)
 
     def clean_title_text(s: str) -> str:
         s = normalize_space(s)
