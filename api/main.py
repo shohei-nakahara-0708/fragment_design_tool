@@ -211,15 +211,17 @@ TYPESET_JS = r"""
   const isOnlySymbols = (s) => {
     const t = oneLine(s);
     if (!t) return false;
-    return /^[~〜～\-–—−－・･:：,，/／()（）]+$/.test(t);
+    return /^[~〜～\-–—―−－・･:：,，/／()（）]+$/.test(t);
   };
 
   const startsWithWeakSymbol = (s) => {
     const t = oneLine(s);
-    return /^[~〜～\-–—−－:：,，/／]+/.test(t);
+    return /^[~〜～\-–—―−－:：,，/／]+/.test(t);
   };
 
   // title_lines を join するときに記号前の余計な空白を作らない
+  const isJpChar = (ch) => /[ぁ-んァ-ヶー一-龠々〇\u4E00-\u9FFF]/.test(ch || "");
+
   const joinTitleLinesSmart = (lines) => {
     const arr = (lines || []).map(x => oneLine(x)).filter(Boolean);
     if (!arr.length) return "";
@@ -229,7 +231,10 @@ TYPESET_JS = r"""
       const cur = arr[i];
 
       // 記号始まりの行は前に空白を入れない
-      if (/^[~〜～\-–—−－・･:：/／]/.test(cur)) {
+      if (/^[~〜～\-–—―−－・･:：/／]/.test(cur)) {
+        out += cur;
+      // 日本語同士の結合はスペース不要
+      } else if (isJpChar(out[out.length - 1]) && isJpChar(cur[0])) {
         out += cur;
       } else {
         out += " " + cur;
@@ -322,6 +327,7 @@ TYPESET_JS = r"""
       { pattern: /−/g, priority: 1 },
       { pattern: /–/g, priority: 1 },
       { pattern: /—/g, priority: 1 },
+      { pattern: /―/g, priority: 1 },
       // 高優先度：長い文章の自然な区切り
       { pattern: /における/g, priority: 2 },
       { pattern: /について/g, priority: 2 },
@@ -367,6 +373,10 @@ TYPESET_JS = r"""
         
         if (!inMedicalTerm && !isMidWord(s, pos)) {
           out.push({ pos, priority: breakItem.priority });
+          // 全角ダッシュはダッシュの前でも改行できるようにする
+          if (/[–—―−－]/.test(match[0]) && match.index > 0) {
+            out.push({ pos: match.index, priority: breakItem.priority });
+          }
         }
       }
     }
@@ -383,7 +393,7 @@ TYPESET_JS = r"""
     };
 
     // 前後に空白がある dash だけ候補にする
-    const dashAroundSpaceRe = /\s[-–—−－]\s/g;
+    const dashAroundSpaceRe = /\s[-–—―−－]\s/g;
     let m;
     while ((m = dashAroundSpaceRe.exec(s)) !== null) {
       out.push({ pos: m.index + 1, priority: 2 });
@@ -469,7 +479,7 @@ TYPESET_JS = r"""
     if (!s) return null;
 
     // " - " / " – " / " — "
-    let m = /\s[-–—−－]\s/.exec(s);
+    let m = /\s[-–—―−－]\s/.exec(s);
     if (m && m.index > 0) {
       const p = m.index + 1;
       return [s.slice(0, p).trimEnd(), s.slice(p).trimStart()];
@@ -486,8 +496,23 @@ TYPESET_JS = r"""
       return [s.slice(0, idx).trimEnd(), s.slice(idx).trimStart()];
     }
 
+    // full-width dash (スペースなしでもサブタイトル区切りとみなす)
+    const fwDashSubRe = /[–—―−－]/g;
+    let fwm;
+    while ((fwm = fwDashSubRe.exec(s)) !== null) {
+      const p = fwm.index;
+      if (p <= 1) continue;
+      const before = s.slice(0, p).trim();
+      const after  = s.slice(p).trim();
+      // after が閉じダッシュだけ(eg "―")でなく実質的内容を持つか
+      const afterCore = after.replace(/^[–—―−－\s]+/, "").replace(/[–—―−－\s]+$/, "");
+      if (before.length > 2 && afterCore.length > 2) {
+        return [before, after];
+      }
+    }
+
     // dash fallback: 語中ハイフンは避ける
-    const dashRe = /[-–—−－]/g;
+    const dashRe = /[-–—―−－]/g;
     while ((m = dashRe.exec(s)) !== null) {
       const p = m.index;
       const prev = s[p - 1] || "";
@@ -598,7 +623,7 @@ TYPESET_JS = r"""
     if (idx === total - 1 && startsWithWeakSymbol(t) && t.length <= 2) p += 50000;
 
     // 先頭が記号っぽい（ただし医学用語の一部なら軽減）
-    if (/^[-–—−－:：,，/／]+/.test(t)) {
+    if (/^[-–—―−－:：,，/／]+/.test(t)) {
       const hasImportantContent = medicalTerms.some(term => t.includes(term));
       p += hasImportantContent ? 200 : 700;
     }
@@ -754,7 +779,7 @@ TYPESET_JS = r"""
       }
       
       // ダッシュ記号での改行は高スコア（自然なサブタイトル区切り）
-      if (/[－−–—]/.test(s.slice(Math.max(0, p-3), p+1))) {
+      if (/[－−–—―]/.test(s.slice(Math.max(0, p-3), p+1))) {
         score -= 500;
       }
 
