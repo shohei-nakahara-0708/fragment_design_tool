@@ -5401,14 +5401,7 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             return bool(_extract_name_anywhere(s2))
 
         def is_chair_area_name(s: str) -> bool:
-            """座長エリアの人名かどうかをチェック"""
-            # 現在処理中のテキストが座長名前と一致するかチェック
-            if payload.chair and payload.chair.name:
-                chair_name_key = normalize_key(payload.chair.name)
-                s_key = normalize_key(s.replace("先生", ""))
-                if chair_name_key and chair_name_key in s_key:
-                    return True
-            
+            """座長エリアの人名かどうかをチェック"""            
             lines = [normalize_space(x) for x in str(s or "").split("\n") if normalize_space(x)]
             # 同じブロック内に「座長」が含まれているかチェック
             for line in lines:
@@ -5597,21 +5590,13 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                         else:
                             speaker = norm_name(sp2)
                     if aff2 and sp2:
-                        # 座長の名前が含まれる場合は所属も除外
-                        sp2_key = normalize_key(sp2)
-                        chair_name_key = normalize_key(payload.chair.name if payload.chair else "")
-                        if not (chair_name_key and sp2_key == chair_name_key):
-                            clean_aff = normalize_affiliation(aff2)
-                            if clean_aff:
-                                aff_candidates.append(clean_aff)
+                        clean_aff = normalize_affiliation(aff2)
+                        if clean_aff:
+                            aff_candidates.append(clean_aff)
                     else:
-                        # テキスト全体をチェックして座長情報が含まれていないかチェック
-                        chair_name_key = normalize_key(payload.chair.name if payload.chair else "")
-                        s_key = normalize_key(s)
-                        if not (chair_name_key and chair_name_key in s_key):
-                            clean_s = normalize_affiliation(s)
-                            if clean_s:
-                                aff_candidates.append(clean_s)
+                        clean_s = normalize_affiliation(s)
+                        if clean_s:
+                            aff_candidates.append(clean_s)
 
             # affiliation確定
             if not affiliation and aff_candidates:
@@ -5636,23 +5621,8 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
 
             print(affiliation)
 
-            # speaker確定：座長と同じ名前は避ける
-            if speaker and payload.chair and payload.chair.name:
-                chair_name_key = normalize_key(payload.chair.name)
-                speaker_key = normalize_key(speaker)
-                if speaker_key == chair_name_key:
-                    # 座長と同じ名前の演者を回避 - 別の演者を探す
-                    alternate_speaker = ""
-                    for s in seg_lines:
-                        if is_aff_line(s):
-                            sp2, _ = split_speaker_affiliation_fuzzy(s)
-                            if sp2:
-                                sp2_key = normalize_key(sp2)
-                                if sp2_key != chair_name_key:
-                                    alternate_speaker = norm_name(sp2)
-                                    break
-                    if alternate_speaker:
-                        speaker = alternate_speaker
+            # speaker確定（座長との重複チェックは後の処理で実行）
+            # この段階では座長情報がないため、単純に演者として設定
           
             # タイトル fallback: 「演題」ラベルが無いテンプレ用
             if not title_lines:
