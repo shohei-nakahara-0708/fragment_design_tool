@@ -712,18 +712,10 @@ TYPESET_JS = r"""
       }
     }
 
-    // one line - カラム落ち防止のため、より厳しい幅制限を適用
-    const safeMaxPx = enableEarlyBreak ? maxPx * 0.9 : maxPx; // 早期改行モードでは10%のバッファ
+    // one line - 実際にmaxPxに収まるなら1行で返す
     const currentWidth = measure(s, style);
     
-    // デバッグ情報（必要に応じて削除）
-    try {
-      console.log(`[WRAP] Text: "${s.slice(0, 50)}..." | Width: ${currentWidth} | Max: ${maxPx} | SafeMax: ${safeMaxPx}`);
-    } catch (e) {
-      console.log('[WRAP] Debug log failed:', e);
-    }
-    
-    if (currentWidth <= safeMaxPx) return [s];
+    if (currentWidth <= maxPx) return [s];
 
     const cand = breakPositions(s);
     try {
@@ -746,9 +738,7 @@ TYPESET_JS = r"""
       const wa = measure(a, style);
       const wb = measure(b, style);
       
-      // カラム落ち防止のため、より厳しい幅チェック
-      const safeMaxForLine = enableEarlyBreak ? maxPx * 0.95 : maxPx;
-      if (wa > safeMaxForLine || wb > safeMaxForLine) continue;
+      if (wa > maxPx || wb > maxPx) continue;
 
       // 早期改行判定：カラム落ちリスクがある場合は優先的に採用
       const isEarlyBreakCandidate = enableEarlyBreak && shouldEarlyBreak(s, p, maxPx, style);
@@ -846,11 +836,11 @@ TYPESET_JS = r"""
   // =========================================================
   // スマートな幅計算：カラム落ちを防ぐ安全マージン付き
   const getSmartMaxWidth = (maxPx, context = 'normal') => {
-    // コンテキストに応じた安全マージン
+    // コンテキストに応じた安全マージン（改行時の各行の上限）
     const margins = {
-      'hero': 0.92,    // イベントタイトル：8%マージン
-      'talk': 0.94,    // 演題タイトル：6%マージン  
-      'normal': 0.95   // 通常：5%マージン
+      'hero': 0.96,    // イベントタイトル：4%マージン
+      'talk': 0.96,    // 演題タイトル：4%マージン  
+      'normal': 0.97   // 通常：3%マージン
     };
     
     const margin = margins[context] || margins.normal;
@@ -941,7 +931,9 @@ TYPESET_JS = r"""
   // =========================================================
   const wrapEl = document.querySelector(".wrap");
   const wrapW = wrapEl ? wrapEl.clientWidth : 600;
-  const talkMax = (wrapW - 28 - 102);
+  // pill(74px) + gap(24px) = 98px → content area = wrapW - 98
+  const contentMax = wrapW - 98;
+  const talkMax = contentMax;
 
   // =========================================================
   // styles
@@ -958,6 +950,37 @@ TYPESET_JS = r"""
     fontWeight: 700,
     fontSize: "25px",
     letterSpacing: "normal"
+  };
+
+  const affStyle = {
+    fontFamily: "Invention JP",
+    fontWeight: 700,
+    fontSize: "16px",
+    letterSpacing: "normal"
+  };
+
+  const chairAffStyle = {
+    fontFamily: "Invention JP",
+    fontWeight: 700,
+    fontSize: "16px",
+    letterSpacing: "normal"
+  };
+
+  // 所属テキストのスマート改行
+  const wrapAffiliation = (text, maxPx, style) => {
+    const s = oneLine(text);
+    if (!s) return "";
+    const w = measure(s, style);
+    if (w <= maxPx) return s;
+
+    // 所属テキスト用の改行候補を生成
+    const lines = wrapPx(s, maxPx, style, 3, {
+      forceSubtitle2ndHead: false,
+      preferBalancedAscii: false,
+      avoidSingleWordLastLine: false,
+      enableEarlyBreak: false,
+    });
+    return lines.join("\n");
   };
 
   // =========================================================
@@ -1007,7 +1030,9 @@ console.log('Event title processing completed:', JSON.stringify(evLines));
   // chair
   // =========================================================
   if (data.chair) {
-    data.chair.affiliation = normalizeAffiliation(data.chair.affiliation ?? "");
+    const rawChairAff = normalizeAffiliation(data.chair.affiliation ?? "");
+    // 座長所属のスマート改行（pill 74px + gap 24px = 98px を引いた領域）
+    data.chair.affiliation = wrapAffiliation(rawChairAff, contentMax, chairAffStyle);
   }
 
   // =========================================================
@@ -1015,184 +1040,50 @@ console.log('Event title processing completed:', JSON.stringify(evLines));
   // =========================================================
 if (Array.isArray(data.talks)) {
   console.log('Processing talks started');
-  console.log('==== JAVASCRIPT IS WORKING FOR TALKS ===='); // 確実に見えるログ
   console.log('Talks length:', data.talks.length);
   
+  // 講演タイトル・所属のピクセルベース改行
+  const talkTitleMax = getSmartMaxWidth(talkMax, 'talk');
+  const talkAffMax = contentMax; // 所属は pill(74) + gap(24) の右側
+
   data.talks = data.talks.map((t, index) => {
     const rawTitleLines =
       Array.isArray(t?.title_lines) && t.title_lines.length
         ? t.title_lines.map(x => oneLine(x)).filter(Boolean)
         : [oneLine(t?.title ?? "")].filter(Boolean);
 
-    // ★ 基本的な改行処理：ダッシュで分割
-    let title_lines = [];
     let debug_info = {};
-    
+
+    // ★ ピクセルベースのスマート改行
+    let title_lines = [];
     if (rawTitleLines.length > 0) {
-      const combinedTitle = rawTitleLines.join(" ");
+      // タイトル行を結合（記号始まりの行は空白なしで結合）
+      const combinedTitle = joinTitleLinesSmart(rawTitleLines);
       debug_info.original_title = combinedTitle;
       debug_info.title_length = combinedTitle.length;
-      
-      // より積極的な改行処理
-      const dashPattern = /([－−–—])/;
-      
-      if (dashPattern.test(combinedTitle)) {
-        debug_info.has_dash = true;
-        const parts = combinedTitle.split(dashPattern);
-        if (parts.length === 3) {
-          let firstLine = parts[0].trim();
-          let secondLine = parts[1] + parts[2].trim();
-          
-          debug_info.dash_split_result = [firstLine, secondLine];
-          
-          // 2行目が長すぎる場合（20文字以上）、さらに分割
-          if (secondLine.length > 20) {
-            debug_info.second_line_too_long = true;
-            debug_info.second_line_length = secondLine.length;
-            
-            // 「を含めた」で分割を試す
-            if (secondLine.includes('を含めた')) {
-              const splitPoint = secondLine.indexOf('を含めた') + 4;
-              title_lines = [
-                firstLine,
-                secondLine.substring(0, splitPoint),
-                secondLine.substring(splitPoint)
-              ];
-              debug_info.split_method = "を含めた";
-            }
-            // 「に関する」で分割を試す  
-            else if (secondLine.includes('に関する')) {
-              const splitPoint = secondLine.indexOf('に関する') + 4;
-              title_lines = [
-                firstLine,
-                secondLine.substring(0, splitPoint),
-                secondLine.substring(splitPoint)
-              ];
-              debug_info.split_method = "に関する";
-            }
-            // スペースで分割を試す
-            else if (secondLine.includes(' ')) {
-              const spaceIndex = secondLine.indexOf(' ');
-              if (spaceIndex > 5 && spaceIndex < secondLine.length - 5) {
-                title_lines = [
-                  firstLine,
-                  secondLine.substring(0, spaceIndex),
-                  secondLine.substring(spaceIndex + 1)
-                ];
-                debug_info.split_method = "space";
-              } else {
-                title_lines = [firstLine, secondLine];
-                debug_info.split_method = "space_unsuitable";
-              }
-            } else {
-              title_lines = [firstLine, secondLine];
-              debug_info.split_method = "none_available";
-            }
-          } else {
-            title_lines = [firstLine, secondLine];
-            debug_info.second_line_ok = true;
-          }
-        } else {
-          title_lines = [combinedTitle];
-          debug_info.dash_split_failed = true;
-        }
-      } else {
-        debug_info.has_dash = false;
-        // ダッシュがない場合も長い場合は分割
-        if (combinedTitle.length > 18) {
-          debug_info.long_title_no_dash = true;
-          
-          // コロンで分割を試す
-          if (combinedTitle.includes('：')) {
-            const colonIndex = combinedTitle.indexOf('：');
-            const firstPart = combinedTitle.substring(0, colonIndex + 1);
-            const secondPart = combinedTitle.substring(colonIndex + 1);
-            title_lines = [firstPart, secondPart];
-            debug_info.split_method = "colon";
-            debug_info.colon_split_result = [firstPart, secondPart];
-          }
-          // 波ダッシュ（～）で分割を試す
-          else if (combinedTitle.includes('～')) {
-            const tildeIndex = combinedTitle.indexOf('～');
-            // 波ダッシュが先頭近くにある場合は前の文字も含める
-            if (tildeIndex > 8) {
-              const firstPart = combinedTitle.substring(0, tildeIndex);
-              const secondPart = '～' + combinedTitle.substring(tildeIndex + 1);
-              title_lines = [firstPart.trim(), secondPart.trim()];
-              debug_info.split_method = "tilde";
-              debug_info.tilde_split_result = [firstPart.trim(), secondPart.trim()];
-            } else {
-              title_lines = [combinedTitle];
-              debug_info.tilde_too_early = true;
-            }
-          }
-          // スペースで分割を試す（「考える HIF-2α」のようなパターン）
-          else if (combinedTitle.includes(' ')) {
-            const spaceIndex = combinedTitle.indexOf(' ');
-            // スペースが適切な位置にある場合
-            if (spaceIndex > 8 && spaceIndex < combinedTitle.length - 8) {
-              const firstPart = combinedTitle.substring(0, spaceIndex);
-              const secondPart = combinedTitle.substring(spaceIndex + 1);
-              title_lines = [firstPart.trim(), secondPart.trim()];
-              debug_info.split_method = "space";
-              debug_info.space_split_result = [firstPart.trim(), secondPart.trim()];
-            } else {
-              title_lines = [combinedTitle];
-              debug_info.space_position_bad = true;
-            }
-          }
-          // 「と」で分割を試す（長い場合の最後の手段）
-          else if (combinedTitle.length > 25 && combinedTitle.includes('と')) {
-            const indices = [];
-            for (let i = 0; i < combinedTitle.length; i++) {
-              if (combinedTitle[i] === 'と') {
-                indices.push(i);
-              }
-            }
-            // 中央付近の「と」を選択
-            const midPoint = combinedTitle.length / 2;
-            let bestIndex = -1;
-            let minDistance = Infinity;
-            for (const idx of indices) {
-              const distance = Math.abs(idx - midPoint);
-              if (distance < minDistance && idx > 8 && idx < combinedTitle.length - 5) {
-                minDistance = distance;
-                bestIndex = idx;
-              }
-            }
-            if (bestIndex !== -1) {
-              const firstPart = combinedTitle.substring(0, bestIndex + 1);
-              const secondPart = combinedTitle.substring(bestIndex + 1);
-              title_lines = [firstPart, secondPart];
-              debug_info.split_method = "particle_to";
-              debug_info.particle_split_result = [firstPart, secondPart];
-            } else {
-              title_lines = [combinedTitle];
-              debug_info.no_suitable_particle = true;
-            }
-          } else {
-            title_lines = [combinedTitle];
-            debug_info.no_split_method_found = true;
-          }
-        } else {
-          title_lines = [combinedTitle];
-          debug_info.title_not_long = true;
-        }
+
+      // wrapTalkTitle でピクセル実測ベースの改行
+      title_lines = wrapTalkTitle(combinedTitle, talkMax, talkStyle);
+      debug_info.split_method = "pixel_wrap";
+
+      if (!title_lines.length) {
+        title_lines = rawTitleLines;
+        debug_info.split_method = "fallback";
       }
-      
-      debug_info.final_result = title_lines;
     } else {
       title_lines = t.title_lines?.length ? t.title_lines : rawTitleLines;
     }
 
-    const affiliation = normalizeAffiliation(String(t?.affiliation ?? ""));
+    // ★ 所属テキストのピクセルベース改行
+    const rawAff = normalizeAffiliation(String(t?.affiliation ?? ""));
+    const affiliation = wrapAffiliation(rawAff, talkAffMax, affStyle);
 
     return {
       ...t,
       title_lines,
       title: title_lines.join("\n"),
       affiliation,
-      _debug: debug_info  // デバッグ情報を追加
+      _debug: debug_info
     };
   });
   
@@ -6335,6 +6226,23 @@ def clean_ai_talk_titles(payload: DesignJSON) -> DesignJSON:
     for t in payload.talks or []:
         lines = t.title_lines or []
         cleaned = [_clean_title_text(x) for x in lines if _clean_title_text(x)]
+
+        # 複数行にまたがる外側カッコの除去
+        # 例: ['『(仮)循環器医こそ…', 'つかいどころ』'] → カッコ除去
+        if len(cleaned) >= 2:
+            first = cleaned[0]
+            last = cleaned[-1]
+            for open_q, close_q in [('「', '」'), ('『', '』')]:
+                if first.startswith(open_q) and last.endswith(close_q):
+                    # 内部の開閉カッコ数をチェック
+                    joined = "\n".join(cleaned)
+                    inner = joined[1:-1]
+                    if inner.count(open_q) == inner.count(close_q):
+                        cleaned[0] = first[1:]  # 先頭行の開きカッコ除去
+                        cleaned[-1] = last[:-1]  # 最終行の閉じカッコ除去
+                        # 空行になった場合は除去
+                        cleaned = [x for x in cleaned if x.strip()]
+                        break
 
         if cleaned:
             t.title_lines = cleaned
