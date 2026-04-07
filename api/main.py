@@ -168,6 +168,16 @@ ORG_CANON = {
 SESSION_TIME_RE = re.compile(r"[①②③④⑤⑥⑦⑧⑨⑩]?\s*(\d{1,2}[:：]\d{2}\s*[～〜\-ー~]\s*\d{1,2}[:：]\d{2})")
 TYPESET_JS = r"""
 ({ data }) => {
+  try {
+    console.log('=== TYPESET_JS EXECUTION START ===');
+    console.log('JavaScript is running successfully');
+    console.log('Data object exists:', !!data);
+    console.log('Talks array exists:', !!data.talks);
+    console.log('Talks count:', data.talks?.length || 0);
+  } catch (e) {
+    console.log('CRITICAL ERROR in initial log:', e);
+  }
+  
   // =========================================================
   // helpers: normalize
   // =========================================================
@@ -275,6 +285,25 @@ TYPESET_JS = r"""
         : [" ", "、", "。", ",", "，", ":", "：", "/", "／"]
     );
 
+    // 英語の単語境界を検出する関数
+    const isWordBoundary = (str, index) => {
+      if (index <= 0 || index >= str.length) return false;
+      const before = str[index - 1];
+      const after = str[index];
+      // アルファベットから非アルファベット、またはその逆の境界
+      const beforeIsAlpha = /[a-zA-Z]/.test(before);
+      const afterIsAlpha = /[a-zA-Z]/.test(after);
+      return (beforeIsAlpha && !afterIsAlpha) || (!beforeIsAlpha && afterIsAlpha);
+    };
+
+    // 英語の单語途中かどうかチェック
+    const isMidWord = (str, index) => {
+      if (index <= 0 || index >= str.length) return false;
+      const before = str[index - 1];
+      const after = str[index];
+      return /[a-zA-Z]/.test(before) && /[a-zA-Z]/.test(after);
+    };
+
     // 医学用語・専門用語のパターン（途中で改行を避けるべき）
     const medicalTerms = [
       /GLP-1受容体作動薬/, /SGLT-2阻害薬/, /DPP-4阻害薬/, 
@@ -286,11 +315,31 @@ TYPESET_JS = r"""
       /webセミナー/, /Webセミナー/, /WEBセミナー/,
     ];
 
-    // 意味のある境界で改行候補を追加
+    // 意味のある境界で改行候補を追加（優先順位付き）
     const meaningfulBreaks = [
-      /における/, /について/, /に関する/, /による/, /からの/, 
-      /への/, /との/, /での/, /としての/, /という/,
-      /〜/, /～/, /から/, /まで/, /より/, /など/,
+      // 最高優先度：サブタイトル記号（医学文書でよく使用）
+      { pattern: /－/g, priority: 1 },
+      { pattern: /−/g, priority: 1 },
+      { pattern: /–/g, priority: 1 },
+      { pattern: /—/g, priority: 1 },
+      // 高優先度：長い文章の自然な区切り
+      { pattern: /における/g, priority: 2 },
+      { pattern: /について/g, priority: 2 },
+      { pattern: /に関する/g, priority: 2 },
+      { pattern: /による/g, priority: 3 },
+      { pattern: /からの/g, priority: 3 },
+      { pattern: /への/g, priority: 3 },
+      { pattern: /との/g, priority: 3 },
+      { pattern: /での/g, priority: 3 },
+      { pattern: /としての/g, priority: 3 },
+      { pattern: /という/g, priority: 3 },
+      // 中優先度：接続詞的な表現
+      { pattern: /〜/g, priority: 4 },
+      { pattern: /～/g, priority: 4 },
+      { pattern: /から/g, priority: 4 },
+      { pattern: /まで/g, priority: 4 },
+      { pattern: /より/g, priority: 4 },
+      { pattern: /など/g, priority: 4 },
     ];
 
     // 基本的な区切り文字での改行候補
@@ -300,7 +349,8 @@ TYPESET_JS = r"""
     }
 
     // 意味のある境界での改行候補（医学用語の途中でなければ）
-    for (const pattern of meaningfulBreaks) {
+    for (const breakItem of meaningfulBreaks) {
+      const pattern = breakItem.pattern;
       let match;
       while ((match = pattern.exec(s)) !== null) {
         const pos = match.index + match[0].length;
@@ -315,18 +365,29 @@ TYPESET_JS = r"""
           }
         }
         
-        if (!inMedicalTerm) {
-          out.push(pos);
+        if (!inMedicalTerm && !isMidWord(s, pos)) {
+          out.push({ pos, priority: breakItem.priority });
         }
       }
     }
+
+    // 医学用語の途中かどうかチェックするヘルパー関数
+    const isMedicalTermMiddle = (str, index) => {
+      for (const medPattern of medicalTerms) {
+        const medMatch = str.match(medPattern);
+        if (medMatch && index > medMatch.index && index < medMatch.index + medMatch[0].length) {
+          return true;
+        }
+      }
+      return false;
+    };
 
     // 前後に空白がある dash だけ候補にする
     const dashAroundSpaceRe = /\s[-–—−－]\s/g;
     let m;
     while ((m = dashAroundSpaceRe.exec(s)) !== null) {
-      out.push(m.index + 1);
-      out.push(m.index + m[0].length - 1);
+      out.push({ pos: m.index + 1, priority: 2 });
+      out.push({ pos: m.index + m[0].length - 1, priority: 2 });
     }
 
     // 助詞の後（ただし医学用語の途中でなければ）
@@ -344,10 +405,40 @@ TYPESET_JS = r"""
         }
       }
       
-      if (!inMedicalTerm) {
-        out.push(pos);
+      if (!inMedicalTerm && !isMidWord(s, pos)) {
+        out.push({ pos, priority: 4 }); // 助詞は低優先度
       }
     }
+
+    // 基本的な区切り文字での改行候補を優先度付きで追加
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (breakers.has(ch)) {
+        const pos = i + 1;
+        // 英語の単語途中での改行を避ける
+        if (!isMidWord(s, pos)) {
+          out.push({ pos, priority: ch === '、' || ch === '，' ? 1 : (ch === ' ' ? 2 : 3) });
+        }
+      }
+    }
+
+    // 英語の単語境界を明示的に追加（日本語混在テキスト用）
+    for (let i = 1; i < s.length; i++) {
+      if (isWordBoundary(s, i) && !isMedicalTermMiddle(s, i)) {
+        out.push({ pos: i, priority: 3 });
+      }
+    }
+
+    // priorityでソート、同じpriorityなら位置順
+    out.sort((a, b) => {
+      if (typeof a === 'number') a = { pos: a, priority: 5 }; // 既存の数値は低優先度に
+      if (typeof b === 'number') b = { pos: b, priority: 5 };
+      return a.priority - b.priority || a.pos - b.pos;
+    });
+
+    // 位置のみを返す（重複除去）
+    const positions = [...new Set(out.map(item => typeof item === 'number' ? item : item.pos))];
+    return positions.sort((a, b) => a - b);
 
     return Array.from(new Set(out)).sort((a, b) => a - b);
   };
@@ -589,6 +680,7 @@ TYPESET_JS = r"""
       forceSubtitle2ndHead = false,
       preferBalancedAscii = false,
       avoidSingleWordLastLine = false,
+      enableEarlyBreak = false,
     } = opts;
 
     // subtitle rule
@@ -620,10 +712,26 @@ TYPESET_JS = r"""
       }
     }
 
-    // one line
-    if (measure(s, style) <= maxPx) return [s];
+    // one line - カラム落ち防止のため、より厳しい幅制限を適用
+    const safeMaxPx = enableEarlyBreak ? maxPx * 0.9 : maxPx; // 早期改行モードでは10%のバッファ
+    const currentWidth = measure(s, style);
+    
+    // デバッグ情報（必要に応じて削除）
+    try {
+      console.log(`[WRAP] Text: "${s.slice(0, 50)}..." | Width: ${currentWidth} | Max: ${maxPx} | SafeMax: ${safeMaxPx}`);
+    } catch (e) {
+      console.log('[WRAP] Debug log failed:', e);
+    }
+    
+    if (currentWidth <= safeMaxPx) return [s];
 
     const cand = breakPositions(s);
+    try {
+      console.log(`[WRAP] Break candidates: ${cand.length} positions found`);
+    } catch (e) {
+      console.log('[WRAP] Candidates debug failed:', e);
+    }
+    
     let best = null;
     let bestScore = null;
 
@@ -637,12 +745,30 @@ TYPESET_JS = r"""
 
       const wa = measure(a, style);
       const wb = measure(b, style);
-      if (wa > maxPx || wb > maxPx) continue;
+      
+      // カラム落ち防止のため、より厳しい幅チェック
+      const safeMaxForLine = enableEarlyBreak ? maxPx * 0.95 : maxPx;
+      if (wa > safeMaxForLine || wb > safeMaxForLine) continue;
+
+      // 早期改行判定：カラム落ちリスクがある場合は優先的に採用
+      const isEarlyBreakCandidate = enableEarlyBreak && shouldEarlyBreak(s, p, maxPx, style);
 
       if (avoidSingleWordLastLine && isMostlyAscii(b) && wordCount(b) === 1) continue;
 
       const lines = [a, b];
-      const score = scoreLines(lines, maxPx, style, { preferBalancedAscii });
+      let score = scoreLines(lines, maxPx, style, { preferBalancedAscii });
+      
+      // 早期改行候補は大幅にスコアを改善（カラム落ち防止優先）
+      if (isEarlyBreakCandidate) {
+        score -= 1000;
+      }
+      
+      // ダッシュ記号での改行は高スコア（自然なサブタイトル区切り）
+      if (/[－−–—]/.test(s.slice(Math.max(0, p-3), p+1))) {
+        score -= 500;
+      }
+
+      console.log(`Break at ${p}: "${a}" | "${b}" | Score: ${score} | Widths: ${wa}/${wb}`);
 
       if (bestScore === null || score < bestScore) {
         bestScore = score;
@@ -718,35 +844,85 @@ TYPESET_JS = r"""
   // =========================================================
   // specialized wrappers
   // =========================================================
+  // スマートな幅計算：カラム落ちを防ぐ安全マージン付き
+  const getSmartMaxWidth = (maxPx, context = 'normal') => {
+    // コンテキストに応じた安全マージン
+    const margins = {
+      'hero': 0.92,    // イベントタイトル：8%マージン
+      'talk': 0.94,    // 演題タイトル：6%マージン  
+      'normal': 0.95   // 通常：5%マージン
+    };
+    
+    const margin = margins[context] || margins.normal;
+    return Math.floor(maxPx * margin);
+  };
+
+  // 早期改行判定：長い行になりそうな場合の予防的改行
+  const shouldEarlyBreak = (text, currentPos, maxPx, style) => {
+    const remaining = text.slice(currentPos);
+    const currentWidth = measure(text.slice(0, currentPos), style);
+    
+    // 現在の幅が70%を超えて、残りテキストが長い場合
+    if (currentWidth > maxPx * 0.7 && remaining.length > 15) {
+      return true;
+    }
+    
+    // 残りに医学用語が含まれていて分割困難な場合
+    const hasMedicalTerm = /GLP-1|SGLT-2|DPP-4|受容体作動薬|阻害薬|糖尿病性/.test(remaining.slice(0, 20));
+    if (currentWidth > maxPx * 0.65 && hasMedicalTerm) {
+      return true;
+    }
+    
+    return false;
+  };
+
+  // =========================================================
   const wrapHeroTitle = (line, maxPx, style) => {
+    console.log('[WRAP_HERO] Called with:', { line, maxPx });
     const s = unifyTilde(oneLine(line));
     if (!s) return [];
 
     const ascii = isMostlyAscii(s);
+    const smartMaxPx = getSmartMaxWidth(maxPx, 'hero');
 
     // 医学セミナータイトルの特別な処理
     const isMedicalSeminar = /セミナー|webinar|symposium|conference/i.test(s);
     const hasMedicalTerms = /GLP-1|SGLT-2|DPP-4|糖尿病|循環器|腎臓|心血管/.test(s);
 
-    return wrapPx(s, maxPx, style, 8, {
+    const result = wrapPx(s, smartMaxPx, style, 8, {
       forceSubtitle2ndHead: true,
       preferBalancedAscii: ascii && !hasMedicalTerms, // 医学用語がある場合はバランスより内容重視
       avoidSingleWordLastLine: ascii && !isMedicalSeminar,
+      enableEarlyBreak: true, // 早期改行を有効化
     });
+    
+    console.log('[WRAP_HERO] Result:', result);
+    return result;
   };
 
   const wrapTalkTitle = (line, maxPx, style) => {
-    const s = unifyTilde(oneLine(line));
-    if (!s) return [];
+    try {
+      console.log('wrapTalkTitle called with line:', JSON.stringify(line));
+      const s = unifyTilde(oneLine(line));
+      if (!s) return [];
 
-    const hasMedicalTerms = /GLP-1|SGLT-2|DPP-4|糖尿病|循環器|腎臓|心血管|エビデンス|ガイドライン/.test(s);
-    const hasLongMedicalPhrase = /受容体作動薬|阻害薬|合併症|バイオマーカー|プロトコル/.test(s);
+      const smartMaxPx = getSmartMaxWidth(maxPx, 'talk');
+      const hasMedicalTerms = /GLP-1|SGLT-2|DPP-4|糖尿病|循環器|腎臓|心血管|エビデンス|ガイドライン/.test(s);
+      const hasLongMedicalPhrase = /受容体作動薬|阻害薬|合併症|バイオマーカー|プロトコル/.test(s);
 
-    return wrapPx(s, maxPx, style, 5, {
-      forceSubtitle2ndHead: true,
-      preferBalancedAscii: isMostlyAscii(s) && !hasMedicalTerms,
-      avoidSingleWordLastLine: isMostlyAscii(s) && !hasLongMedicalPhrase,
-    });
+      const result = wrapPx(s, smartMaxPx, style, 5, {
+        forceSubtitle2ndHead: true,
+        preferBalancedAscii: isMostlyAscii(s) && !hasMedicalTerms,
+        avoidSingleWordLastLine: isMostlyAscii(s) && !hasLongMedicalPhrase,
+        enableEarlyBreak: true, // 早期改行を有効化
+      });
+      
+      console.log('wrapTalkTitle result:', JSON.stringify(result));
+      return result;
+    } catch (e) {
+      console.log('ERROR in wrapTalkTitle:', e);
+      return [line]; // フォールバック
+    }
   };
 
   const normalizeAffiliation = (s) => {
@@ -754,7 +930,10 @@ TYPESET_JS = r"""
       .split("\n")
       .map(x => oneLine(x))
       .filter(Boolean)
-      .join("\n");
+      .join("\n")
+      .replace(/\s*演\s*者\s*$/g, "")  // 末尾の「演 者」「演者」を除去
+      .replace(/\s*座\s*長\s*$/g, "")  // 末尾の「座 長」「座長」も除去
+      .trim();
   };
 
   // =========================================================
@@ -784,19 +963,45 @@ TYPESET_JS = r"""
   // =========================================================
   // event title
   // =========================================================
+  console.log('Processing event title started');
+  
 const evBaseLines =
   Array.isArray(data.event_title_lines) && data.event_title_lines.length
     ? data.event_title_lines.map(x => oneLine(x)).filter(Boolean)
     : [oneLine(data.event_title || "")].filter(Boolean);
 
-// ★ 日本語はそのまま
-const evLines =
-  Array.isArray(data.event_title_lines) && data.event_title_lines.length
+console.log('evBaseLines:', JSON.stringify(evBaseLines));
+
+// ★ 改行処理を適用してスマートな改行位置を決定
+console.log('[TYPESET] Processing event title:', evBaseLines);
+let evLines = [];
+if (evBaseLines.length > 0) {
+  const combinedEventTitle = evBaseLines.join(" ");
+  console.log('[TYPESET] Combined event title:', combinedEventTitle);
+  // heroタイトル用の最大幅を計算（wrapW - マージン）
+  const heroMax = wrapW - 60; // 余裕を持ったマージン
+  console.log('[TYPESET] Hero max width:', heroMax);
+  // wrapHeroTitleを使って改行位置を最適化
+  evLines = wrapHeroTitle(combinedEventTitle, heroMax, heroStyle);
+  // 空の場合は元の形式にフォールバック
+  if (!evLines.length) {
+    console.log('[TYPESET] Event title fallback to original');
+    evLines = Array.isArray(data.event_title_lines) && data.event_title_lines.length
+      ? data.event_title_lines
+      : evBaseLines;
+  } else {
+    console.log('[TYPESET] New event title lines:', evLines);
+  }
+} else {
+  evLines = Array.isArray(data.event_title_lines) && data.event_title_lines.length
     ? data.event_title_lines
     : evBaseLines;
+}
 
 data.event_title_lines = evLines;
 data.event_title = evLines.join("\n");
+
+console.log('Event title processing completed:', JSON.stringify(evLines));
 
   // =========================================================
   // chair
@@ -809,14 +1014,176 @@ data.event_title = evLines.join("\n");
   // talks
   // =========================================================
 if (Array.isArray(data.talks)) {
-  data.talks = data.talks.map((t) => {
+  console.log('Processing talks started');
+  console.log('==== JAVASCRIPT IS WORKING FOR TALKS ===='); // 確実に見えるログ
+  console.log('Talks length:', data.talks.length);
+  
+  data.talks = data.talks.map((t, index) => {
     const rawTitleLines =
       Array.isArray(t?.title_lines) && t.title_lines.length
         ? t.title_lines.map(x => oneLine(x)).filter(Boolean)
         : [oneLine(t?.title ?? "")].filter(Boolean);
 
-    // ★ 日本語はそのまま使う（超重要）
-    const title_lines = t.title_lines?.length ? t.title_lines : rawTitleLines;
+    // ★ 基本的な改行処理：ダッシュで分割
+    let title_lines = [];
+    let debug_info = {};
+    
+    if (rawTitleLines.length > 0) {
+      const combinedTitle = rawTitleLines.join(" ");
+      debug_info.original_title = combinedTitle;
+      debug_info.title_length = combinedTitle.length;
+      
+      // より積極的な改行処理
+      const dashPattern = /([－−–—])/;
+      
+      if (dashPattern.test(combinedTitle)) {
+        debug_info.has_dash = true;
+        const parts = combinedTitle.split(dashPattern);
+        if (parts.length === 3) {
+          let firstLine = parts[0].trim();
+          let secondLine = parts[1] + parts[2].trim();
+          
+          debug_info.dash_split_result = [firstLine, secondLine];
+          
+          // 2行目が長すぎる場合（20文字以上）、さらに分割
+          if (secondLine.length > 20) {
+            debug_info.second_line_too_long = true;
+            debug_info.second_line_length = secondLine.length;
+            
+            // 「を含めた」で分割を試す
+            if (secondLine.includes('を含めた')) {
+              const splitPoint = secondLine.indexOf('を含めた') + 4;
+              title_lines = [
+                firstLine,
+                secondLine.substring(0, splitPoint),
+                secondLine.substring(splitPoint)
+              ];
+              debug_info.split_method = "を含めた";
+            }
+            // 「に関する」で分割を試す  
+            else if (secondLine.includes('に関する')) {
+              const splitPoint = secondLine.indexOf('に関する') + 4;
+              title_lines = [
+                firstLine,
+                secondLine.substring(0, splitPoint),
+                secondLine.substring(splitPoint)
+              ];
+              debug_info.split_method = "に関する";
+            }
+            // スペースで分割を試す
+            else if (secondLine.includes(' ')) {
+              const spaceIndex = secondLine.indexOf(' ');
+              if (spaceIndex > 5 && spaceIndex < secondLine.length - 5) {
+                title_lines = [
+                  firstLine,
+                  secondLine.substring(0, spaceIndex),
+                  secondLine.substring(spaceIndex + 1)
+                ];
+                debug_info.split_method = "space";
+              } else {
+                title_lines = [firstLine, secondLine];
+                debug_info.split_method = "space_unsuitable";
+              }
+            } else {
+              title_lines = [firstLine, secondLine];
+              debug_info.split_method = "none_available";
+            }
+          } else {
+            title_lines = [firstLine, secondLine];
+            debug_info.second_line_ok = true;
+          }
+        } else {
+          title_lines = [combinedTitle];
+          debug_info.dash_split_failed = true;
+        }
+      } else {
+        debug_info.has_dash = false;
+        // ダッシュがない場合も長い場合は分割
+        if (combinedTitle.length > 18) {
+          debug_info.long_title_no_dash = true;
+          
+          // コロンで分割を試す
+          if (combinedTitle.includes('：')) {
+            const colonIndex = combinedTitle.indexOf('：');
+            const firstPart = combinedTitle.substring(0, colonIndex + 1);
+            const secondPart = combinedTitle.substring(colonIndex + 1);
+            title_lines = [firstPart, secondPart];
+            debug_info.split_method = "colon";
+            debug_info.colon_split_result = [firstPart, secondPart];
+          }
+          // 波ダッシュ（～）で分割を試す
+          else if (combinedTitle.includes('～')) {
+            const tildeIndex = combinedTitle.indexOf('～');
+            // 波ダッシュが先頭近くにある場合は前の文字も含める
+            if (tildeIndex > 8) {
+              const firstPart = combinedTitle.substring(0, tildeIndex);
+              const secondPart = '～' + combinedTitle.substring(tildeIndex + 1);
+              title_lines = [firstPart.trim(), secondPart.trim()];
+              debug_info.split_method = "tilde";
+              debug_info.tilde_split_result = [firstPart.trim(), secondPart.trim()];
+            } else {
+              title_lines = [combinedTitle];
+              debug_info.tilde_too_early = true;
+            }
+          }
+          // スペースで分割を試す（「考える HIF-2α」のようなパターン）
+          else if (combinedTitle.includes(' ')) {
+            const spaceIndex = combinedTitle.indexOf(' ');
+            // スペースが適切な位置にある場合
+            if (spaceIndex > 8 && spaceIndex < combinedTitle.length - 8) {
+              const firstPart = combinedTitle.substring(0, spaceIndex);
+              const secondPart = combinedTitle.substring(spaceIndex + 1);
+              title_lines = [firstPart.trim(), secondPart.trim()];
+              debug_info.split_method = "space";
+              debug_info.space_split_result = [firstPart.trim(), secondPart.trim()];
+            } else {
+              title_lines = [combinedTitle];
+              debug_info.space_position_bad = true;
+            }
+          }
+          // 「と」で分割を試す（長い場合の最後の手段）
+          else if (combinedTitle.length > 25 && combinedTitle.includes('と')) {
+            const indices = [];
+            for (let i = 0; i < combinedTitle.length; i++) {
+              if (combinedTitle[i] === 'と') {
+                indices.push(i);
+              }
+            }
+            // 中央付近の「と」を選択
+            const midPoint = combinedTitle.length / 2;
+            let bestIndex = -1;
+            let minDistance = Infinity;
+            for (const idx of indices) {
+              const distance = Math.abs(idx - midPoint);
+              if (distance < minDistance && idx > 8 && idx < combinedTitle.length - 5) {
+                minDistance = distance;
+                bestIndex = idx;
+              }
+            }
+            if (bestIndex !== -1) {
+              const firstPart = combinedTitle.substring(0, bestIndex + 1);
+              const secondPart = combinedTitle.substring(bestIndex + 1);
+              title_lines = [firstPart, secondPart];
+              debug_info.split_method = "particle_to";
+              debug_info.particle_split_result = [firstPart, secondPart];
+            } else {
+              title_lines = [combinedTitle];
+              debug_info.no_suitable_particle = true;
+            }
+          } else {
+            title_lines = [combinedTitle];
+            debug_info.no_split_method_found = true;
+          }
+        } else {
+          title_lines = [combinedTitle];
+          debug_info.title_not_long = true;
+        }
+      }
+      
+      debug_info.final_result = title_lines;
+    } else {
+      title_lines = t.title_lines?.length ? t.title_lines : rawTitleLines;
+    }
 
     const affiliation = normalizeAffiliation(String(t?.affiliation ?? ""));
 
@@ -824,9 +1191,12 @@ if (Array.isArray(data.talks)) {
       ...t,
       title_lines,
       title: title_lines.join("\n"),
-      affiliation
+      affiliation,
+      _debug: debug_info  // デバッグ情報を追加
     };
   });
+  
+  console.log('Talks processing completed successfully');
 }
 
   return data;
@@ -1748,7 +2118,37 @@ async def apply_precise_typeset_initial(payload: DesignJSON, page=None) -> Desig
         await pg.evaluate("() => document.fonts && document.fonts.ready")
 
         # TYPESET_JS: data_obj を px実測で event_title_lines/title_lines/affiliation に整形して返す
-        return await pg.evaluate(TYPESET_JS, {"data": data_obj})
+        print("🔧 [PYTHON] About to execute TYPESET_JS...")
+        print("🔧 [PYTHON] data_obj keys:", list(data_obj.keys()) if isinstance(data_obj, dict) else "Not a dict")
+        try:
+            result = await pg.evaluate(TYPESET_JS, {"data": data_obj})
+            print("🔧 [PYTHON] TYPESET_JS execution completed successfully")  
+            print("🔧 [PYTHON] Result type:", type(result))
+            
+            # talks の改行結果を確認
+            if isinstance(result, dict) and 'talks' in result:
+                print("🔧 [PYTHON] Talks processing results:")
+                for i, talk in enumerate(result['talks']):
+                    if 'title_lines' in talk:
+                        print(f"  Talk {i}: {talk['title_lines']}")
+                        # デバッグ情報も表示
+                        if '_debug' in talk:
+                            debug = talk['_debug']
+                            print(f"    Debug: title_length={debug.get('title_length')}, "
+                                  f"has_dash={debug.get('has_dash')}, "
+                                  f"split_method={debug.get('split_method')}")
+                            if 'colon_split_result' in debug:
+                                print(f"    Colon split: {debug['colon_split_result']}")
+                            if 'dash_split_result' in debug:
+                                print(f"    Dash split: {debug['dash_split_result']}")
+                            if 'second_line_length' in debug:
+                                print(f"    Second line length: {debug['second_line_length']}")
+            
+            return result
+        except Exception as e:
+            print("🔧 [PYTHON] ERROR: TYPESET_JS execution failed:", str(e))
+            print("🔧 [PYTHON] Error type:", type(e))
+            raise
 
     # ---- page が無ければここで起動 ----
     if page is None:
@@ -2737,6 +3137,42 @@ def normalize_affiliation(s: str) -> str:
     """所属から肩書きを除去し、適切に正規化"""
     x = normalize_space(s or "").replace("\n", " ")
     
+    # 先頭の人名（先生付き）を除去 - より包括的な日本語文字パターン
+    original_x = x
+    
+    # パターン1: より包括的な日本語文字セット（西根広樹等に対応）
+    # \u4e00-\u9faf: CJK統合漢字
+    # \u3041-\u3096: ひらがな  
+    # \u30a1-\u30fa: カタカナ
+    # \u3005: 々
+    # \u3006: 〆
+    # \u3024: 〤  
+    x = re.sub(r'^[\u4e00-\u9faf\u3041-\u3096\u30a1-\u30fa\u3005\u3006\u3024]{2,8}\s*先生\s*[（(]?\s*', '', x)
+    
+    # 除去後に空または短すぎる場合は、スペース込みでより長い名前も除去
+    if not x.strip() or len(x.strip()) < 3:
+        x = original_x
+        # スペース込みのより長い名前パターンも除去（西根　広樹等）
+        x = re.sub(r'^[\u4e00-\u9faf\u3041-\u3096\u30a1-\u30fa\u3005\u3006\u3024\s]{2,16}先生\s*[（(]?\s*', '', x)
+    
+    # まだ短すぎる場合は、括弧内の機関情報だけを抽出
+    if not x.strip() or len(x.strip()) < 3:
+        x = original_x
+        # 括弧内の機関情報だけを抽出
+        bracket_match = re.search(r'[（(]([^)）]+)[）)]', x)
+        if bracket_match:
+            x = bracket_match.group(1)
+        else:
+            # 括弧がない場合は「先生」以降の部分を取得
+            match = re.search(r'先生\s*(.+)', original_x)
+            if match:
+                x = match.group(1)
+    
+    # 先頭が ( で始まる場合、( を除去  
+    x = re.sub(r'^\s*[（(]\s*', '', x)
+    # 末尾が ) で終わる場合、) を除去
+    x = re.sub(r'\s*[）)]\s*$', '', x)
+    
     # 先頭の肩書き除去
     changed = True
     while changed and x:
@@ -2750,7 +3186,9 @@ def normalize_affiliation(s: str) -> str:
     # 「講 師」のようなスペース入り肩書きも除去
     x = re.sub(r'^(講\s*師|教\s*授|部\s*長|院\s*長|課\s*長)\s*', '', x)
     
-    # 医療用語の標準化は呼び出し元で実行（重複を避ける）
+    # 結果が短すぎる場合は元の文字列（ただし改行は除去）
+    if len(x.strip()) < 3:
+        return normalize_space(original_x)
     
     return x.strip()
 
@@ -4024,25 +4462,35 @@ def split_name_affil_inline(text: str) -> tuple[str, str]:
     """
     例:
     '永井　英明　先生　（ Web 講演） 独立行政法人...感染症センター長'
+    '國島広之先生 （聖マリアンナ医科大学 感染症学講座 主任教授）'
     -> ('永井英明', '独立行政法人...感染症センター長')
+    -> ('國島広之', '聖マリアンナ医科大学 感染症学講座 主任教授')
     """
     s = normalize_space(text)
     if "先生" not in s:
         return "", ""
-    # 先生より前を名前、後ろを所属（括弧の補足は捨てる）
-    m = re.search(r"(.+?)\s*先生\s*(?:（.*?）\s*)?(.*)$", s)
-    if not m:
-        return "", ""
-    raw_name = normalize_space(m.group(1))
-    raw_aff = normalize_space(m.group(2))
     
-    # 名前から肩書き除去
-    key = norm_name(raw_name)
+    # パターン1: 括弧内に所属がある場合「名前先生（所属）」
+    m1 = re.search(r"(.+?)\s*先生\s*（([^）]+)）", s)
+    if m1:
+        raw_name = normalize_space(m1.group(1))
+        raw_aff = normalize_space(m1.group(2))
+        key = norm_name(raw_name)
+        clean_aff = normalize_affiliation(raw_aff)
+
+        return key, clean_aff
     
-    # 所属から肩書き除去
-    clean_aff = normalize_affiliation(raw_aff)
+    # パターン2: 先生より前を名前、後ろを所属（括弧の補足は捨てる）
+    m2 = re.search(r"(.+?)\s*先生\s*(?:（.*?）\s*)?(.*)$", s)
+    if m2:
+        raw_name = normalize_space(m2.group(1))
+        raw_aff = normalize_space(m2.group(2))
+        key = norm_name(raw_name)
+        clean_aff = normalize_affiliation(raw_aff)
+
+        return key, clean_aff
     
-    return key, clean_aff
+    return "", ""
 
 def is_overall_datetime(tm: str, overall: str) -> bool:
     if not tm or not overall:
@@ -4235,7 +4683,30 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
               "講師", "教授", "医師", "部長", "院長", "研究", "機構"]
         return any(w in s for w in kw) or len(s) >= 10
 
-    name_blocks = [b for b in blocks if ("先生" in b.text and "座長" not in b.text and "演者" not in b.text)]
+    # 座長エリアにあるブロックを除外する関数
+    def is_block_in_chair_area(block: TextBlock) -> bool:
+        """ブロックが座長エリア（座長ラベルより上）にあるかどうかをチェック"""
+        for b in blocks:
+            if "座長" in b.text:
+                # 座長ラベル近傍だが、座長ラベルより上のエリアのみ
+                chair_x0 = b.left - 200000
+                chair_x1 = b.left + 5000000
+                chair_y0 = b.top - 200000
+                chair_y1 = b.top - 50000  # 座長ラベルより上のみ（修正）
+                
+                if in_region(block, chair_x0, chair_y0, chair_x1, chair_y1):
+                    return True
+        return False
+
+    # 座長エリア以外の「先生」ブロックのみを対象とする
+    name_blocks = [
+        b for b in blocks 
+        if ("先生" in b.text and "座長" not in b.text and "演者" not in b.text)
+        and not is_block_in_chair_area(b)
+    ]
+    
+
+    
     ordered = sorted(blocks, key=lambda b: (b.top, b.left))
 
     for nb in name_blocks:
@@ -4305,10 +4776,10 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
 
 def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]) -> Chair:
     """
-    「座長」アンカー近傍から
-    - raw（表示用：スペース保持）
-    - key（照合用：スペース除去）
-    を分離して取得する
+    「座長」ラベル近傍から座長情報を抽出する
+    - 座長ラベルより上のブロックを優先検索（レイアウト修正）
+    - 「先生」付きテキストから名前部分を抽出
+    - speaker_mapから対応する所属情報を取得
     """
     chair_anchor = None
     for b in blocks:
@@ -4318,27 +4789,86 @@ def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
     if not chair_anchor:
         return Chair()
 
-    # 座長ラベル近傍
+    # 座長ラベル近傍（下方向を優先）
     x0 = chair_anchor.left - 200000
     x1 = chair_anchor.left + 5000000
     y0 = chair_anchor.top - 200000
     y1 = chair_anchor.top + 1200000
 
     near = [b for b in blocks if in_region(b, x0, y0, x1, y1)]
+    # 座長ラベルより上にあるブロックを優先（レイアウト修正）
+    above_chair = [b for b in near if b.top < chair_anchor.top]
+    below_chair = [b for b in near if b.top > chair_anchor.top]
 
-    # ① 「◯◯ 先生」を最優先
-    for b in near:
+    # ① まず座長ラベル「より上」の「◯◯ 先生」を最優先
+    for b in sorted(above_chair, key=lambda x: -x.top):  # 上から順
         if "先生" in b.text:
-            raw = normalize_space(b.text.replace("先生", ""))
-            key = norm_name(raw)
-            aff = speaker_map.get(key, "")
-            return Chair(
-                name=key,
-                name_display=raw,     # ★ スペース保持
-                affiliation=normalize_space(aff),
-            )
+            # テキストから名前部分だけを抽出（所属は除去）
+            text = normalize_space(b.text)
+            print(f"[CHAIR DEBUG] 座長候補（上）: {b.text.strip()} (top: {b.top})")
+            print(f"[CHAIR DEBUG] 処理テキスト: '{text}'")
+            
+            # パターン1: "名前先生\n（所属）" または "名前先生 （所属）" 形式から名前だけ抽出
+            name_match = re.match(r'^([^\n（(]+)先生[\n\s]*[（(]?', text)
+            if name_match:
+                name_only = name_match.group(1).strip()
+                key = norm_name(name_only)
+                print(f"[CHAIR DEBUG] パターン1適用: name_only='{name_only}', key='{key}'")
+                if key:
+                    aff = speaker_map.get(key, "")
+                    print(f"[CHAIR DEBUG] 座長選択（上）: {key}")
+                    return Chair(
+                        name=key,
+                        name_display=build_speaker_display(key),
+                        affiliation=normalize_space(aff),
+                    )
+            
+            # パターン2: 単純に先生前の部分だけを抽出
+            if "先生" in text:
+                name_part = text.split("先生")[0].strip()
+                key = norm_name(name_part)
+                print(f"[CHAIR DEBUG] パターン2適用: name_part='{name_part}', key='{key}'")
+                if key and len(key) >= 2:  # 名前として妥当な長さ
+                    aff = speaker_map.get(key, "")
+                    print(f"[CHAIR DEBUG] 座長選択（上・パターン2）: {key}")
+                    return Chair(
+                        name=key,
+                        name_display=build_speaker_display(key),
+                        affiliation=normalize_space(aff),
+                    )
 
-    # ② フォールバック：speaker_map のキーが含まれるか
+    # ② 次に座長ラベル「より下」から探す
+    for b in sorted(below_chair, key=lambda x: x.top):
+        if "先生" in b.text:
+            # テキストから名前部分だけを抽出（所属は除去）
+            text = normalize_space(b.text)
+            
+            # パターン1: "名前先生\n（所属）" または "名前先生 （所属）" 形式から名前だけ抽出
+            name_match = re.match(r'^([^\n（(]+)先生[\n\s]*[（(]?', text)
+            if name_match:
+                name_only = name_match.group(1).strip()
+                key = norm_name(name_only)
+                if key:
+                    aff = speaker_map.get(key, "")
+                    return Chair(
+                        name=key,
+                        name_display=build_speaker_display(key),
+                        affiliation=normalize_space(aff),
+                    )
+            
+            # パターン2: 単純に先生前の部分だけを抽出
+            if "先生" in text:
+                name_part = text.split("先生")[0].strip()
+                key = norm_name(name_part)
+                if key and len(key) >= 2:  # 名前として妥当な長さ
+                    aff = speaker_map.get(key, "")
+                    return Chair(
+                        name=key,
+                        name_display=build_speaker_display(key),
+                        affiliation=normalize_space(aff),
+                    )
+
+    # ③ フォールバック：speaker_map のキーが含まれるか
     joined = normalize_key("\n".join(b.text for b in near))
     for key, aff in speaker_map.items():
         if key and key in joined:
@@ -4652,6 +5182,12 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
         return ""
 
     def pick_speaker_from_texts(texts: List[str]) -> str:
+        """
+        テキスト群から演者名を抽出する
+        - 「演者：」ラベル付きテキストを優先
+        - 座長エリアの人名は演者から除外（レイアウトを考慮）
+        - speaker_mapのキーから該当する演者を選択
+        """
         # “演者：” 優先
         for t in texts:
             if "演者" in normalize_key(t):
@@ -4659,13 +5195,78 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                 cand = norm_name(cand)
                 if cand:
                     return cand
-        # speaker_map の key を含むかでも見る
+        # 座長エリアの人を特定して除外
+        chair_area_names = set()
+        
+        # 座長ラベルがあるかチェック
+        has_chair_label = any("座長" in t for t in texts)
+        if has_chair_label:
+            # 座長ラベルより上にいる人の名前を特定（正しいレイアウト対応）
+            chair_texts = []
+            seat_label_found = False
+            
+            for t in texts:
+                if "座長" in t:
+                    seat_label_found = True
+                    continue
+                    
+                # 座長ラベルより前に出現する「先生」付きテキストを座長候補とする
+                if not seat_label_found and "先生" in t:
+                    chair_texts.append(t)
+            
+            # 座長候補から名前を抽出
+            for t in chair_texts:
+                text_normalized = normalize_space(t)
+                if "（" in text_normalized or "(" in text_normalized:
+                    name_part = re.split(r'[（(]', text_normalized)[0]
+                    name_part = name_part.replace("先生", "").strip()
+                    if len(name_part) >= 2:
+                        chair_area_names.add(norm_name(name_part))
+        
+        if chair_area_names:
+            pass  # デバッグログ削除
+        
         joined = normalize_key("\n".join(texts))
         for k in speaker_map.keys():
-            if k and k in joined:
+            if k and k in joined and k not in chair_area_names:
+                return k
+        
+        # フォールバック：座長エリア外の最初の人
+        for k in speaker_map.keys():
+            if k and k not in chair_area_names:
                 return k
         return ""
 
+    def clean_title_from_time_and_labels(text: str) -> str:
+        """演題タイトルから時間情報と講演種別ラベルを除去"""
+        s = normalize_space(text)
+        if not s:
+            return s
+            
+        # 時間パターンを除去 (XX:XX～XX:XX形式)
+        time_pattern = r'\d{1,2}[:：]\d{2}\s*[～〜~\-－]\s*\d{1,2}[:：]\d{2}'
+        s = re.sub(time_pattern, '', s)
+        
+        # 講演種別ラベルを除去
+        talk_type_patterns = [
+            r'^基調講演\s*',
+            r'^特別講演\s*',
+            r'^一般演題\s*',
+            r'^一般講演\s*',
+            r'^教育講演\s*',
+            r'^招待講演\s*',
+            r'^講演[０-９\d]+\s*',
+            r'^演題[０-９\d]*\s*[:：]?\s*'
+        ]
+        
+        for pattern in talk_type_patterns:
+            s = re.sub(pattern, '', s)
+        
+        # 連続する空白を整理
+        s = re.sub(r'\s+', ' ', s).strip()
+        
+        return s
+    
     def pick_title_lines(texts: List[str]) -> List[str]:
         out: List[str] = []
         for t in texts:
@@ -4683,6 +5284,10 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             # 「演題：」のときはラベル除去
             if "演題" in normalize_key(s):
                 s = strip_label(["演題", "演題:", "演題："], s)
+            
+            # 時間情報と講演種別ラベルを除去
+            s = clean_title_from_time_and_labels(s)
+            
             # 人名単体は除外
             if s.endswith("先生") and len(s) <= 16:
                 continue
@@ -4795,6 +5400,38 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             # 名前候補が取れればOK（所属が混ざってても良い）
             return bool(_extract_name_anywhere(s2))
 
+        def is_chair_area_name(s: str) -> bool:
+            """座長エリアの人名かどうかをチェック"""
+            # 現在処理中のテキストが座長名前と一致するかチェック
+            if payload.chair and payload.chair.name:
+                chair_name_key = normalize_key(payload.chair.name)
+                s_key = normalize_key(s.replace("先生", ""))
+                if chair_name_key and chair_name_key in s_key:
+                    return True
+            
+            lines = [normalize_space(x) for x in str(s or "").split("\n") if normalize_space(x)]
+            # 同じブロック内に「座長」が含まれているかチェック
+            for line in lines:
+                if "座長" in line:
+                    return True
+            
+            # 座長ラベル近傍ブロックの人名もチェック
+            for b in ordered:
+                if "座長" in (b.text or ""):
+                    # 座長ラベルブロック近傍かチェック
+                    chair_x0 = b.left - 200000  
+                    chair_x1 = b.left + 5000000
+                    chair_y0 = b.top - 200000
+                    chair_y1 = b.top + 1200000
+                    
+                    # 現在のテキストを含むブロックを探す
+                    for check_b in ordered:
+                        if s.strip() in (check_b.text or ""):
+                            if in_region(check_b, chair_x0, chair_y0, chair_x1, chair_y1):
+                                return True
+            
+            return False
+
         # 本文側leftで安定ソート
         time_blocks2.sort(key=lambda x: (x[2], x[0].top))
 
@@ -4832,6 +5469,8 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             y1 = (next_top - 200000) if next_top is not None else (tb.top + 3500000)
 
             near = [b for b in ordered if in_region(b, x0, y0, x1, y1)]
+            # 座長エリアのブロックを除外
+            near = [b for b in near if not is_chair_area_name(b.text)]
             near = sorted(near, key=lambda b: (b.top, b.left))
             seg_lines = [normalize_space(b.text) for b in near if normalize_space(b.text)]
 
@@ -4862,13 +5501,16 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
 
             for j, s in enumerate(seg_lines):
                 k = normalize_key(s)
-                print("ROLE_CHECK", repr(s), "=>", extract_role_name_block(s))
 
                 role2, name2 = extract_role_name_block(s)
                 if role2 and name2:
                     if not speaker:
-                        speaker = norm_name(name2)
-                    pending_role = role2
+                        # 座長の名前は演者として使用しない
+                        name2_key = normalize_key(name2)
+                        chair_name_key = normalize_key(payload.chair.name if payload.chair else "")
+                        if not (chair_name_key and name2_key == chair_name_key):
+                            speaker = norm_name(name2)
+                            pending_role = role2
                     continue
 
                 # if not speaker:
@@ -4883,6 +5525,8 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                 if not title_lines and "演題" in k:
                     t = strip_label(["演題", "演題:", "演題："], s)
                     if t:
+                        # 時間情報と講演種別ラベルを除去
+                        t = clean_title_from_time_and_labels(t)
                         for ln in (t or "").split("\n"):
                             ln = normalize_space(ln)
                             if not ln:
@@ -4926,6 +5570,9 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
 
                 # 「演者」ラベルが無いテンプレ用：名前っぽい行
                 if not speaker and looks_like_name_line(s):
+                    # 座長エリアの人名は演者から除外
+                    if is_chair_area_name(s):
+                        continue
                     role2, name2 = extract_role_name_block(s)
                     if role2 and name2:
                         speaker = norm_name(name2)
@@ -4941,11 +5588,30 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                     # affiliation候補として積む前に、末尾人名が付いてたら分離
                     sp2, aff2 = split_speaker_affiliation_fuzzy(s)
                     if sp2 and not speaker:
-                        speaker = norm_name(sp2)
-                    if aff2:
-                        aff_candidates.append(aff2)
+                        # 座長の名前は演者として使用しない
+                        sp2_key = normalize_key(sp2)
+                        chair_name_key = normalize_key(payload.chair.name if payload.chair else "")
+                        if chair_name_key and sp2_key == chair_name_key:
+                            # 座長の所属情報も演者所属には使わない（混入防止）
+                            continue
+                        else:
+                            speaker = norm_name(sp2)
+                    if aff2 and sp2:
+                        # 座長の名前が含まれる場合は所属も除外
+                        sp2_key = normalize_key(sp2)
+                        chair_name_key = normalize_key(payload.chair.name if payload.chair else "")
+                        if not (chair_name_key and sp2_key == chair_name_key):
+                            clean_aff = normalize_affiliation(aff2)
+                            if clean_aff:
+                                aff_candidates.append(clean_aff)
                     else:
-                        aff_candidates.append(s)
+                        # テキスト全体をチェックして座長情報が含まれていないかチェック
+                        chair_name_key = normalize_key(payload.chair.name if payload.chair else "")
+                        s_key = normalize_key(s)
+                        if not (chair_name_key and chair_name_key in s_key):
+                            clean_s = normalize_affiliation(s)
+                            if clean_s:
+                                aff_candidates.append(clean_s)
 
             # affiliation確定
             if not affiliation and aff_candidates:
@@ -4970,6 +5636,23 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
 
             print(affiliation)
 
+            # speaker確定：座長と同じ名前は避ける
+            if speaker and payload.chair and payload.chair.name:
+                chair_name_key = normalize_key(payload.chair.name)
+                speaker_key = normalize_key(speaker)
+                if speaker_key == chair_name_key:
+                    # 座長と同じ名前の演者を回避 - 別の演者を探す
+                    alternate_speaker = ""
+                    for s in seg_lines:
+                        if is_aff_line(s):
+                            sp2, _ = split_speaker_affiliation_fuzzy(s)
+                            if sp2:
+                                sp2_key = normalize_key(sp2)
+                                if sp2_key != chair_name_key:
+                                    alternate_speaker = norm_name(sp2)
+                                    break
+                    if alternate_speaker:
+                        speaker = alternate_speaker
           
             # タイトル fallback: 「演題」ラベルが無いテンプレ用
             if not title_lines:
@@ -4984,8 +5667,11 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                         continue
                     if looks_like_name_line(s):
                         continue
-                    if len(s) >= 10:
-                        title_lines.append(s)
+                    
+                    # 時間情報と講演種別ラベルを除去してからチェック
+                    cleaned_s = clean_title_from_time_and_labels(s)
+                    if len(cleaned_s) >= 10:
+                        title_lines.append(cleaned_s)
                         break
 
             talks.append(Talk(time=tm, title_lines=title_lines[:4], speaker=speaker, affiliation=affiliation))
@@ -5912,12 +6598,27 @@ async def ai_refine_json(
         name = normalize_person_name(chair_patch.get("name", "") or "")
         aff = normalize_space(chair_patch.get("affiliation", "") or "")
 
-        if role:
-            refined.chair.role = normalize_chair_role(role)
-        if name:
-            refined.chair.name = name
-        if aff:
-            refined.chair.affiliation = aff
+        # 既存の座長情報が既に正しく抽出されている場合は保護
+        current_chair_valid = (
+            refined.chair and 
+            refined.chair.name and 
+            refined.chair.affiliation and
+            len(refined.chair.name) >= 2 and
+            len(refined.chair.affiliation) >= 5
+        )
+
+        if current_chair_valid:
+            print(f"[AI REFINE DEBUG] 既存座長情報を保護: {refined.chair.name}")
+            # 座長情報は変更せず、既存を保持
+            pass
+        else:
+            # 既存座長情報が不十分な場合のみAI結果を適用
+            if role:
+                refined.chair.role = normalize_chair_role(role)
+            if name:
+                refined.chair.name = name
+            if aff:
+                refined.chair.affiliation = aff
 
         if getattr(refined.chair, "name_display", ""):
             refined.chair.name_display = normalize_person_display(refined.chair.name_display)
@@ -6476,7 +7177,17 @@ def fix_title_lines_jp(lines: list[str]) -> list[str]:
     return out
 
 def repair_chair_from_multiline_block(payload: DesignJSON, blocks: list[TextBlock]) -> DesignJSON:
+    """
+    座長情報の修復を行う関数
+    ただし、既に正しい座長情報が抽出されている場合は修復をスキップする
+    """
     if not getattr(payload, "chair", None):
+        return payload
+
+    # 座長情報が既に存在する場合は修復をスキップ
+    # extract_chair_by_blocksで正しく抽出されている場合を優先
+    if payload.chair.name and payload.chair.affiliation:
+        print(f"[CHAIR REPAIR DEBUG] 座長情報が既に存在するため修復をスキップ: {payload.chair.name}")
         return payload
 
     ordered = sorted(blocks, key=lambda b: (b.top, b.left))
@@ -6951,25 +7662,37 @@ def fill_chair_affiliation_from_vm_hint(payload: DesignJSON, blocks: list[TextBl
 def fill_chair_affiliation_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> DesignJSON:
     if not getattr(payload, "chair", None):
         return payload
-    if (payload.chair.affiliation or "").strip():
+    
+    # ★ 既に長い所属情報がある場合はスキップ（30文字以上なら十分と判断）
+    current_affiliation = (payload.chair.affiliation or "").strip()
+    if current_affiliation and len(current_affiliation) > 30:
         return payload
+
+    print(f"[DEBUG] Chair affiliation check: current='{current_affiliation}' (length={len(current_affiliation)})")
 
     def _nospace(s: str) -> str:
         return normalize_space(s).replace(" ", "").replace("\u3000", "")
 
     key_ns = _nospace(payload.chair.name)
+    print(f"[DEBUG] Looking for chair name: '{payload.chair.name}' (no space: '{key_ns}')")
 
     ordered = sorted(blocks, key=lambda b: (b.top, b.left))
 
     target = None
-    for b in ordered:
+    print(f"[DEBUG] Checking {len(ordered)} blocks for chair...")
+    
+    for i, b in enumerate(ordered):
         t = normalize_space(b.text)
         t_ns = _nospace(t)
+        print(f"[DEBUG] Block {i}: '{t[:50]}...' (contains 座長: {'座長' in t}, contains chair name: {key_ns in t_ns if key_ns else False})")
+        
         if "座長" in t and key_ns and key_ns in t_ns:
+            print(f"[DEBUG] ★ FOUND chair block {i}: '{t}'")
             target = b
             break
 
     if not target:
+        print("[DEBUG] No chair block found")
         return payload
 
     def looks_like_affil(s: str) -> bool:
@@ -6983,7 +7706,60 @@ def fill_chair_affiliation_from_blocks(payload: DesignJSON, blocks: list[TextBlo
         kw = ["大学", "病院", "クリニック", "センター", "科", "部", "教授", "講師", "医師", "部長", "院長"]
         return any(w in s for w in kw)
 
-    # ★ 横並び優先（高さ帯一致）
+    # ★ まず同一ブロック内から所属を抽出
+    target_text = normalize_space(target.text)
+    lines = [line.strip() for line in target_text.split('\n') if line.strip()]
+    
+    print(f"[DEBUG] Chair block found. Target text: {repr(target_text)}")
+    print(f"[DEBUG] Split lines: {lines}")
+    print(f"[DEBUG] Chair name key (no space): {repr(key_ns)}")
+    
+    # 「座長」と名前以外の行で所属っぽいものを探す
+    for i, line in enumerate(lines):
+        print(f"[DEBUG] Processing line {i}: {repr(line)}")
+        
+        # 座長が含まれる行でも、1行内に所属情報があるかチェック
+        if "座長" in line:
+            print(f"[DEBUG] Line {i} contains 座長, checking for inline affiliation")
+            # 座長名の後に所属があるかチェック (パターン: "座長 名前先生 所属")
+            if key_ns and key_ns in _nospace(line):
+                # 「座長」を除去
+                remaining = re.sub(r'座長\s*', '', line).strip()
+                
+                # 人名部分（漢字+ひらがな+先生）を除去する汎用的な処理
+                # 「[漢字・ひらがな・カタカナ・空白]+先生」パターンを除去
+                remaining = re.sub(r'^[一-龠ぁ-ゔァ-ヴー々〆〤\s]*先生\s*', '', remaining)
+                
+                remaining = remaining.strip()
+                print(f"[DEBUG] After removing chair info, remaining: '{remaining}'")
+                
+                if remaining and looks_like_affil(remaining):
+                    print(f"[DEBUG] Found inline affiliation in 座長 line {i}: '{remaining}'")
+                    payload.chair.affiliation = remaining  
+                    return payload
+                else:
+                    print(f"[DEBUG] Remaining part doesn't look like affiliation")
+            
+            print(f"[DEBUG] Skipping line {i}: contains 座長 but no inline affiliation found")
+            continue
+        # 名前（先生付き）を含む行をスキップ
+        if key_ns and key_ns in _nospace(line):
+            print(f"[DEBUG] Skipping line {i}: contains chair name")
+            continue
+        if "先生" in line:
+            print(f"[DEBUG] Skipping line {i}: contains 先生")
+            continue
+        # 残った行で所属っぽければ採用
+        if looks_like_affil(line):
+            print(f"[DEBUG] Found affiliation in same block: {repr(line)}")
+            payload.chair.affiliation = line
+            return payload
+        else:
+            print(f"[DEBUG] Line {i} doesn't look like affiliation")
+
+    print("[DEBUG] No affiliation found in same block, trying horizontal search...")
+
+    # ★ 横並び優先（高さ帯一致）- フォールバック
     cand = []
     for b in ordered:
         if b is target:
