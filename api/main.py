@@ -1300,8 +1300,8 @@ def extract_talk_number_and_time_from_text(text: str) -> tuple[int | None, str]:
 
     talk_no = None
 
-    # 1) 講演1 / 講演１ / 講演① / 講 演 1
-    m = re.search(r"講演([0-9０-９]+|[①②③④⑤⑥⑦⑧⑨⑩])", s)
+    # 1) 講演1 / 講演１ / 講演① / 講 演 1 / 演題1 / 演題①
+    m = re.search(r"(?:講演|演題)([0-9０-９]+|[①②③④⑤⑥⑦⑧⑨⑩])", s)
     if m:
         raw_no = m.group(1)
         if raw_no in CIRCLED_NUM_MAP:
@@ -1426,11 +1426,7 @@ def assign_talk_times_by_anchor(blocks: list[TextBlock], payload: DesignJSON) ->
     if not talk_time_map:
         return payload
 
-    # 先に全部消す（壊れた time を残さない）
-    for t in talks:
-        t.time = ""
-
-    # 講演番号 1,2,3... に対応して入れ直す
+    # アンカーで特定できた講演のみ時間を設定（他はリセットしない）
     for idx, t in enumerate(talks, start=1):
         tm = talk_time_map.get(idx)
         if tm:
@@ -6961,7 +6957,7 @@ async def ai_refine_json(
     if rule_org:
         refined.organizer = normalize_organizer(rule_org)
 
-    refined.organizer = normalize_space(refined.organizer)
+    refined.organizer = normalize_organizer(refined.organizer)
     refined.datetime = normalize_space(refined.datetime)
     refined.datetime_note = normalize_space(refined.datetime_note)
 
@@ -7525,7 +7521,7 @@ def parse_blocks_to_design_json(blocks: List[TextBlock]) -> DesignJSON:
         event_title_lines=event_title_lines,
         event_title=event_title,
         datetime=normalize_space(dt),
-        organizer=normalize_space(org),
+        organizer=normalize_organizer(org),
         chair=Chair(role=chair.role, name=chair.name, name_display=chair.name_display, affiliation=chair.affiliation),
         talks=talks[:4],
         warnings=sorted(set(warnings)),
