@@ -286,7 +286,7 @@ TYPESET_JS = r"""
     // 基本的な区切り文字
     const breakers = new Set(
       jp
-        ? ["、", "。", ",", "，", ":", "：", "/", "／"]
+        ? [" ", "、", "。", ",", "，", ":", "：", "/", "／"]
         : [" ", "、", "。", ",", "，", ":", "：", "/", "／"]
     );
 
@@ -640,6 +640,10 @@ TYPESET_JS = r"""
     // 行末が中途半端（助詞で終わる）
     if (/[のにとへやではがも]$/.test(t)) p += 120;
 
+    // カタカナ語の途中分断ペナルティ
+    // 行末がカタカナ（ー含む）で終わり、次行頭もカタカナの場合
+    if (idx < total - 1 && /[ァ-ヶー]$/.test(t)) p += 3000;
+
     // ・終わり
     if (/[・･]$/.test(t)) p += 800;
 
@@ -772,6 +776,11 @@ TYPESET_JS = r"""
 
       const lines = [a, b];
       let score = scoreLines(lines, maxPx, style, { preferBalancedAscii });
+      
+      // カタカナ語の途中分断を回避（フォーラム→フォー|ラム 等）
+      if (/[ァ-ヶー]$/.test(a) && /^[ァ-ヶー]/.test(b)) {
+        score += 8000;
+      }
       
       // 早期改行候補は大幅にスコアを改善（カラム落ち防止優先）
       if (isEarlyBreakCandidate) {
@@ -3502,6 +3511,9 @@ def normalize_datetime_text(s: str) -> str:
     s = re.sub(r"\s*年\s*", "年", s)
     s = re.sub(r"\s*月\s*", "月", s)
     s = re.sub(r"\s*日\s*", "日", s)
+    # 月日のゼロ埋め除去: 04月→4月, 02日→2日
+    s = re.sub(r"(\d{4}年)0(\d月)", r"\1\2", s)
+    s = re.sub(r"(\d{1,2}月)0(\d日)", r"\1\2", s)
     # コロン前後
     s = re.sub(r"\s*:\s*", ":", s)
     # 20 :00 → 20:00
