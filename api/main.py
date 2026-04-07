@@ -6103,6 +6103,11 @@ def build_ai_prompt(
 - manual_override は変更禁止
 - region / unit / event_id は変更禁止
 
+# 旧字体・異体字の保持（重要）
+- blocks テキストに含まれる旧字体・異体字（髙→高、﨑→崎、邉→辺、齊→斉 等）は
+  絶対に新字体に置き換えないこと。blocks にある文字をそのままコピーすること。
+- 例: blocks に「髙田」とあれば「髙田」のまま出力。「高田」に変換は禁止。
+
 # speaker_map（このキーにある speaker 名だけ使用可）
 {json.dumps(speaker_map, ensure_ascii=False, indent=2)}
 
@@ -6967,6 +6972,32 @@ async def ai_refine_json(
         refined.chair.name_display = normalize_person_display(refined.chair.name_display)
     refined.chair.affiliation = normalize_space(getattr(refined.chair, "affiliation", "") or "")
 
+    # --- 旧字体復元: AI が髙→高 等に置き換えた文字をブロック原文から復元 ---
+    _OLD_NEW_KANJI = [
+        ("髙", "高"), ("﨑", "崎"), ("邉", "辺"), ("邊", "辺"),
+        ("齊", "斉"), ("齋", "斉"), ("渡邉", "渡辺"), ("渡邊", "渡辺"),
+        ("廣", "広"), ("櫻", "桜"), ("國", "国"), ("壽", "寿"),
+        ("眞", "真"), ("實", "実"), ("惠", "恵"), ("發", "発"),
+    ]
+    _all_block_text = " ".join(b.text or "" for b in blocks)
+    _all_block_text_flat = _all_block_text.replace("\n", "").replace(" ", "").replace("\u3000", "")
+
+    def _restore_old_kanji(name: str) -> str:
+        """blocks 原文に旧字体があれば、AI が新字体に置換した部分を復元"""
+        if not name:
+            return name
+        for old_ch, new_ch in _OLD_NEW_KANJI:
+            if old_ch in _all_block_text and new_ch in name:
+                # 名前のスペースなし版を作って照合
+                name_nospace = name.replace(" ", "").replace("\u3000", "")
+                restored = name_nospace.replace(new_ch, old_ch)
+                if restored in _all_block_text_flat:
+                    name = name.replace(new_ch, old_ch)
+        return name
+
+    refined.chair.name = _restore_old_kanji(refined.chair.name)
+    refined.chair.name_display = _restore_old_kanji(refined.chair.name_display)
+
 
     def clean_speaker_text_strict(s: str) -> str:
         s = normalize_space(s or "")
@@ -7022,6 +7053,7 @@ async def ai_refine_json(
             t.title = "\n".join(t.title_lines).strip()
         t.speaker = clean_speaker_text_strict(getattr(t, "speaker", "") or "")
         t.speaker = norm_name(t.speaker)
+        t.speaker = _restore_old_kanji(t.speaker)
         if speaker_map and t.speaker in speaker_map:
             t.affiliation = normalize_space(speaker_map[t.speaker] or "")
         else:
