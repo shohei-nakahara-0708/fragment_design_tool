@@ -3981,53 +3981,47 @@ def iter_shapes(shapes):
 
 
 
-def extract_blocks_from_pptx(file_path: str) -> list[dict]:
-    prs = Presentation(file_path)
-    out: list[dict] = []
+def extract_blocks_from_pptx(pptx_path: Path, first_slide_only: bool = True) -> List[TextBlock]:
+    prs = Presentation(str(pptx_path))
+    blocks: List[TextBlock] = []
 
-    if not prs.slides:
-        return out
+    slides = [prs.slides[0]] if (first_slide_only and len(prs.slides) > 0) else prs.slides
+    for slide in slides:
+        for sh in iter_shapes(slide.shapes):
+            if not getattr(sh, "has_text_frame", False):
+                continue
+            tf = sh.text_frame
+            if not tf:
+                continue
 
-    slide = prs.slides[0]
-
-    slide_w = float(prs.slide_width or 1)
-    slide_h = float(prs.slide_height or 1)
-
-    for shape in slide.shapes:
-        if not getattr(shape, "has_text_frame", False):
-            continue
-
-        text = "\n".join(
-            p.text.strip()
-            for p in shape.text_frame.paragraphs
-            if (p.text or "").strip()
-        ).strip()
-
-        if not text:
-            continue
-
-        max_size = 0.0
-        try:
-            for p in shape.text_frame.paragraphs:
+            paras = []
+            max_font = 0.0
+            for p in tf.paragraphs:
+                t = (p.text or "").strip()
+                if t:
+                    paras.append(t)
                 for run in p.runs:
-                    if run.font.size:
-                        max_size = max(max_size, float(run.font.size.pt))
-        except Exception:
-            pass
+                    if run.font and run.font.size:
+                        max_font = max(max_font, run.font.size / EMU_PER_PT)
 
-        out.append({
-            "text": text,
-            "left": float(shape.left),
-            "top": float(shape.top),
-            "width": float(shape.width),
-            "height": float(shape.height),
-            "max_font_pt": round(max_size, 2),
-            "_coord_unit": "emu",
-            "_slide_width": slide_w,
-            "_slide_height": slide_h,
-        })
+            # ★改行保持する
+            text = normalize_keep_newlines("\n".join(paras))
+            if not text:
+                continue
 
-    return out
+            blocks.append(
+                TextBlock(
+                    text=text,
+                    left=int(sh.left),
+                    top=int(sh.top),
+                    width=int(sh.width),
+                    height=int(sh.height),
+                    max_font_pt=float(max_font or 0.0),
+                )
+            )
+
+    blocks.sort(key=lambda b: (b.top, b.left))
+    return blocks
 
 
 def blocks_to_lines(blocks: List[TextBlock]) -> List[str]:
