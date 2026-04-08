@@ -2152,15 +2152,26 @@ async def apply_precise_typeset_initial(payload: DesignJSON, page=None) -> Desig
             print("🔧 [PYTHON] Error type:", type(e))
             raise
 
-    # ---- page が無ければここで起動 ----
+    # ---- page が無ければグローバル _browser から一時ページを作成 ----
     if page is None:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch()
-            pg = await browser.new_page(viewport=BASE_VIEWPORT)
+        global _browser
+        if _browser is not None:
+            # グローバルブラウザから一時ページを作成（2重ブラウザ起動によるOOMを回避）
+            ctx = await _browser.new_context(viewport=BASE_VIEWPORT)
+            pg = await ctx.new_page()
             try:
                 new_obj = await _run(pg)
             finally:
-                await browser.close()
+                await ctx.close()
+        else:
+            # フォールバック: グローバルブラウザが未初期化の場合のみ新規起動
+            async with async_playwright() as p:
+                browser = await p.chromium.launch()
+                pg = await browser.new_page(viewport=BASE_VIEWPORT)
+                try:
+                    new_obj = await _run(pg)
+                finally:
+                    await browser.close()
     else:
         new_obj = await _run(page)
 
@@ -6386,7 +6397,10 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
     - 類似度 >= 0.85 : talks の speaker / affiliation / title も復元（同一書類の可能性が高い）
     """
     try:
-        all_blocks_text = " ".join(b.text for b in blocks)
+        all_blocks_text = " ".join(
+            (b.get("text", "") if isinstance(b, dict) else getattr(b, "text", ""))
+            for b in blocks
+        )
         event_title = payload.event_title or ""
 
         similar = find_similar_correct_answers(all_blocks_text, event_title, top_k=1)
@@ -6402,11 +6416,12 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
         correct = best.get("correct_json") or {}
         print(f"[correct-answer-overlay] sim={sim:.2f} job_id={best.get('job_id','')}")
 
-        # ---- event_title ----
-        if correct.get("event_title"):
-            payload.event_title = correct["event_title"]
+        # ---- event_title ---- (title_lines を正とし、title を再合成)
         if correct.get("event_title_lines"):
             payload.event_title_lines = correct["event_title_lines"]
+            payload.event_title = "\n".join(correct["event_title_lines"])
+        elif correct.get("event_title"):
+            payload.event_title = correct["event_title"]
 
         # ---- organizer ----
         if correct.get("organizer"):
@@ -6430,9 +6445,11 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
                         t.speaker = ct["speaker"]
                     if ct.get("affiliation"):
                         t.affiliation = ct["affiliation"]
+                    # title_lines を正とし、title を再合成
                     if ct.get("title_lines"):
-                        t.title_lines = ct["title_lines"]
-                    if ct.get("title"):
+                        t.title_lines = fix_title_lines_jp(ct["title_lines"])
+                        t.title = "\n".join(t.title_lines)
+                    elif ct.get("title"):
                         t.title = ct["title"]
 
     except Exception as e:
@@ -7210,7 +7227,9 @@ async def ai_refine_json(
     # event_title_lines / event_title
     if "event_title_lines" in parsed:
         lines = normalize_lines_keep_order(_safe_list_str(parsed.get("event_title_lines")))
-        if lines and len(lines) == len(draft.event_title_lines or []):
+        draft_lines = draft.event_title_lines or []
+        if lines and (len(lines) >= len(draft_lines)):
+            # AI が行数を増やす（サブタイトル追加等）は許可、減らす方向はブロック
             refined.event_title_lines = lines
             refined.event_title = "\n".join(lines).strip()
 
@@ -7843,6 +7862,27 @@ def fix_title_lines_jp(lines: list[str]) -> list[str]:
     if not arr:
         return []
 
+    # ---- パス1: 複合助詞の不自然な分割を修正 ----
+    # 「ワクチンへ\nのシフト」→「ワクチン\nへのシフト」
+    COMPOUND_PARTICLES = {
+        "への", "での", "との",
+        "には", "では", "とは",
+        "にも", "でも", "とも",
+        "から", "まで",
+        "ても", "ので", "のに",
+        "ほど", "より",
+    }
+    for j in range(len(arr) - 1):
+        cur_j = arr[j]
+        nxt_j = arr[j + 1]
+        if len(cur_j) >= 3 and len(nxt_j) >= 1:
+            pair = cur_j[-1] + nxt_j[0]
+            if pair in COMPOUND_PARTICLES:
+                arr[j] = cur_j[:-1]
+                arr[j + 1] = cur_j[-1] + nxt_j
+
+    # ---- パス2: 短すぎる次行をマージ ----
+    MAX_MERGE_LEN = 28  # マージ後の最大文字数
     out = []
     i = 0
     while i < len(arr):
@@ -7850,6 +7890,7 @@ def fix_title_lines_jp(lines: list[str]) -> list[str]:
 
         if i + 1 < len(arr):
             nxt = arr[i + 1]
+            merged_len = len(cur) + len(nxt)
 
             # 1文字だけの次行
             if len(nxt) == 1:
@@ -7858,13 +7899,13 @@ def fix_title_lines_jp(lines: list[str]) -> list[str]:
                 continue
 
             # ひらがな始まりの短い次行（る / が / に / を 等）
-            if re.match(r"^[ぁ-ん]", nxt) and len(nxt) <= 4:
+            if re.match(r"^[ぁ-ん]", nxt) and len(nxt) <= 4 and merged_len <= MAX_MERGE_LEN:
                 out.append(cur + nxt)
                 i += 2
                 continue
 
             # 漢字1字 + 続き、みたいな不自然分割（性 －... など）
-            if re.match(r"^[一-龠々]", nxt) and len(cur) >= 6:
+            if re.match(r"^[一-龠々]", nxt) and len(cur) >= 6 and merged_len <= MAX_MERGE_LEN:
                 out.append(cur + nxt)
                 i += 2
                 continue
@@ -9913,9 +9954,8 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
 
     refined = fill_datetime_parts(refined, blocks)
 
-    # 正解DBで後処理の上書きを復元
-    refined = apply_correct_answer_overlay(refined, blocks)
-    dump_titles("after apply_correct_answer_overlay", refined)
+    # NOTE: apply_correct_answer_overlay はバッチフロー側で
+    # apply_precise_typeset_initial の「後」に呼ぶ（typeset が改行位置を上書きするため）
 
     
     # if refined.confidence < draft.confidence:
@@ -10563,6 +10603,18 @@ async def upload_batch_stream(
                     payload = post_format_design_initial(payload)
                     payload = await apply_precise_typeset_initial(payload)
                     payload = ensure_display_fields(payload)
+
+                    # 正解DBで後処理の上書きを復元（typeset後に適用して改行位置を保持）
+                    _blocks_for_overlay = []
+                    try:
+                        _dbp = p.get("debug_blocks")
+                        if _dbp and _dbp.exists():
+                            _raw = json.loads(_dbp.read_text(encoding="utf-8"))
+                            _blocks_for_overlay = _raw  # list[dict] – overlay は dict 対応済み
+                    except Exception:
+                        pass
+                    payload = apply_correct_answer_overlay(payload, _blocks_for_overlay)
+                    dump_titles("after apply_correct_answer_overlay", payload)
 
                     payload.region = presence_rows[0].get("VP/PH/ONC", "")
                     payload.unit = presence_rows[0].get("取得単位：フラグメントデザインへの内容記載", "")
