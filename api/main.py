@@ -3832,6 +3832,27 @@ def init_db():
             """)
             con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at);")
             con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);")
+
+            con.execute("""
+            CREATE TABLE IF NOT EXISTS correct_answers (
+                id SERIAL PRIMARY KEY,
+                job_id TEXT UNIQUE NOT NULL,
+                event_title TEXT NOT NULL DEFAULT '',
+                blocks_text TEXT NOT NULL DEFAULT '',
+                keywords TEXT[] NOT NULL DEFAULT '{}',
+                correct_json JSONB NOT NULL DEFAULT '{}',
+                embedding DOUBLE PRECISION[],
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """)
+            con.execute("CREATE INDEX IF NOT EXISTS idx_ca_job_id ON correct_answers(job_id);")
+            # embedding カラムが無ければ追加（既存テーブル互換）
+            con.execute("""
+            DO $$ BEGIN
+                ALTER TABLE correct_answers ADD COLUMN IF NOT EXISTS embedding DOUBLE PRECISION[];
+            EXCEPTION WHEN duplicate_column THEN NULL;
+            END $$;
+            """)
             con.commit()
             logger.info("Database tables initialized successfully")
         finally:
@@ -6167,6 +6188,257 @@ async def try_fill_organizer_from_logo(pptx_path: Path) -> str:
     return ""
 
 
+# ---------------- 正解DB (Correct Answer Store) ----------------
+
+def _compute_embedding(text: str) -> list[float] | None:
+    """OpenAI text-embedding-3-small でベクトル化（1536次元）"""
+    if not OPENAI_API_KEY or not text.strip():
+        return None
+    try:
+        truncated = text[:8000]  # トークン制限安全マージン
+        resp = requests.post(
+            f"{OPENAI_BASE_URL}/embeddings",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"model": "text-embedding-3-small", "input": truncated},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            return resp.json()["data"][0]["embedding"]
+        print(f"[embedding] API error {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[embedding] error: {e}")
+    return None
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """コサイン類似度"""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _load_correct_answers() -> list[dict]:
+    """正解DBを読み込む（Postgres）"""
+    try:
+        with db_connect() as con:
+            rows = con.execute(
+                "SELECT job_id, event_title, blocks_text, keywords, correct_json, embedding, created_at "
+                "FROM correct_answers ORDER BY created_at DESC LIMIT 500"
+            ).fetchall()
+        return [
+            {
+                "job_id": r["job_id"],
+                "event_title": r["event_title"],
+                "blocks_text": r["blocks_text"],
+                "keywords": r["keywords"] or [],
+                "correct_json": r["correct_json"] or {},
+                "embedding": r["embedding"],
+                "created_at": str(r["created_at"]),
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        print(f"[correct_answers] load error: {e}")
+        return []
+
+
+def _extract_keywords(text: str) -> set[str]:
+    """テキストからキーワードを抽出（類似度計算用）"""
+    text = normalize_space(text or "")
+    # 日本語 + 英数字の連続をトークンとして抽出
+    tokens = set(re.findall(r'[\u3040-\u9FFF\uF900-\uFAFF]{2,}|[a-zA-Z0-9]{2,}', text))
+    return tokens
+
+
+def _compute_similarity(kw_a: set[str], kw_b: set[str]) -> float:
+    """Jaccard係数で類似度を計算"""
+    if not kw_a or not kw_b:
+        return 0.0
+    intersection = kw_a & kw_b
+    union = kw_a | kw_b
+    return len(intersection) / len(union) if union else 0.0
+
+
+def save_correct_answer(
+    blocks_text: str,
+    correct_json: dict,
+    event_title: str = "",
+    job_id: str = "",
+) -> None:
+    """確定済みの正解データをPostgresに保存する（embedding付き）"""
+    keywords = list(_extract_keywords(blocks_text + " " + event_title))
+    truncated_text = blocks_text[:2000]
+    embedding = _compute_embedding(blocks_text + " " + event_title)
+
+    try:
+        with db_connect() as con:
+            con.execute(
+                """
+                INSERT INTO correct_answers (job_id, event_title, blocks_text, keywords, correct_json, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (job_id) DO UPDATE SET
+                    event_title = EXCLUDED.event_title,
+                    blocks_text = EXCLUDED.blocks_text,
+                    keywords = EXCLUDED.keywords,
+                    correct_json = EXCLUDED.correct_json,
+                    embedding = EXCLUDED.embedding,
+                    created_at = NOW()
+                """,
+                (job_id, event_title, truncated_text, keywords,
+                 json.dumps(correct_json, ensure_ascii=False),
+                 embedding),
+            )
+            # 500件を超えたら古い順に削除
+            con.execute(
+                """
+                DELETE FROM correct_answers WHERE id IN (
+                    SELECT id FROM correct_answers
+                    ORDER BY created_at DESC
+                    OFFSET 500
+                )
+                """
+            )
+            con.commit()
+    except Exception as e:
+        print(f"[correct_answers] save error: {e}")
+
+
+def find_similar_correct_answers(
+    blocks_text: str,
+    event_title: str = "",
+    top_k: int = 2,
+    min_similarity: float = 0.15,
+) -> list[dict]:
+    """類似する正解データを検索して返す（embedding優先、fallback: Jaccard）"""
+    answers = _load_correct_answers()
+    if not answers:
+        return []
+
+    query_text = blocks_text + " " + event_title
+    query_emb = _compute_embedding(query_text)
+
+    scored = []
+    for ans in answers:
+        # embedding があればコサイン類似度を使う
+        ans_emb = ans.get("embedding")
+        if query_emb and ans_emb:
+            sim = _cosine_similarity(query_emb, ans_emb)
+        else:
+            # fallback: Jaccard
+            query_kw = _extract_keywords(query_text)
+            ans_kw = set(ans.get("keywords", []))
+            sim = _compute_similarity(query_kw, ans_kw)
+
+        if sim >= min_similarity:
+            ans["_similarity"] = sim
+            scored.append((sim, ans))
+
+    scored.sort(key=lambda x: -x[0])
+    return [item[1] for item in scored[:top_k]]
+
+
+def _build_dynamic_few_shot(similar_answers: list[dict]) -> list[dict]:
+    """正解DBの類似結果をfew-shot messagesに変換"""
+    messages = []
+    for ans in similar_answers:
+        cj = ans.get("correct_json", {})
+        # 重要フィールドだけ抜粋（トークン節約）
+        summary = {
+            "event_title": cj.get("event_title", ""),
+            "talks": [],
+        }
+        for t in (cj.get("talks") or [])[:4]:
+            summary["talks"].append({
+                "title_lines": t.get("title_lines", []),
+                "speaker": t.get("speaker", ""),
+                "affiliation": t.get("affiliation", ""),
+            })
+        if cj.get("chair"):
+            chair = cj["chair"]
+            if chair.get("name"):
+                summary["chair"] = {
+                    "name": chair.get("name", ""),
+                    "affiliation": chair.get("affiliation", ""),
+                }
+
+        user_msg = f"類似スライド: {ans.get('event_title', '(不明)')}"
+        assistant_msg = json.dumps(summary, ensure_ascii=False)
+        messages.append({"role": "user", "content": user_msg})
+        messages.append({"role": "assistant", "content": assistant_msg})
+
+    return messages
+
+
+def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSON:
+    """
+    後処理で上書きされたフィールドを正解DBから復元する。
+    - 類似度 >= 0.70 : event_title, organizer, chair を復元
+    - 類似度 >= 0.85 : talks の speaker / affiliation / title も復元（同一書類の可能性が高い）
+    """
+    try:
+        all_blocks_text = " ".join(b.text for b in blocks)
+        event_title = payload.event_title or ""
+
+        similar = find_similar_correct_answers(all_blocks_text, event_title, top_k=1)
+        if not similar:
+            return payload
+
+        best = similar[0]
+        sim = best.get("_similarity", 0.0)
+
+        if sim < 0.70:
+            return payload
+
+        correct = best.get("correct_json") or {}
+        print(f"[correct-answer-overlay] sim={sim:.2f} job_id={best.get('job_id','')}")
+
+        # ---- event_title ----
+        if correct.get("event_title"):
+            payload.event_title = correct["event_title"]
+        if correct.get("event_title_lines"):
+            payload.event_title_lines = correct["event_title_lines"]
+
+        # ---- organizer ----
+        if correct.get("organizer"):
+            payload.organizer = correct["organizer"]
+
+        # ---- chair ----
+        cc = correct.get("chair") or {}
+        if cc and payload.chair:
+            if cc.get("name"):
+                payload.chair.name = cc["name"]
+            if cc.get("affiliation"):
+                payload.chair.affiliation = cc["affiliation"]
+
+        # ---- talks (高類似度: 同一ドキュメントの可能性が高い) ----
+        if sim >= 0.85:
+            ct_list = correct.get("talks") or []
+            if ct_list and payload.talks and len(ct_list) == len(payload.talks):
+                for i, ct in enumerate(ct_list):
+                    t = payload.talks[i]
+                    if ct.get("speaker"):
+                        t.speaker = ct["speaker"]
+                    if ct.get("affiliation"):
+                        t.affiliation = ct["affiliation"]
+                    if ct.get("title_lines"):
+                        t.title_lines = ct["title_lines"]
+                    if ct.get("title"):
+                        t.title = ct["title"]
+
+    except Exception as e:
+        print(f"[correct-answer-overlay] error: {e}")
+
+    return payload
+
+
 # ---------------- AI ----------------
 def build_ai_prompt(
     blocks: List[TextBlock],
@@ -6496,6 +6768,78 @@ async def ai_refine_json(
         "Content-Type": "application/json",
     }
 
+    # Few-shot例: AIがよく間違えるパターンの正解を示す
+    few_shot_examples = [
+        # 例1: 1回目/2回目同一内容 → talksは1つだけ
+        {
+            "user": (
+                "blocks に「1回目、2回目ともに同一の内容です」と記載。"
+                "講演: 「○○治療の最前線」演者: 山田太郎 先生 / ○○大学 教授。"
+                "draft の talks に同一内容が2件入っている。"
+            ),
+            "assistant": json.dumps({
+                "talks": [
+                    {
+                        "time": "",
+                        "title_lines": ["○○治療の最前線"],
+                        "speaker": "山田太郎",
+                        "affiliation": "○○大学 教授"
+                    }
+                ],
+                "_reason": "1回目2回目同一内容なので talks は1件のみ"
+            }, ensure_ascii=False)
+        },
+        # 例2: 開会挨拶・閉会挨拶は除外
+        {
+            "user": (
+                "draft の talks に3件: 「開会挨拶」「糖尿病治療の新展開」「閉会の辞」。"
+                "blocks を確認すると実際の講演は「糖尿病治療の新展開」のみ。"
+            ),
+            "assistant": json.dumps({
+                "talks": [
+                    {
+                        "time": "",
+                        "title_lines": ["糖尿病治療の新展開"],
+                        "speaker": "佐藤花子",
+                        "affiliation": "○○病院 内科 部長"
+                    }
+                ],
+                "_reason": "開会挨拶・閉会の辞は講演ではないので除外"
+            }, ensure_ascii=False)
+        },
+        # 例3: 旧字体保持 + 演者名の正確な抽出
+        {
+            "user": (
+                "blocks に「髙橋 一郎 先生」「慶應義塾大学医学部 教授」とある。"
+                "draft の speaker が「高橋一郎」（新字体に変換済み）。"
+            ),
+            "assistant": json.dumps({
+                "talks": [
+                    {
+                        "time": "",
+                        "title_lines": ["腎臓病の最新治療"],
+                        "speaker": "髙橋一郎",
+                        "affiliation": "慶應義塾大学医学部 教授"
+                    }
+                ],
+                "_reason": "blocks の旧字体「髙」をそのまま使用"
+            }, ensure_ascii=False)
+        },
+    ]
+
+    few_shot_messages = []
+    for ex in few_shot_examples:
+        few_shot_messages.append({"role": "user", "content": ex["user"]})
+        few_shot_messages.append({"role": "assistant", "content": ex["assistant"]})
+
+    # 正解DBから類似例を動的に追加
+    all_blocks_text = " ".join(b.text for b in blocks)
+    event_title = draft.event_title or ""
+    similar = find_similar_correct_answers(all_blocks_text, event_title, top_k=2)
+    dynamic_shots = _build_dynamic_few_shot(similar)
+    if dynamic_shots:
+        few_shot_messages.extend(dynamic_shots)
+
     body = {
         "model": AI_MODEL,
         "messages": [
@@ -6509,6 +6853,7 @@ async def ai_refine_json(
                     "Do not wrap in markdown."
                 ),
             },
+            *few_shot_messages,
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.1,  # 少しだけ創造性を残して、より自然な結果を得る
@@ -9566,6 +9911,10 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
 
     refined = fill_datetime_parts(refined, blocks)
 
+    # 正解DBで後処理の上書きを復元
+    refined = apply_correct_answer_overlay(refined, blocks)
+    dump_titles("after apply_correct_answer_overlay", refined)
+
     
     # if refined.confidence < draft.confidence:
     #     refined.warnings = list(set(refined.warnings + ["ai_lower_confidence"]))
@@ -10327,6 +10676,8 @@ async def render(req: RenderReq):
     event_id = row.get("event_id") or ""
 
     payload = req.design
+    # /render はエディタからの手動保存でのみ呼ばれるので常に manual_override=True
+    payload.manual_override = True
 
     payload_dict = (
         payload.model_dump(exclude_none=True)
@@ -10355,6 +10706,33 @@ async def render(req: RenderReq):
         raise HTTPException(500, f"storage upload failed: {e}")
 
     upsert_job_ok(req.jobId, filename, payload, session_id, event_id)
+
+    # manual_override=True → 正解DBに自動登録
+    if True:
+        try:
+            # blocksをストレージから取得
+            blocks_text = ""
+            sp = storage_paths(req.jobId)
+            blocks_url = f"{SUPABASE_URL}/storage/v1/object/authenticated/{sp['debug_blocks']}"
+            headers_s = {
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            }
+            resp = requests.get(blocks_url, headers=headers_s, timeout=30)
+            if resp.status_code == 200:
+                blocks_data = resp.json()
+                blocks_text = " ".join(
+                    (b.get("text", "") if isinstance(b, dict) else "")
+                    for b in (blocks_data if isinstance(blocks_data, list) else [])
+                )
+            save_correct_answer(
+                blocks_text=blocks_text,
+                correct_json=payload_dict,
+                event_title=getattr(payload, "event_title", "") or "",
+                job_id=req.jobId,
+            )
+        except Exception as e:
+            print(f"[correct-answer][auto-register] {req.jobId}: {e}")
 
     return JSONResponse({
         "jobId": req.jobId,
@@ -11284,3 +11662,80 @@ async def delete_job(job_id: str, req: JobDeleteReq = JobDeleteReq()):
         "deletedStorage": deleted_storage,
         "storageErrors": storage_errors,
     }
+
+
+# ---------------- 正解DB API ----------------
+
+class CorrectAnswerReq(BaseModel):
+    job_id: str
+    design: dict  # 確定済みDesignJSON
+
+
+@app.post("/correct-answer/register")
+async def register_correct_answer(req: CorrectAnswerReq):
+    """ユーザーが確定した結果を正解DBに登録する"""
+    job_id = req.job_id
+    design = req.design
+
+    # blocksをストレージから取得
+    blocks_text = ""
+    try:
+        sp = storage_paths(job_id)
+        blocks_url = f"{SUPABASE_URL}/storage/v1/object/authenticated/{sp['debug_blocks']}"
+        headers = {
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        }
+        resp = requests.get(blocks_url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            blocks_data = resp.json()
+            blocks_text = " ".join(
+                (b.get("text", "") if isinstance(b, dict) else "")
+                for b in (blocks_data if isinstance(blocks_data, list) else [])
+            )
+    except Exception as e:
+        print(f"[correct-answer] blocks fetch failed: {e}")
+
+    event_title = design.get("event_title", "")
+
+    save_correct_answer(
+        blocks_text=blocks_text,
+        correct_json=design,
+        event_title=event_title,
+        job_id=job_id,
+    )
+
+    answers = _load_correct_answers()
+    return {"ok": True, "total_answers": len(answers), "job_id": job_id}
+
+
+@app.get("/correct-answer/list")
+async def list_correct_answers():
+    """登録済みの正解データ一覧"""
+    answers = _load_correct_answers()
+    return {
+        "total": len(answers),
+        "answers": [
+            {
+                "job_id": a.get("job_id", ""),
+                "event_title": a.get("event_title", ""),
+                "created_at": a.get("created_at", ""),
+            }
+            for a in answers
+        ],
+    }
+
+
+@app.delete("/correct-answer/{job_id}")
+async def delete_correct_answer(job_id: str):
+    """正解データを削除"""
+    try:
+        with db_connect() as con:
+            result = con.execute(
+                "DELETE FROM correct_answers WHERE job_id = %s", (job_id,)
+            )
+            deleted = result.rowcount
+            con.commit()
+        return {"ok": True, "deleted": deleted}
+    except Exception as e:
+        raise HTTPException(500, f"delete failed: {e}")
