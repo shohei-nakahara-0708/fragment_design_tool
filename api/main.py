@@ -2453,8 +2453,12 @@ def fill_datetime_parts(payload, blocks=None):
 
     # 全体時間
     full_dt = normalize_datetime_text(dt)
-    m_full = TIME_RANGE_RE.search(full_dt)
-    full_time = normalize_time_range(m_full.group(0)) if m_full else ""
+    # マルチセッション（N回目）の場合は全体時間を取らない
+    if has_session_label(full_dt):
+        full_time = ""
+    else:
+        m_full = TIME_RANGE_RE.search(full_dt)
+        full_time = normalize_time_range(m_full.group(0)) if m_full else ""
 
     session_times = extract_session_times_from_blocks(blocks)
     if not session_times:
@@ -4444,15 +4448,25 @@ def extract_datetime_from_blocks(blocks: List[TextBlock]) -> str:
             break
 
     # 3) 時間を探す（別行のことが多いので全行から探す）
+    # 「1回目：12:30～13:00  2回目：13:10～13:40」のような複数回パターンを優先
+    multi_session_re = re.compile(r"(\d+回目\s*[：:]\s*\d{1,2}[:：]\d{2}\s*[～〜~\-ー]\s*\d{1,2}[:：]\d{2})")
     t0 = t1 = ""
+    multi_time = ""
     for l in lines:
-        if "日時" in l and TIME_RE2.search(_norm_time2(l)) is None:
-            # 「日時：2026年5月...」みたいに日付専用行もあるのでスルー
-            pass
-        mm = TIME_RE2.search(_norm_time2(l))
-        if mm:
-            t0, t1 = _norm_time2(mm.group(1)), _norm_time2(mm.group(2))
+        sessions = multi_session_re.findall(_norm_time2(l))
+        if len(sessions) >= 2:
+            # 複数回パターン検出 → そのまま結合して返す
+            multi_time = " ".join(normalize_space(s) for s in sessions)
             break
+    if not multi_time:
+        for l in lines:
+            if "日時" in l and TIME_RE2.search(_norm_time2(l)) is None:
+                # 「日時：2026年5月...」みたいに日付専用行もあるのでスルー
+                pass
+            mm = TIME_RE2.search(_norm_time2(l))
+            if mm:
+                t0, t1 = _norm_time2(mm.group(1)), _norm_time2(mm.group(2))
+                break
 
     # 4) 「日時:」行のフォールバック（文字列をそのまま返す用途）
     if not (y and m and d) and any("日時" in l for l in lines):
@@ -4469,6 +4483,8 @@ def extract_datetime_from_blocks(blocks: List[TextBlock]) -> str:
     date_str = f"{int(y)}年{int(m)}月{int(d)}日"
     if dow:
         date_str += f"（{dow}）"
+    if multi_time:
+        return f"{date_str} {multi_time}"
     if t0 and t1:
         return f"{date_str} {t0}～{t1}"
     return date_str
@@ -7093,7 +7109,13 @@ async def ai_refine_json(
     # rule優先
     rule_dt = extract_datetime_from_blocks_v2(blocks)
     if rule_dt:
-        refined.datetime = normalize_space(rule_dt)
+        # multi-session time（N回目）が既に入っている場合は単一時間で上書きしない
+        current_has_multi = "回目" in (refined.datetime or "")
+        rule_has_multi = "回目" in rule_dt
+        if current_has_multi and not rule_has_multi:
+            pass  # 既存のmulti-session datetimeを保持
+        else:
+            refined.datetime = normalize_space(rule_dt)
 
     rule_dt_note = extract_datetime_note_from_blocks(blocks)
     if is_honsha_vm(vm_rows):
