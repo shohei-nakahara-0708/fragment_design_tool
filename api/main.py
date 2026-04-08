@@ -1214,6 +1214,42 @@ EMU_PER_PT = 12700
 
 TIME_RE = re.compile(r"(\d{1,2}\s*[:\：]\s*\d{2})\s*[~〜～\-–—−－]\s*(\d{1,2}\s*[:\：]\s*\d{2})")
 
+def _merge_blocks_to_rows(blocks: list, top_tolerance: int = 200000):
+    """同一行（近い top）のブロックを left 順で結合し (top, left, merged_text) を返す。
+    時間ブロックが個別に分割されている場合（"19:00" "～" "19:30"）に結合する。"""
+    if not blocks:
+        return []
+    sorted_blocks = sorted(blocks, key=lambda b: (b.top, b.left))
+    rows = []
+    for b in sorted_blocks:
+        if rows and abs(b.top - rows[-1][0].top) < top_tolerance:
+            rows[-1].append(b)
+        else:
+            rows.append([b])
+    out = []
+    _hhmm_re = re.compile(r"\d{1,2}[:：]\d{2}")
+    for row in rows:
+        row.sort(key=lambda b: b.left)
+        merged = " ".join((b.text or "").replace("\n", " ") for b in row)
+        merged = normalize_space(merged)
+        if merged:
+            out.append((row[0].top, row[0].left, merged))
+        # フォールバック: 通常結合で TIME_RE マッチしない場合、
+        # 各ブロックの先頭行から HH:MM を抽出して時間値順で結合
+        if merged and not TIME_RE.search(_norm_time(merged)):
+            times = []
+            for b in row:
+                first_line = (b.text or "").split("\n")[0].strip()
+                first_line = first_line.translate(str.maketrans("０１２３４５６７８９：", "0123456789:"))
+                m = _hhmm_re.search(first_line)
+                if m:
+                    times.append(m.group().replace("：", ":"))
+            if len(times) >= 2:
+                times.sort(key=lambda t: int(t.replace(":", "")))
+                time_merged = f"{times[0]}～{times[1]}"
+                out.append((row[0].top, row[0].left, time_merged))
+    return out
+
 def _norm_time(s: str) -> str:
     """時間表記の正規化（全角・半角・記号統一）"""
     s = str(s or "").replace("\u3000", " ")
@@ -1231,6 +1267,7 @@ def _norm_time(s: str) -> str:
 def extract_time_cands_with_pos(blocks: list[TextBlock]) -> list[TimeCand]:
     """ブロックから時間範囲を抽出（位置情報付き）"""
     out = []
+    seen_tops = set()
     for b in blocks:
         t = _norm_time(b.text)
         
@@ -1248,6 +1285,22 @@ def extract_time_cands_with_pos(blocks: list[TextBlock]) -> list[TimeCand]:
         
         time_text = f"{start_norm}~{end_norm}"
         out.append(TimeCand(text=time_text, top=b.top, left=b.left))
+        seen_tops.add(b.top)
+
+    # 個別ブロックで取れない場合、結合行からも抽出（"19:00" "～" "19:30" バラバラ対応）
+    for top, left, merged in _merge_blocks_to_rows(blocks):
+        if top in seen_tops:
+            continue
+        t = _norm_time(merged)
+        m = TIME_RE.search(t)
+        if not m:
+            continue
+        start_time = m.group(1).replace(" ", "")
+        end_time = m.group(2).replace(" ", "")
+        start_norm = re.sub(r"(\d{1,2}):(\d{2})", r"\1:\2", start_time)
+        end_norm = re.sub(r"(\d{1,2}):(\d{2})", r"\1:\2", end_time)
+        time_text = f"{start_norm}~{end_norm}"
+        out.append(TimeCand(text=time_text, top=top, left=left))
     
     out.sort(key=lambda x: (x.top, x.left))
     return out
@@ -1351,10 +1404,21 @@ def extract_talk_times_in_order(blocks: list[TextBlock]) -> list[str]:
 
         tm = f"{m.group(1)}~{m.group(2)}"
 
-        # 全体時間っぽい長い1本は除外したいならここで弾く
         if tm not in seen:
             out.append(tm)
             seen.add(tm)
+
+    # 個別ブロックで取れない場合、結合行からも抽出
+    if not out:
+        for top, left, merged in _merge_blocks_to_rows(blocks):
+            one = normalize_time_text(merged)
+            m = re.search(r"(\d{1,2}:\d{2})\s*[～〜~\-－]\s*(\d{1,2}:\d{2})", one)
+            if not m:
+                continue
+            tm = f"{m.group(1)}~{m.group(2)}"
+            if tm not in seen:
+                out.append(tm)
+                seen.add(tm)
 
     return out
 
@@ -1390,6 +1454,8 @@ def assign_talk_times_by_order_fallback(
 
 def extract_talk_time_map_by_anchor(blocks: list[TextBlock]) -> dict[int, str]:
     ordered = sorted(blocks, key=lambda b: (b.top, b.left))
+    # 結合行も含めた時間検索用リスト
+    merged_rows = _merge_blocks_to_rows(blocks)
     out: dict[int, str] = {}
 
     for i, b in enumerate(ordered):
@@ -1404,6 +1470,7 @@ def extract_talk_time_map_by_anchor(blocks: list[TextBlock]) -> dict[int, str]:
 
         best_time = ""
         best_dist = None
+        # 個別ブロックから探す
         for j in range(max(0, i - 6), min(len(ordered), i + 7)):
             if j == i:
                 continue
@@ -1419,6 +1486,20 @@ def extract_talk_time_map_by_anchor(blocks: list[TextBlock]) -> dict[int, str]:
             if best_dist is None or dist < best_dist:
                 best_dist = dist
                 best_time = f"{tm.group(1)}~{tm.group(2)}"
+
+        # 個別ブロックで見つからない場合、結合行から探す
+        if not best_time:
+            for top, left, merged in merged_rows:
+                cand = normalize_time_text(merged)
+                tm = re.search(r"(\d{1,2}:\d{2})\s*[～〜~\-－]\s*(\d{1,2}:\d{2})", cand)
+                if not tm:
+                    continue
+                dist = abs(top - b.top) + abs(left - b.left) * 0.15
+                if dist > 1500000:
+                    continue
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best_time = f"{tm.group(1)}~{tm.group(2)}"
 
         if best_time:
             out[talk_no] = best_time
@@ -4057,7 +4138,7 @@ def looks_like_body_text_for_title(s: str) -> bool:
         return False
     # long polite-body sentences
     if len(s2) >= 30:
-        if any(k in s2 for k in ["謹啓", "謹白", "時下", "平素", "ご高配", "ご案内", "ご多用", "厚く御礼", "お慶び"]):
+        if any(k in s2 for k in ["謹啓", "謹白", "時下", "平素", "ご高配", "ご多用", "厚く御礼", "お慶び"]):
             return True
     # explicitly exclude these keywords even if short
     if any(k in s2 for k in ["謹啓", "謹白"]):
@@ -4232,11 +4313,13 @@ def extract_event_title_lines_from_blocks(blocks: List[TextBlock]) -> List[str]:
     if head_is_english:
         head_text = trim_mixed_english_title(head_text)
 
-    # ✅ near 範囲を狭める（タイトルはせいぜい2行分）
+    # ✅ near 範囲（タイトルは2行分程度）
+    # head の height を基準にして、同等サイズのブロックが2行目にある場合を拾う
+    title_line_height = max(head.height, 300000)  # 最低30万EMU(約0.5行分)
     x0 = head.left - 400000
     x1 = head.left + head.width + 400000
-    y0 = head.top - 150000
-    y1 = head.top + 900000  # ← 2行程度に絞る（広げすぎない）
+    y0 = head.top - title_line_height
+    y1 = head.top + title_line_height * 4  # 約4行分の余裕
 
     near = [b for b in blocks if in_region(b, x0, y0, x1, y1)]
     near = sorted(near, key=lambda b: (b.top, b.left))
@@ -4285,7 +4368,7 @@ def extract_event_title_lines_from_blocks(blocks: List[TextBlock]) -> List[str]:
 
 
 
-DATE_RE = re.compile(r"(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日(?:\s*（?([月火水木金土日])）?)?")
+DATE_RE = re.compile(r"(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日(?:\s*[（(]?\s*([月火水木金土日])\s*[）)]?)?")
 TIME_RE2 = re.compile(r"(\d{1,2}[:：]\d{2})\s*[～〜\-ー~]\s*(\d{1,2}[:：]\d{2})")
 
 def _norm_time2(s: str) -> str:
@@ -4294,10 +4377,59 @@ def _norm_time2(s: str) -> str:
     s = s.replace("〜", "～").replace("~", "～").replace("-", "～").replace("ー", "～")
     return s
 
+def _normalize_cjk_compat(s: str) -> str:
+    """CJK互換部首文字を通常の漢字に変換: ⽇→日, ⽉→月, ⽕→火, ⽔→水, ⽊→木, ⾦→金, ⼟→土, ⽇→日"""
+    table = str.maketrans({
+        "\u2F47": "\u65E5",  # ⽇ → 日
+        "\u2F49": "\u6708",  # ⽉ → 月
+        "\u2F51": "\u65E5",  # ⽇ → 日 (duplicate radical)
+        "\u2F6B": "\u706B",  # ⽕ → 火
+        "\u2F54": "\u6C34",  # ⽔ → 水
+        "\u2F32": "\u571F",  # ⼟ → 土
+        "\u2F46": "\u65E5",  # ⽆ variant
+        "\u2F4E": "\u6728",  # ⽊ → 木
+        "\u2F91": "\u91D1",  # ⾦ → 金
+        "\u2F44": "\u5E74",  # ⽄ → 年 (if needed)
+    })
+    return s.translate(table)
+
+
+def _merge_scattered_blocks_to_lines(blocks: List[TextBlock], top_tolerance: int = 200000) -> List[str]:
+    """同一行（近い top）のブロックを left 順で結合して行リストを返す。
+    1文字ずつバラバラに配置された日時等を復元するため。"""
+    if not blocks:
+        return []
+    sorted_blocks = sorted(blocks, key=lambda b: (b.top, b.left))
+    rows: List[List[TextBlock]] = []
+    for b in sorted_blocks:
+        if rows and abs(b.top - rows[-1][0].top) < top_tolerance:
+            rows[-1].append(b)
+        else:
+            rows.append([b])
+    out = []
+    for row in rows:
+        row.sort(key=lambda b: b.left)
+        merged = "".join((b.text or "").replace("\n", " ") for b in row)
+        merged = _normalize_cjk_compat(merged)
+        merged = normalize_space(merged)
+        if merged:
+            out.append(merged)
+    return out
+
+
 def extract_datetime_from_blocks(blocks: List[TextBlock]) -> str:
     # 1) まず全テキスト（行）を作る
     lines = [normalize_space(x) for x in blocks_to_lines(blocks)]
     lines = [x for x in lines if x]
+
+    # 1b) CJK互換部首文字を正規化
+    lines = [_normalize_cjk_compat(l) for l in lines]
+
+    # 1c) バラバラブロックを結合した行も追加（1文字ずつ分離されたケース対応）
+    merged_lines = _merge_scattered_blocks_to_lines(blocks)
+    for ml in merged_lines:
+        if ml not in lines:
+            lines.append(ml)
 
     # 2) 日付を探す（どこか1行にあることが多い）
     y = m = d = None
@@ -7112,6 +7244,9 @@ def find_talk_anchor_top(blocks: list[TextBlock], talk: Talk) -> int:
             key = tl.replace(" ", "").replace("　", "")
             if key and key in bt_key:
                 score += 3
+            # 逆方向: ブロックテキストがタイトル行の一部（バラバラブロック対応）
+            elif bt_key and len(bt_key) >= 3 and bt_key in key:
+                score += 3
 
         for sp in speaker_keys:
             key = sp.replace(" ", "").replace("　", "").replace("先生", "")
@@ -7124,8 +7259,9 @@ def find_talk_anchor_top(blocks: list[TextBlock], talk: Talk) -> int:
     if not candidates:
         return 10**18
 
-    # score高いもの優先、同点なら上にあるもの
-    candidates.sort(key=lambda x: (-x[0], x[1]))
+    # アンカーは講演の「最も上にあるブロック」を使う
+    # （時間ラベルは講演の上に配置されるため、上端が正確な基準になる）
+    candidates.sort(key=lambda x: x[1])
     return candidates[0][1]
 
 
@@ -7140,17 +7276,30 @@ def sort_talks_by_layout(blocks: list[TextBlock], talks: list[Talk]) -> list[Tal
 def assign_talk_times_by_nearest_upper_time(blocks: list[TextBlock], talks: list[Talk]) -> list[Talk]:
     """講演の上側にある最も近い時間を割り当て"""
     time_blocks = []
+    seen_tops = set()
     for b in blocks:
         txt = _norm_time(b.text or "")
-        # 改善された正規表現を使用
         m = TIME_RE.search(txt)
         if m:
             start_time = m.group(1).replace(" ", "")
             end_time = m.group(2).replace(" ", "")
-            # HH:MM形式に正規化
             start_norm = re.sub(r"(\d{1,2}):(\d{2})", r"\1:\2", start_time)
             end_norm = re.sub(r"(\d{1,2}):(\d{2})", r"\1:\2", end_time)
             time_blocks.append((b.top, b.left, f"{start_norm}~{end_norm}"))
+            seen_tops.add(b.top)
+
+    # バラバラブロック結合からも時間抽出（"19:00" "～" "19:30" 分割対応）
+    for top, left, merged in _merge_blocks_to_rows(blocks):
+        if top in seen_tops:
+            continue
+        txt = _norm_time(merged)
+        m = TIME_RE.search(txt)
+        if m:
+            start_time = m.group(1).replace(" ", "")
+            end_time = m.group(2).replace(" ", "")
+            start_norm = re.sub(r"(\d{1,2}):(\d{2})", r"\1:\2", start_time)
+            end_norm = re.sub(r"(\d{1,2}):(\d{2})", r"\1:\2", end_time)
+            time_blocks.append((top, left, f"{start_norm}~{end_norm}"))
 
     for t in talks:
         # 既に時間が設定されている場合はスキップ
