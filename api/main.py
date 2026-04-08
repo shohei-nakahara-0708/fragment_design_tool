@@ -5315,7 +5315,7 @@ def append_role_to_affiliation(affiliation: str, role: str) -> str:
     return f"{aff} {role}".strip()
 
 
-def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]) -> List[Talk]:
+def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str], chair: "Chair | None" = None) -> List[Talk]:
     """
     まず「講演1/演題1」等のアンカーを優先。
     ただし、時間帯（HH:MM～HH:MM）が複数あるテンプレでは
@@ -5810,7 +5810,7 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                     if not speaker:
                         # 座長の名前は演者として使用しない
                         name2_key = normalize_key(name2)
-                        chair_name_key = normalize_key(payload.chair.name if payload.chair else "")
+                        chair_name_key = normalize_key(chair.name if chair else "")
                         if not (chair_name_key and name2_key == chair_name_key):
                             speaker = norm_name(name2)
                             pending_role = role2
@@ -5893,7 +5893,7 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                     if sp2 and not speaker:
                         # 座長の名前は演者として使用しない
                         sp2_key = normalize_key(sp2)
-                        chair_name_key = normalize_key(payload.chair.name if payload.chair else "")
+                        chair_name_key = normalize_key(chair.name if chair else "")
                         if chair_name_key and sp2_key == chair_name_key:
                             # 座長の所属情報も演者所属には使わない（混入防止）
                             continue
@@ -8064,7 +8064,7 @@ def parse_blocks_to_design_json(blocks: List[TextBlock]) -> DesignJSON:
     speaker_map = extract_speaker_affil_map_by_blocks(blocks)
     chair = extract_chair_by_blocks(blocks, speaker_map)
 
-    talks = extract_talks_by_blocks(blocks, speaker_map)
+    talks = extract_talks_by_blocks(blocks, speaker_map, chair)
 
     if not event_title:
         warnings.append("missing_event_title"); confidence -= 0.2
@@ -10725,12 +10725,46 @@ async def render(req: RenderReq):
                     (b.get("text", "") if isinstance(b, dict) else "")
                     for b in (blocks_data if isinstance(blocks_data, list) else [])
                 )
+            else:
+                print(f"[correct-answer] blocks fetch failed: {resp.status_code} for {req.jobId}")
+
+            if not blocks_text.strip():
+                # blocks取得失敗時はpayloadからテキスト素材を合成（embeddingの精度を確保）
+                parts = []
+                # event_title_lines のサブタイトルも含める
+                etl = getattr(payload, "event_title_lines", None) or []
+                if etl:
+                    parts.extend(etl)
+                elif getattr(payload, "event_title", ""):
+                    parts.append(payload.event_title)
+                if getattr(payload, "organizer", ""):
+                    parts.append(payload.organizer)
+                if getattr(payload, "datetime", ""):
+                    parts.append(payload.datetime)
+                for t in (payload.talks or []):
+                    if getattr(t, "title", ""):
+                        parts.append(t.title)
+                    if getattr(t, "speaker", ""):
+                        parts.append(t.speaker)
+                    if getattr(t, "affiliation", ""):
+                        parts.append(t.affiliation)
+                if getattr(payload, "chair", None):
+                    if getattr(payload.chair, "name", ""):
+                        parts.append(payload.chair.name)
+                blocks_text = " ".join(parts)
+                print(f"[correct-answer] using payload fallback for blocks_text ({len(blocks_text)} chars)")
+
+            # event_title は event_title_lines 全行を含めてembeddingの精度を確保
+            etl = getattr(payload, "event_title_lines", None) or []
+            full_event_title = " ".join(etl) if etl else (getattr(payload, "event_title", "") or "")
+
             save_correct_answer(
                 blocks_text=blocks_text,
                 correct_json=payload_dict,
-                event_title=getattr(payload, "event_title", "") or "",
+                event_title=full_event_title,
                 job_id=req.jobId,
             )
+            print(f"[correct-answer] saved for {req.jobId} (blocks_text={len(blocks_text)} chars)")
         except Exception as e:
             print(f"[correct-answer][auto-register] {req.jobId}: {e}")
 
