@@ -3847,12 +3847,14 @@ def init_db():
             """)
             con.execute("CREATE INDEX IF NOT EXISTS idx_ca_job_id ON correct_answers(job_id);")
             # embedding カラムが無ければ追加（既存テーブル互換）
-            con.execute("""
-            DO $$ BEGIN
-                ALTER TABLE correct_answers ADD COLUMN IF NOT EXISTS embedding DOUBLE PRECISION[];
-            EXCEPTION WHEN duplicate_column THEN NULL;
-            END $$;
-            """)
+            # CREATE TABLE に embedding を含めているため、新規作成時は不要。
+            # 既存テーブルのみ対象とし、軽量に存在チェックしてから ALTER する。
+            row = con.execute("""
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'correct_answers' AND column_name = 'embedding'
+            """).fetchone()
+            if not row:
+                con.execute("ALTER TABLE correct_answers ADD COLUMN embedding DOUBLE PRECISION[];")
             con.commit()
             logger.info("Database tables initialized successfully")
         finally:
