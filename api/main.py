@@ -6512,6 +6512,31 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
                 def _sp_key(s):
                     return (s or "").replace(" ", "").replace("\u3000", "")
 
+                def _title_key(s):
+                    """改行・空白を除去した演題テキスト"""
+                    return (s or "").replace("\n", "").replace(" ", "").replace("\u3000", "")
+
+                def _title_similar(ct_title, cur_title):
+                    """演題の内容がほぼ同じか（改行位置だけ違うケース）"""
+                    k1 = _title_key(ct_title)
+                    k2 = _title_key(cur_title)
+                    if not k1 or not k2:
+                        return False
+                    return k1 == k2
+
+                def _apply_talk_overlay(ct, t):
+                    """1 talk分のoverlayを適用"""
+                    if ct.get("speaker"):
+                        t.speaker = ct["speaker"]
+                    if ct.get("affiliation"):
+                        t.affiliation = ct["affiliation"]
+                    # title: 内容が同じ場合のみ改行位置を復元（演題変更時は上書きしない）
+                    ct_title = "\n".join(ct.get("title_lines", [])) or ct.get("title", "")
+                    cur_title = getattr(t, "title", "") or ""
+                    if ct.get("title_lines") and _title_similar(ct_title, cur_title):
+                        t.title_lines = fix_title_lines_jp(ct["title_lines"])
+                        t.title = "\n".join(t.title_lines)
+
                 # 件数一致なら index ベースで復元（ただし演者名が一致する場合のみ）
                 if len(ct_list) == len(payload.talks):
                     all_matched = True
@@ -6524,16 +6549,7 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
 
                     if all_matched:
                         for i, ct in enumerate(ct_list):
-                            t = payload.talks[i]
-                            if ct.get("speaker"):
-                                t.speaker = ct["speaker"]
-                            if ct.get("affiliation"):
-                                t.affiliation = ct["affiliation"]
-                            if ct.get("title_lines"):
-                                t.title_lines = fix_title_lines_jp(ct["title_lines"])
-                                t.title = "\n".join(t.title_lines)
-                            elif ct.get("title"):
-                                t.title = ct["title"]
+                            _apply_talk_overlay(ct, payload.talks[i])
                     else:
                         # 演者不一致 → speaker名ベースマッチにフォールバック
                         print(f"[correct-answer-overlay] index-based skipped: speaker mismatch, falling back to name-based")
@@ -6545,12 +6561,7 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
                         for t in payload.talks:
                             sp = _sp_key(getattr(t, "speaker", ""))
                             if sp and sp in ct_by_speaker:
-                                ct = ct_by_speaker[sp]
-                                if ct.get("affiliation"):
-                                    t.affiliation = ct["affiliation"]
-                                if ct.get("title_lines"):
-                                    t.title_lines = fix_title_lines_jp(ct["title_lines"])
-                                    t.title = "\n".join(t.title_lines)
+                                _apply_talk_overlay(ct_by_speaker[sp], t)
                 else:
                     # 件数不一致: speaker名でマッチングして復元
                     ct_by_speaker = {}
@@ -6561,12 +6572,7 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
                     for t in payload.talks:
                         sp = _sp_key(getattr(t, "speaker", ""))
                         if sp and sp in ct_by_speaker:
-                            ct = ct_by_speaker[sp]
-                            if ct.get("affiliation"):
-                                t.affiliation = ct["affiliation"]
-                            if ct.get("title_lines"):
-                                t.title_lines = fix_title_lines_jp(ct["title_lines"])
-                                t.title = "\n".join(t.title_lines)
+                            _apply_talk_overlay(ct_by_speaker[sp], t)
 
     except Exception as e:
         print(f"[correct-answer-overlay] error: {e}")
@@ -8545,9 +8551,9 @@ def fill_chair_affiliation_from_blocks(payload: DesignJSON, blocks: list[TextBlo
     if not getattr(payload, "chair", None):
         return payload
     
-    # ★ 既に長い所属情報がある場合はスキップ（30文字以上なら十分と判断）
+    # ★ 既に所属情報がある場合はスキップ（上流のAI結果を尊重）
     current_affiliation = (payload.chair.affiliation or "").strip()
-    if current_affiliation and len(current_affiliation) > 30:
+    if current_affiliation and len(current_affiliation) >= 4:
         return payload
 
     print(f"[DEBUG] Chair affiliation check: current='{current_affiliation}' (length={len(current_affiliation)})")
