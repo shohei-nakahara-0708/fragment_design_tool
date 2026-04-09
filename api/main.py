@@ -4868,7 +4868,7 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
     def is_block_in_chair_area(block: TextBlock) -> bool:
         """ブロックが座長エリア（座長ラベルより上）にあるかどうかをチェック"""
         for b in blocks:
-            if "座長" in b.text:
+            if "座長" in normalize_key(b.text):
                 # 座長ラベル近傍だが、座長ラベルより上のエリアのみ
                 chair_x0 = b.left - 200000
                 chair_x1 = b.left + 5000000
@@ -4882,11 +4882,98 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
     # 座長エリア以外の「先生」ブロックのみを対象とする
     name_blocks = [
         b for b in blocks 
-        if ("先生" in b.text and "座長" not in b.text and "演者" not in b.text)
+        if ("先生" in b.text and "座長" not in normalize_key(b.text) and "演者" not in normalize_key(b.text))
         and not is_block_in_chair_area(b)
     ]
-    
-def remove_person_names_from_affiliation(affiliation: str, person_name: str) -> str:
+
+    ordered = sorted(blocks, key=lambda b: (b.top, b.left))
+
+    for nb in name_blocks:
+        raw = normalize_space(nb.text.replace("先生", ""))
+        key = norm_name(raw)
+        
+        # 人名として有効かチェック
+        if not key or not is_valid_person_name(key):
+            continue
+            
+        mp.setdefault(key, "")  # ★所属が見つからなくてもキーだけ作る（後段の照合が安定）
+
+        # ★まず「直下」を最優先（このテンプレで一番多い）
+        below = []
+        x0 = nb.left - 400000
+        x1 = nb.left + nb.width + 400000
+        y0 = nb.top + nb.height - 100000
+        y1 = nb.top + nb.height + 1200000
+        for b in ordered:
+            if b is nb:
+                continue
+            if not in_region(b, x0, y0, x1, y1):
+                continue
+            s = normalize_space(b.text.replace("\n", " "))
+            if looks_like_affil(s):
+                # 所属から肩書き除去を適用
+                clean_s = normalize_affiliation(s)
+                # 所属情報から人名を除去（座長名の重複を防ぐ）
+                clean_s = _remove_person_names_from_affiliation(clean_s, key)
+                below.append((abs(b.top - nb.top), clean_s))
+        below.sort(key=lambda x: x[0])
+        if below:
+            mp[key] = below[0][1]
+            continue
+
+        # ★次に「右+下」広め（2カラム/右寄せ対策）
+        cand = []
+        x0 = nb.left - 200000
+        x1 = nb.left + 6500000
+        y0 = nb.top - 200000
+        y1 = nb.top + 1800000
+
+        for b in ordered:
+            if b is nb:
+                continue
+            if not in_region(b, x0, y0, x1, y1):
+                continue
+            s = normalize_space(b.text.replace("\n", " "))
+            if not looks_like_affil(s):
+                continue
+
+            # 所属から肩書き除去を適用
+            clean_s = normalize_affiliation(s)
+            # 所属情報から人名を除去（座長名の重複を防ぐ）
+            clean_s = _remove_person_names_from_affiliation(clean_s, key)
+
+            cx = b.left + b.width / 2.0
+            cy = b.top + b.height / 2.0
+            nx = nb.left + nb.width / 2.0
+            ny = nb.top + nb.height / 2.0
+
+            # ★「下方向」を強く優遇（所属は下に来ることが多い）
+            dy = max(0, cy - ny)
+            dx = abs(cx - nx)
+            dist = dx + dy * 0.6  # 下を優遇
+
+            cand.append((dist, clean_s))
+
+        cand.sort(key=lambda x: x[0])
+        if cand:
+            mp[key] = cand[0][1]
+
+    # ★ 学習済み所属フォーマットを適用（スペース位置の正規化）
+    aff_cache = _get_affiliation_format_cache()
+    if aff_cache:
+        for name_key, aff_val in mp.items():
+            if not aff_val:
+                continue
+            ck = _aff_cache_key(aff_val)
+            if ck and ck in aff_cache:
+                learned = aff_cache[ck]
+                if learned != aff_val:
+                    mp[name_key] = learned
+
+    return mp
+
+
+def _remove_person_names_from_affiliation(affiliation: str, person_name: str) -> str:
     """所属情報から人名を除去する"""
     if not affiliation or not person_name:
         return affiliation
@@ -4977,93 +5064,6 @@ def remove_person_names_from_affiliation(affiliation: str, person_name: str) -> 
     
     return cleaned
 
-    
-    ordered = sorted(blocks, key=lambda b: (b.top, b.left))
-
-    for nb in name_blocks:
-        raw = normalize_space(nb.text.replace("先生", ""))
-        key = norm_name(raw)
-        
-        # 人名として有効かチェック
-        if not key or not is_valid_person_name(key):
-            continue
-            
-        mp.setdefault(key, "")  # ★所属が見つからなくてもキーだけ作る（後段の照合が安定）
-
-        # ★まず「直下」を最優先（このテンプレで一番多い）
-        below = []
-        x0 = nb.left - 400000
-        x1 = nb.left + nb.width + 400000
-        y0 = nb.top + nb.height - 100000
-        y1 = nb.top + nb.height + 1200000
-        for b in ordered:
-            if b is nb:
-                continue
-            if not in_region(b, x0, y0, x1, y1):
-                continue
-            s = normalize_space(b.text.replace("\n", " "))
-            if looks_like_affil(s):
-                # 所属から肩書き除去を適用
-                clean_s = normalize_affiliation(s)
-                # 所属情報から人名を除去（座長名の重複を防ぐ）
-                clean_s = remove_person_names_from_affiliation(clean_s, key)
-                below.append((abs(b.top - nb.top), clean_s))
-        below.sort(key=lambda x: x[0])
-        if below:
-            mp[key] = below[0][1]
-            continue
-
-        # ★次に「右+下」広め（2カラム/右寄せ対策）
-        cand = []
-        x0 = nb.left - 200000
-        x1 = nb.left + 6500000
-        y0 = nb.top - 200000
-        y1 = nb.top + 1800000
-
-        for b in ordered:
-            if b is nb:
-                continue
-            if not in_region(b, x0, y0, x1, y1):
-                continue
-            s = normalize_space(b.text.replace("\n", " "))
-            if not looks_like_affil(s):
-                continue
-
-            # 所属から肩書き除去を適用
-            clean_s = normalize_affiliation(s)
-            # 所属情報から人名を除去（座長名の重複を防ぐ）
-            clean_s = remove_person_names_from_affiliation(clean_s, key)
-
-            cx = b.left + b.width / 2.0
-            cy = b.top + b.height / 2.0
-            nx = nb.left + nb.width / 2.0
-            ny = nb.top + nb.height / 2.0
-
-            # ★「下方向」を強く優遇（所属は下に来ることが多い）
-            dy = max(0, cy - ny)
-            dx = abs(cx - nx)
-            dist = dx + dy * 0.6  # 下を優遇
-
-            cand.append((dist, clean_s))
-
-        cand.sort(key=lambda x: x[0])
-        if cand:
-            mp[key] = cand[0][1]
-
-    # ★ 学習済み所属フォーマットを適用（スペース位置の正規化）
-    aff_cache = _get_affiliation_format_cache()
-    if aff_cache:
-        for name_key, aff_val in mp.items():
-            if not aff_val:
-                continue
-            ck = _aff_cache_key(aff_val)
-            if ck and ck in aff_cache:
-                learned = aff_cache[ck]
-                if learned != aff_val:
-                    mp[name_key] = learned
-
-    return mp
-
 def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str], heading_words=None, debug=False) -> Chair:
     """
     「座長」ラベル近傍から座長情報を抽出する
@@ -5078,7 +5078,7 @@ def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
 
     chair_anchor = None
     for b in blocks:
-        if "座長" in b.text:
+        if "座長" in normalize_key(b.text):
             chair_anchor = b
             break
     if not chair_anchor:
@@ -5534,15 +5534,15 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
         # 座長エリアの人を特定して除外
         chair_area_names = set()
         
-        # 座長ラベルがあるかチェック
-        has_chair_label = any("座長" in t for t in texts)
+        # 座長ラベルがあるかチェック（スペース入り「座 長」にも対応）
+        has_chair_label = any("座長" in normalize_key(t) for t in texts)
         if has_chair_label:
             # 座長ラベルより上にいる人の名前を特定（正しいレイアウト対応）
             chair_texts = []
             seat_label_found = False
             
             for t in texts:
-                if "座長" in t:
+                if "座長" in normalize_key(t):
                     seat_label_found = True
                     continue
                     
@@ -5558,6 +5558,11 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                     name_part = name_part.replace("先生", "").strip()
                     if len(name_part) >= 2:
                         chair_area_names.add(norm_name(name_part))
+                elif "先生" in text_normalized:
+                    # 括弧なしフォーマット（「名前 先生 所属」）にも対応
+                    name_part = text_normalized.split("先生")[0].strip()
+                    if len(name_part) >= 2:
+                        chair_area_names.add(norm_name(name_part))
         
         if chair_area_names:
             pass  # デバッグログ削除
@@ -5565,7 +5570,7 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
         # 明示的に演者名を探す（「先生」付きテキストから）
         explicit_speakers = []
         for t in texts:
-            if "先生" in t and "座長" not in t:
+            if "先生" in t and "座長" not in normalize_key(t):
                 # 先生から人名を抽出
                 name_match = re.search(r'([^\n（(\s]{2,8})\s*先生', t)
                 if name_match:
@@ -5795,12 +5800,12 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             lines = [normalize_space(x) for x in str(s or "").split("\n") if normalize_space(x)]
             # 同じブロック内に「座長」が含まれているかチェック
             for line in lines:
-                if "座長" in line:
+                if "座長" in normalize_key(line):
                     return True
             
             # 座長ラベル近傍ブロックの人名もチェック
             for b in ordered:
-                if "座長" in (b.text or ""):
+                if "座長" in normalize_key(b.text or ""):
                     # 座長ラベルブロック近傍かチェック
                     chair_x0 = b.left - 200000  
                     chair_x1 = b.left + 5000000
@@ -5925,7 +5930,7 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                     affiliation_candidate = ''.join(pre_words[2:]) if len(pre_words) > 2 else ''
                     continue
 
-                if not speaker and "演者" in s:
+                if not speaker and "演者" in normalize_key(s):
                     sp = strip_label(["演者", "演者:", "演者："], s)
                     sp = normalize_space(sp)
 
@@ -6378,7 +6383,7 @@ def _build_affiliation_format_cache() -> dict[str, str]:
                     cache[key] = raw
                 # 人名除去バージョンも登録
                 if sp:
-                    aff_no_name = remove_person_names_from_affiliation(raw, sp)
+                    aff_no_name = _remove_person_names_from_affiliation(raw, sp)
                     key2 = _aff_cache_key(aff_no_name)
                     if key2 and len(key2) >= 4 and key2 not in cache:
                         cache[key2] = aff_no_name
@@ -6392,7 +6397,7 @@ def _build_affiliation_format_cache() -> dict[str, str]:
                     cache[key] = raw
                 # 人名除去バージョンも登録
                 if name:
-                    aff_no_name = remove_person_names_from_affiliation(raw, name)
+                    aff_no_name = _remove_person_names_from_affiliation(raw, name)
                     key2 = _aff_cache_key(aff_no_name)
                     if key2 and len(key2) >= 4 and key2 not in cache:
                         cache[key2] = aff_no_name
@@ -7813,6 +7818,7 @@ async def ai_refine_json(
 
     # chair
     chair_patch = parsed.get("chair")
+    _ai_swapped_chair_speaker = False  # AIが座長と演者を逆にした場合のフラグ
     if isinstance(chair_patch, dict):
         role = normalize_space(chair_patch.get("role", "") or "")
         name = normalize_person_name(chair_patch.get("name", "") or "")
@@ -7832,6 +7838,8 @@ async def ai_refine_json(
                 # AIが座長名を別人に変更しようとしている → 名前変更を拒否
                 # affiliationはブロックから後工程で補完される
                 print(f"[AI REFINE DEBUG] AI座長名変更を拒否: {refined.chair.name} → {name}")
+                # AIが座長と演者を逆転させた可能性が高い → talk側のspeaker/affiliationも保護
+                _ai_swapped_chair_speaker = True
             else:
                 # 同一人物 → affiliation等の更新を許可
                 if role:
@@ -7857,7 +7865,20 @@ async def ai_refine_json(
 
     # 1) draft が空、または draft が壊れてるなら AI talks を丸ごと採用
     if isinstance(parsed_talks, list) and (not refined.talks or draft_is_bad):
-        refined.talks = _build_talks_from_parsed(parsed_talks)
+        # AIが座長演者を逆転させた場合、draftに有効なspeaker/affiliationがあればそれを保持
+        if _ai_swapped_chair_speaker and refined.talks:
+            draft_people = [(t.speaker, t.affiliation) for t in refined.talks if t.speaker]
+            refined.talks = _build_talks_from_parsed(parsed_talks)
+            # draft側のspeaker/affiliationで上書き復元
+            for i, t in enumerate(refined.talks):
+                if i < len(draft_people) and draft_people[i][0]:
+                    t.speaker = draft_people[i][0]
+                    t.speaker_display = build_speaker_display(draft_people[i][0]) or draft_people[i][0]
+                    if draft_people[i][1]:
+                        t.affiliation = draft_people[i][1]
+                    print(f"[AI REFINE DEBUG] AI座長演者逆転: talk[{i}] speaker/affiliation復元 ({t.speaker})")
+        else:
+            refined.talks = _build_talks_from_parsed(parsed_talks)
 
     # 2) AI が講演数を減らした場合（挨拶・休憩等の除外）→ AI talks を採用
     elif isinstance(parsed_talks, list) and len(parsed_talks) < len(refined.talks):
@@ -7884,14 +7905,18 @@ async def ai_refine_json(
                 t.title_lines = title_lines
                 t.title = "\n".join(title_lines).strip()
 
-            sp = _norm_speaker_candidate(pt.get("speaker", "") or "")
-            if sp:
-                t.speaker = sp
-                t.speaker_display = build_speaker_display(sp) or sp
+            # AIが座長と演者を逆転させた場合、draftのspeaker/affiliationを保持
+            if _ai_swapped_chair_speaker and t.speaker and t.affiliation:
+                print(f"[AI REFINE DEBUG] AI座長演者逆転検出: talk[{i}] speaker/affiliation保持 ({t.speaker})")
+            else:
+                sp = _norm_speaker_candidate(pt.get("speaker", "") or "")
+                if sp:
+                    t.speaker = sp
+                    t.speaker_display = build_speaker_display(sp) or sp
 
-            aff = normalize_space(pt.get("affiliation", "") or "")
-            if aff:
-                t.affiliation = aff
+                aff = normalize_space(pt.get("affiliation", "") or "")
+                if aff:
+                    t.affiliation = aff
 
     # confidence
     if "confidence" in parsed:
@@ -8998,9 +9023,9 @@ def fill_chair_affiliation_from_blocks(payload: DesignJSON, blocks: list[TextBlo
     for i, b in enumerate(ordered):
         t = normalize_space(b.text)
         t_ns = _nospace(t)
-        print(f"[DEBUG] Block {i}: '{t[:50]}...' (contains 座長: {'座長' in t}, contains chair name: {key_ns in t_ns if key_ns else False})")
+        print(f"[DEBUG] Block {i}: '{t[:50]}...' (contains 座長: {'座長' in normalize_key(t)}, contains chair name: {key_ns in t_ns if key_ns else False})")
         
-        if "座長" in t and key_ns and key_ns in t_ns:
+        if "座長" in normalize_key(t) and key_ns and key_ns in t_ns:
             print(f"[DEBUG] ★ FOUND chair block {i}: '{t}'")
             target = b
             break
@@ -9013,7 +9038,7 @@ def fill_chair_affiliation_from_blocks(payload: DesignJSON, blocks: list[TextBlo
             for b in ordered:
                 t = normalize_space(b.text)
                 t_ns = _nospace(t)
-                if "座長" in t and not chair_label_block:
+                if "座長" in normalize_key(t) and not chair_label_block:
                     chair_label_block = b
                 if key_ns in t_ns and not chair_name_block:
                     chair_name_block = b
@@ -9052,7 +9077,7 @@ def fill_chair_affiliation_from_blocks(payload: DesignJSON, blocks: list[TextBlo
         # アルファベットのみやPROGRAMは除外（ただし英語所属ワードは許可）
         if s.upper() in {"PROGRAM", "AGENDA", "SCHEDULE", "TIME TABLE"}:
             return False
-        if "先生" in s or "座長" in s:
+        if "先生" in s or "座長" in normalize_key(s):
             return False
         if any(w in s for w in ["日時", "会場", "共催", "主催", "提供", "視聴", "登録"]):
             return False
@@ -9081,7 +9106,7 @@ def fill_chair_affiliation_from_blocks(payload: DesignJSON, blocks: list[TextBlo
         print(f"[DEBUG] Processing line {i}: {repr(line)}")
         
         # 座長が含まれる行でも、1行内に所属情報があるかチェック
-        if "座長" in line:
+        if "座長" in normalize_key(line):
             print(f"[DEBUG] Line {i} contains 座長, checking for inline affiliation")
             # 座長名の後に所属があるかチェック (パターン: "座長 名前先生 所属")
             if key_ns and key_ns in _nospace(line):
@@ -9633,7 +9658,7 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         s = _norm(s)
         if not s:
             return False
-        if "講演" in s or "演者" in s or "座長" in s:
+        if "講演" in s or "演者" in normalize_key(s) or "座長" in normalize_key(s):
             return False
         if looks_like_datetime_text(s):
             return False
