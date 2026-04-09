@@ -2451,11 +2451,29 @@ def _ensure_datetime_parts(parts):
 
 def extract_dow_from_blocks(blocks) -> str:
     ordered = sorted(blocks, key=lambda b: (b.top, b.left))
+    # 1) 同一ブロック内に「年月日(曜)」があるケース
     for b in ordered:
         s = normalize_datetime_text(b.text or "")
         m = re.search(r"\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*[（(]\s*([月火水木金土日])\s*[）)]", s)
         if m:
             return m.group(1)
+
+    # 2) 曜日が独立ブロック "(金)" のケース: 日付ブロック近傍を探す
+    date_block = None
+    for b in ordered:
+        s = normalize_datetime_text(b.text or "")
+        if re.search(r"\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日", s):
+            date_block = b
+            break
+    if date_block:
+        for b in ordered:
+            s = normalize_datetime_text(b.text or "").strip()
+            m = re.fullmatch(r"[（(]\s*([月火水木金土日])\s*[）)]", s)
+            if m:
+                # 日付ブロックとの距離が近い（縦方向±500000 emu）
+                if abs(b.top - date_block.top) <= 500000:
+                    return m.group(1)
+
     return ""
   
 
@@ -6459,6 +6477,13 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
         correct = best.get("correct_json") or {}
         print(f"[correct-answer-overlay] sim={sim:.2f} job_id={best.get('job_id','')}")
 
+        # event_title 完全一致なら同一イベントの確度が非常に高い → talks 閾値を緩和
+        correct_title = normalize_key(correct.get("event_title", ""))
+        current_title = normalize_key(payload.event_title or "")
+        title_exact_match = (correct_title and current_title and correct_title == current_title)
+        if title_exact_match:
+            print(f"[correct-answer-overlay] event_title exact match → talks threshold lowered")
+
         # ---- organizer ----
         if correct.get("organizer"):
             payload.organizer = correct["organizer"]
@@ -6479,33 +6504,62 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
             elif correct.get("event_title"):
                 payload.event_title = correct["event_title"]
 
-        # ---- talks (高類似度: 同一ドキュメントの可能性が高い) ----
-        if sim >= 0.90:
+        # ---- talks (高類似度 or event_title完全一致: 同一ドキュメントの可能性が高い) ----
+        talks_threshold = 0.80 if title_exact_match else 0.90
+        if sim >= talks_threshold:
             ct_list = correct.get("talks") or []
             if ct_list and payload.talks:
-                # 件数一致なら index ベースで復元
+                def _sp_key(s):
+                    return (s or "").replace(" ", "").replace("\u3000", "")
+
+                # 件数一致なら index ベースで復元（ただし演者名が一致する場合のみ）
                 if len(ct_list) == len(payload.talks):
+                    all_matched = True
                     for i, ct in enumerate(ct_list):
-                        t = payload.talks[i]
-                        if ct.get("speaker"):
-                            t.speaker = ct["speaker"]
-                        if ct.get("affiliation"):
-                            t.affiliation = ct["affiliation"]
-                        # title_lines: DB の改行位置を復元 + fix_title_lines_jp で補正
-                        if ct.get("title_lines"):
-                            t.title_lines = fix_title_lines_jp(ct["title_lines"])
-                            t.title = "\n".join(t.title_lines)
-                        elif ct.get("title"):
-                            t.title = ct["title"]
+                        ct_sp = _sp_key(ct.get("speaker", ""))
+                        cur_sp = _sp_key(getattr(payload.talks[i], "speaker", ""))
+                        if ct_sp and cur_sp and ct_sp != cur_sp:
+                            all_matched = False
+                            break
+
+                    if all_matched:
+                        for i, ct in enumerate(ct_list):
+                            t = payload.talks[i]
+                            if ct.get("speaker"):
+                                t.speaker = ct["speaker"]
+                            if ct.get("affiliation"):
+                                t.affiliation = ct["affiliation"]
+                            if ct.get("title_lines"):
+                                t.title_lines = fix_title_lines_jp(ct["title_lines"])
+                                t.title = "\n".join(t.title_lines)
+                            elif ct.get("title"):
+                                t.title = ct["title"]
+                    else:
+                        # 演者不一致 → speaker名ベースマッチにフォールバック
+                        print(f"[correct-answer-overlay] index-based skipped: speaker mismatch, falling back to name-based")
+                        ct_by_speaker = {}
+                        for ct in ct_list:
+                            sp = _sp_key(ct.get("speaker", ""))
+                            if sp:
+                                ct_by_speaker[sp] = ct
+                        for t in payload.talks:
+                            sp = _sp_key(getattr(t, "speaker", ""))
+                            if sp and sp in ct_by_speaker:
+                                ct = ct_by_speaker[sp]
+                                if ct.get("affiliation"):
+                                    t.affiliation = ct["affiliation"]
+                                if ct.get("title_lines"):
+                                    t.title_lines = fix_title_lines_jp(ct["title_lines"])
+                                    t.title = "\n".join(t.title_lines)
                 else:
                     # 件数不一致: speaker名でマッチングして復元
                     ct_by_speaker = {}
                     for ct in ct_list:
-                        sp = (ct.get("speaker") or "").replace(" ", "").replace("\u3000", "")
+                        sp = _sp_key(ct.get("speaker", ""))
                         if sp:
                             ct_by_speaker[sp] = ct
                     for t in payload.talks:
-                        sp = (getattr(t, "speaker", "") or "").replace(" ", "").replace("\u3000", "")
+                        sp = _sp_key(getattr(t, "speaker", ""))
                         if sp and sp in ct_by_speaker:
                             ct = ct_by_speaker[sp]
                             if ct.get("affiliation"):
