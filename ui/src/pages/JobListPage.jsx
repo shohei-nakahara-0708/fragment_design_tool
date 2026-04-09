@@ -1117,7 +1117,7 @@ export default function JobListPage() {
                   }}
                 >
                   <img
-                    src={`${API_BASE}${preview.src}`}
+                    src={preview.src.startsWith("http") ? preview.src : `${API_BASE}${preview.src}`}
                     alt=""
                     style={{
                       maxWidth: "100%",

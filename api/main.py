@@ -10919,7 +10919,38 @@ def _normalize_signed_url(signed: str) -> str:
         signed = f"/storage/v1{signed}"
     return f"{SUPABASE_URL}{signed}"
 
+# --- signed URL cache (in-memory, TTL-based) ---
+_signed_url_cache: Dict[str, tuple] = {}  # path -> (url, expires_at)
+_SIGNED_URL_TTL = 2400  # 40 min (URLs expire in 60 min)
+
+def _get_cached_signed_urls(paths: list[str]) -> tuple[dict[str, str], list[str]]:
+    """Return (cached_map, missing_paths)."""
+    now = time.time()
+    cached = {}
+    missing = []
+    for p in paths:
+        entry = _signed_url_cache.get(p)
+        if entry and entry[1] > now:
+            cached[p] = entry[0]
+        else:
+            missing.append(p)
+    return cached, missing
+
+def _put_signed_url_cache(mapping: dict[str, str]):
+    exp = time.time() + _SIGNED_URL_TTL
+    for p, url in mapping.items():
+        _signed_url_cache[p] = (url, exp)
+    # evict expired entries when cache grows
+    if len(_signed_url_cache) > 5000:
+        now = time.time()
+        expired = [k for k, v in _signed_url_cache.items() if v[1] <= now]
+        for k in expired:
+            del _signed_url_cache[k]
+
 def create_signed_url(remote_path: str, expires_in: int = 3600) -> str:
+    cached, _ = _get_cached_signed_urls([remote_path])
+    if remote_path in cached:
+        return cached[remote_path]
     url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/{remote_path}"
     headers = {**_storage_auth_headers(), "Content-Type": "application/json"}
     r = requests.post(url, headers=headers, json={"expiresIn": expires_in}, timeout=10)
@@ -10929,24 +10960,30 @@ def create_signed_url(remote_path: str, expires_in: int = 3600) -> str:
     signed = body.get("signedURL") or body.get("signedUrl") or ""
     if not signed:
         raise RuntimeError(f"signed url empty: {body}")
-    return _normalize_signed_url(signed)
+    result = _normalize_signed_url(signed)
+    _put_signed_url_cache({remote_path: result})
+    return result
 
 def create_signed_urls_batch(remote_paths: list[str], expires_in: int = 3600) -> dict[str, str]:
     if not remote_paths:
         return {}
+    cached, missing = _get_cached_signed_urls(remote_paths)
+    if not missing:
+        return cached
     url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}"
     headers = {**_storage_auth_headers(), "Content-Type": "application/json"}
-    r = requests.post(url, headers=headers, json={"expiresIn": expires_in, "paths": remote_paths}, timeout=15)
+    r = requests.post(url, headers=headers, json={"expiresIn": expires_in, "paths": missing}, timeout=15)
     if r.status_code >= 400:
         logger.warning(f"batch signed url failed: {r.status_code} {r.text}")
-        return {}
-    result = {}
+        return cached
+    fresh = {}
     for item in r.json():
         path = item.get("path", "")
         signed = item.get("signedURL") or item.get("signedUrl") or ""
         if path and signed:
-            result[path] = _normalize_signed_url(signed)
-    return result
+            fresh[path] = _normalize_signed_url(signed)
+    _put_signed_url_cache(fresh)
+    return {**cached, **fresh}
 
 def delete_storage_files(paths: list[str]):
     if not paths:
@@ -11441,6 +11478,10 @@ async def render(req: RenderReq):
 
     upsert_job_ok(req.jobId, filename, payload, session_id, event_id)
 
+    # invalidate signed URL cache for this preview (image changed)
+    preview_cache_key = f"{req.jobId}/preview.jpg"
+    _signed_url_cache.pop(preview_cache_key, None)
+
     # manual_override=True → 正解DBに自動登録
     if True:
         try:
@@ -11669,7 +11710,11 @@ async def list_jobs(
 
         rows = con.execute(
             f"""
-            SELECT * FROM jobs
+            SELECT job_id, filename, session_id, event_id, status,
+                   created_at, updated_at, title, organizer, datetime,
+                   confidence, warnings_json, manual_override, note,
+                   locked, error_message
+            FROM jobs
             {where_sql}
             {order_sql}
             LIMIT %s OFFSET %s
@@ -11744,11 +11789,12 @@ async def preview(job_id: str):
     sp = storage_paths(job_id)
     try:
         signed = create_signed_url(sp["preview"], expires_in=600)
-        return RedirectResponse(url=signed, status_code=307)
+        return RedirectResponse(url=signed, status_code=307,
+                                headers={"Cache-Control": "private, max-age=300"})
     except Exception:
         data = download_storage_file(sp["preview"])
         return Response(content=data, media_type="image/jpeg",
-                        headers={"Cache-Control": "no-cache"})
+                        headers={"Cache-Control": "private, max-age=60"})
 
 
 @app.get("/export/{job_id}.zip")
