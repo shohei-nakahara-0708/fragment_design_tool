@@ -5888,7 +5888,6 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             aff_candidates: List[str] = []
             pending_role = ""
 
-            import re
             for i, block in enumerate(blocks):
                 text = block.text.strip()
                 if not text:
