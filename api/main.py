@@ -3521,12 +3521,17 @@ def build_speaker_display(name: str) -> str:
     if not core:
         return ""
 
-    # ① 辞書
+    # ① 正解DBから学習した分割位置（最優先）
+    cache = _get_speaker_display_cache()
+    if core in cache:
+        return cache[core]
+
+    # ② 辞書
     v = split_name_by_dictionary(core)
     if v:
         return v
 
-    # ② fallback（既存ロジック）
+    # ③ fallback（既存ロジック）
     return add_space_to_jp_name(core)
 
 def extend_lastname_dict_from_vm(vm_rows):
@@ -4842,6 +4847,12 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
         s = normalize_space(s)
         if not s:
             return False
+        # 正解DBから学習した役割を優先
+        learned = lookup_text_role(s)
+        if learned == "affiliation":
+            return True
+        if learned in ("person_name", "event_title", "talk_title"):
+            return False
         if s.startswith("※"):
             return False
         if "先生" in s:
@@ -5786,6 +5797,12 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             s = normalize_space(s or "")
             if not s:
                 return False
+            # 正解DBから学習した役割を優先
+            learned = lookup_text_role(s)
+            if learned == "affiliation":
+                return True
+            if learned in ("talk_title", "event_title"):
+                return False
             # 施設・所属・役職っぽい語が入ってたら「タイトル継続」ではない
             keywords = [
                 "大学", "病院", "センター", "研究科", "学部", "診療科", "内科", "外科",
@@ -6267,6 +6284,320 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+# 正解DBから学習した speaker_display キャッシュ: {"name_key": "display"}
+# 例: {"秋田谷一輝": "秋田谷 一輝", "下川原裕人": "下川原 裕人"}
+_speaker_display_cache: dict[str, str] = {}
+_speaker_display_cache_loaded: bool = False
+
+def _build_speaker_display_cache() -> dict[str, str]:
+    """正解DBの全レコードから speaker/chair の name→display マッピングを構築。
+    新しいレコード(日付降順)を優先。"""
+    cache: dict[str, str] = {}
+    try:
+        answers = _load_correct_answers()
+        for ans in answers:
+            cj = ans.get("correct_json") or {}
+            # talks
+            for t in (cj.get("talks") or []):
+                sp = (t.get("speaker") or "").replace(" ", "").replace("\u3000", "")
+                disp = (t.get("speaker_display") or "").strip()
+                if sp and disp and " " in disp and sp not in cache:
+                    cache[sp] = disp
+            # chair
+            ch = cj.get("chair") or {}
+            cn = (ch.get("name") or "").replace(" ", "").replace("\u3000", "")
+            cd = (ch.get("name_display") or "").strip()
+            if cn and cd and " " in cd and cn not in cache:
+                cache[cn] = cd
+    except Exception as e:
+        print(f"[speaker-display-cache] build error: {e}")
+    if cache:
+        print(f"[speaker-display-cache] loaded {len(cache)} entries")
+    return cache
+
+def _get_speaker_display_cache() -> dict[str, str]:
+    global _speaker_display_cache, _speaker_display_cache_loaded
+    if not _speaker_display_cache_loaded:
+        _speaker_display_cache = _build_speaker_display_cache()
+        _speaker_display_cache_loaded = True
+    return _speaker_display_cache
+
+def invalidate_speaker_display_cache():
+    """save_correct_answer 後に呼ぶことで次回再構築される"""
+    global _speaker_display_cache_loaded
+    _speaker_display_cache_loaded = False
+
+
+# 正解DBから学習した所属フォーマットキャッシュ: {"nospacekey": "formatted"}
+# 例: {"東京大学大学院消化器内科学教授": "東京大学大学院 消化器内科学 教授"}
+_affiliation_format_cache: dict[str, str] = {}
+_affiliation_format_cache_loaded: bool = False
+
+def _aff_cache_key(s: str) -> str:
+    """所属テキストからスペース・改行を全除去してキーにする"""
+    return re.sub(r'[\s\u3000]+', '', s or '')
+
+def _build_affiliation_format_cache() -> dict[str, str]:
+    """正解DBの全レコードから所属の「正しいスペース位置」を学習。
+    新しいレコード(日付降順)を優先。"""
+    cache: dict[str, str] = {}
+    try:
+        answers = _load_correct_answers()
+        for ans in answers:
+            cj = ans.get("correct_json") or {}
+            # talks
+            for t in (cj.get("talks") or []):
+                raw = (t.get("affiliation") or "").strip()
+                if not raw:
+                    continue
+                # 改行→スペースに正規化（typesetの改行位置は毎回変わるので）
+                flat = re.sub(r'[\n\r]+', ' ', raw)
+                flat = re.sub(r'\s+', ' ', flat).strip()
+                key = _aff_cache_key(flat)
+                if key and len(key) >= 4 and key not in cache:
+                    cache[key] = flat
+            # chair
+            ch = cj.get("chair") or {}
+            raw = (ch.get("affiliation") or "").strip()
+            if raw:
+                flat = re.sub(r'[\n\r]+', ' ', raw)
+                flat = re.sub(r'\s+', ' ', flat).strip()
+                key = _aff_cache_key(flat)
+                if key and len(key) >= 4 and key not in cache:
+                    cache[key] = flat
+    except Exception as e:
+        print(f"[affiliation-format-cache] build error: {e}")
+    if cache:
+        print(f"[affiliation-format-cache] loaded {len(cache)} entries")
+    return cache
+
+def _get_affiliation_format_cache() -> dict[str, str]:
+    global _affiliation_format_cache, _affiliation_format_cache_loaded
+    if not _affiliation_format_cache_loaded:
+        _affiliation_format_cache = _build_affiliation_format_cache()
+        _affiliation_format_cache_loaded = True
+    return _affiliation_format_cache
+
+def invalidate_affiliation_format_cache():
+    """save_correct_answer 後に呼ぶことで次回再構築される"""
+    global _affiliation_format_cache_loaded
+    _affiliation_format_cache_loaded = False
+
+
+# ── テキスト→役割（フィールド）キャッシュ ──
+# 正解DBから「このテキストは所属」「このテキストは演者名」等を学習
+# {"normalizedtext": {"role": "affiliation", "count": 5, "formatted": "東京大学 医学部"}}
+_text_role_cache: dict[str, dict] = {}
+_text_role_cache_loaded: bool = False
+
+def _text_role_key(s: str) -> str:
+    """テキストからスペース・改行・括弧等を除去して正規化キーにする"""
+    s = re.sub(r'[\s\u3000\n\r]+', '', s or '')
+    # 括弧類も除去して一致率UP
+    for ch in '（）()【】[]「」『』':
+        s = s.replace(ch, '')
+    return s
+
+def _build_text_role_cache() -> dict[str, dict]:
+    """正解DBの全レコードからテキスト→フィールド役割マッピングを構築。
+    各テキスト断片が「所属」「演者名」「演題」「講演会名」のどれに使われたかを学習。
+    出現回数が多い役割を採用。"""
+    from collections import Counter
+    role_counts: dict[str, Counter] = {}  # key → Counter({"affiliation": 3, ...})
+    formatted: dict[str, str] = {}  # key → 最新のフォーマット済みテキスト
+
+    try:
+        answers = _load_correct_answers()
+        for ans in answers:
+            cj = ans.get("correct_json") or {}
+
+            # event_title
+            et = (cj.get("event_title") or "").strip()
+            if et:
+                key = _text_role_key(et)
+                if key and len(key) >= 4:
+                    role_counts.setdefault(key, Counter())["event_title"] += 1
+                    if key not in formatted:
+                        formatted[key] = re.sub(r'[\n\r]+', ' ', et).strip()
+
+            # chair
+            ch = cj.get("chair") or {}
+            for field, role in [("name", "person_name"), ("affiliation", "affiliation")]:
+                val = (ch.get(field) or "").strip()
+                if not val:
+                    continue
+                key = _text_role_key(val)
+                min_len = 2 if role == "person_name" else 4
+                if key and len(key) >= min_len:
+                    role_counts.setdefault(key, Counter())[role] += 1
+                    if key not in formatted:
+                        formatted[key] = re.sub(r'[\n\r]+', ' ', val).strip()
+
+            # talks
+            for t in (cj.get("talks") or []):
+                for field, role in [("speaker", "person_name"), ("affiliation", "affiliation")]:
+                    val = (t.get(field) or "").strip()
+                    if not val:
+                        continue
+                    key = _text_role_key(val)
+                    min_len = 2 if role == "person_name" else 4
+                    if key and len(key) >= min_len:
+                        role_counts.setdefault(key, Counter())[role] += 1
+                        if key not in formatted:
+                            formatted[key] = re.sub(r'[\n\r]+', ' ', val).strip()
+                # talk title
+                title_lines = t.get("title_lines") or []
+                title = " ".join(title_lines).strip() if title_lines else (t.get("title") or "").strip()
+                if title:
+                    key = _text_role_key(title)
+                    if key and len(key) >= 6:
+                        role_counts.setdefault(key, Counter())["talk_title"] += 1
+                        if key not in formatted:
+                            formatted[key] = re.sub(r'[\n\r]+', ' ', title).strip()
+    except Exception as e:
+        print(f"[text-role-cache] build error: {e}")
+
+    # Counter → most_common role
+    cache: dict[str, dict] = {}
+    for key, counter in role_counts.items():
+        role, count = counter.most_common(1)[0]
+        if count >= 1:
+            cache[key] = {"role": role, "count": count, "formatted": formatted.get(key, "")}
+    if cache:
+        print(f"[text-role-cache] loaded {len(cache)} entries")
+    return cache
+
+def _get_text_role_cache() -> dict[str, dict]:
+    global _text_role_cache, _text_role_cache_loaded
+    if not _text_role_cache_loaded:
+        _text_role_cache = _build_text_role_cache()
+        _text_role_cache_loaded = True
+    return _text_role_cache
+
+def invalidate_text_role_cache():
+    global _text_role_cache_loaded
+    _text_role_cache_loaded = False
+
+def lookup_text_role(text: str) -> str | None:
+    """テキストの学習済み役割を返す。未学習ならNone。
+    役割: "affiliation", "person_name", "event_title", "talk_title" """
+    cache = _get_text_role_cache()
+    if not cache:
+        return None
+    key = _text_role_key(text)
+    if not key:
+        return None
+    entry = cache.get(key)
+    if entry:
+        return entry["role"]
+    return None
+
+def lookup_text_formatted(text: str) -> str | None:
+    """テキストの学習済みフォーマット版を返す。未学習ならNone。"""
+    cache = _get_text_role_cache()
+    if not cache:
+        return None
+    key = _text_role_key(text)
+    if not key:
+        return None
+    entry = cache.get(key)
+    if entry and entry.get("formatted"):
+        return entry["formatted"]
+    return None
+
+
+def apply_learned_text_roles(payload) -> object:
+    """正解DBから学習したテキスト→役割の知識を使って、フィールド割り振りを検証・修正する。
+    例: title_lines に所属テキストが混入していたら affiliation へ移動する等。"""
+    cache = _get_text_role_cache()
+    if not cache:
+        return payload
+
+    # ─────────── talks ───────────
+    for t in getattr(payload, "talks", []) or []:
+        title_lines = list(getattr(t, "title_lines", []) or [])
+        current_aff = normalize_space(getattr(t, "affiliation", "") or "")
+
+        # (A) title_lines に所属テキストが混入 → affiliation に移動
+        new_title_lines = []
+        moved_aff_parts = []
+        for line in title_lines:
+            key = _text_role_key(line)
+            entry = cache.get(key) if key else None
+            if entry and entry["role"] == "affiliation" and entry["count"] >= 2:
+                moved_aff_parts.append(line)
+                print(f"[text-role-fix] moved from title to affiliation: '{line[:40]}'")
+            else:
+                new_title_lines.append(line)
+
+        if moved_aff_parts:
+            t.title_lines = new_title_lines
+            t.title = "\n".join(new_title_lines)
+            if not current_aff:
+                t.affiliation = " ".join(moved_aff_parts)
+
+        # (B) affiliation に演題テキストが混入 → title_lines に移動
+        aff = normalize_space(getattr(t, "affiliation", "") or "")
+        if aff:
+            key = _text_role_key(aff)
+            entry = cache.get(key) if key else None
+            if entry and entry["role"] == "talk_title" and entry["count"] >= 2:
+                current_title = getattr(t, "title_lines", []) or []
+                if not current_title or not "".join(current_title).strip():
+                    print(f"[text-role-fix] moved from affiliation to title: '{aff[:40]}'")
+                    t.title_lines = [aff]
+                    t.title = aff
+                    t.affiliation = ""
+
+        # (C) 全フィールドのテキストに学習済みフォーマットを適用
+        aff = getattr(t, "affiliation", "") or ""
+        if aff:
+            fmt = lookup_text_formatted(aff)
+            if fmt and fmt != aff.replace("\n", " ").strip():
+                t.affiliation = fmt
+
+    # ─────────── chair ───────────
+    if getattr(payload, "chair", None):
+        aff = getattr(payload.chair, "affiliation", "") or ""
+        if aff:
+            fmt = lookup_text_formatted(aff)
+            if fmt and fmt != aff.replace("\n", " ").strip():
+                payload.chair.affiliation = fmt
+
+    return payload
+
+
+def apply_learned_affiliation_format(payload) -> object:
+    """正解DBから学習した所属のスペース位置を適用する。
+    blocks由来のスペースなしテキストを、ユーザーが過去に確定した
+    スペース入りテキストに置換する。"""
+    cache = _get_affiliation_format_cache()
+    if not cache:
+        return payload
+
+    # chair
+    if getattr(payload, "chair", None):
+        aff = getattr(payload.chair, "affiliation", "") or ""
+        key = _aff_cache_key(aff)
+        if key and key in cache:
+            learned = cache[key]
+            if learned != aff.replace("\n", " ").strip():
+                print(f"[affiliation-format-cache] chair: '{aff[:40]}' -> '{learned[:40]}'")
+                payload.chair.affiliation = learned
+
+    # talks
+    for t in getattr(payload, "talks", []) or []:
+        aff = getattr(t, "affiliation", "") or ""
+        key = _aff_cache_key(aff)
+        if key and key in cache:
+            learned = cache[key]
+            if learned != aff.replace("\n", " ").strip():
+                print(f"[affiliation-format-cache] talk: '{aff[:40]}' -> '{learned[:40]}'")
+                t.affiliation = learned
+
+    return payload
+
+
 def _load_correct_answers() -> list[dict]:
     """正解DBを読み込む（Postgres）"""
     try:
@@ -6360,6 +6691,11 @@ def save_correct_answer(
             con.commit()
     except Exception as e:
         print(f"[correct_answers] save error: {e}")
+
+    # 保存後にキャッシュを無効化（次回再構築）
+    invalidate_speaker_display_cache()
+    invalidate_affiliation_format_cache()
+    invalidate_text_role_cache()
 
 
 def find_similar_correct_answers(
@@ -6807,11 +7143,21 @@ def clean_ai_talk_titles(payload: DesignJSON) -> DesignJSON:
                 if inner.count(open_q) == inner.count(close_q):
                     s = inner
 
-        # 括弧のバランス補完
-        if s.count("（") > s.count("）"):
-            s += "）"
-        if s.count("(") > s.count(")"):
-            s += ")"
+        # 括弧のバランス補完（半角・全角混在に対応）
+        open_full = s.count("（")
+        close_full = s.count("）")
+        open_half = s.count("(") - open_full  # 念のため重複除外(不要だが安全)
+        close_half = s.count(")") - close_full
+        # 半角(も全角（も開き括弧として合算して判定
+        # ただし count("(") は全角を含まないので単純合算
+        total_open = s.count("（") + s.count("(")
+        total_close = s.count("）") + s.count(")")
+        if total_open > total_close:
+            # 全角開きが多い → 全角閉じで補完、半角開きが多い → 半角閉じで補完
+            if s.count("（") > s.count("）"):
+                s += "）"
+            elif s.count("(") > s.count(")"):
+                s += ")"
 
         # 医療用語の標準化を適用
         s = normalize_medical_terms(s)
@@ -10118,6 +10464,12 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
 
     refined = finalize_people_fields(refined)
     dump_titles("after finalize_people_fields", refined)
+
+    refined = apply_learned_text_roles(refined)
+    dump_titles("after apply_learned_text_roles", refined)
+
+    refined = apply_learned_affiliation_format(refined)
+    dump_titles("after apply_learned_affiliation_format", refined)
 
     refined = fill_datetime_parts(refined, blocks)
 
