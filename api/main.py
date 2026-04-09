@@ -5050,169 +5050,32 @@ def remove_person_names_from_affiliation(affiliation: str, person_name: str) -> 
         if cand:
             mp[key] = cand[0][1]
 
+    # ★ 学習済み所属フォーマットを適用（スペース位置の正規化）
+    aff_cache = _get_affiliation_format_cache()
+    if aff_cache:
+        for name_key, aff_val in mp.items():
+            if not aff_val:
+                continue
+            ck = _aff_cache_key(aff_val)
+            if ck and ck in aff_cache:
+                learned = aff_cache[ck]
+                if learned != aff_val:
+                    mp[name_key] = learned
+
     return mp
 
 def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str], heading_words=None, debug=False) -> Chair:
-    # heading_words, debugのデフォルト値をローカルでセット（未定義時のみ）
-    if heading_words is None:
-        heading_words = {"PROGRAM", "P R O G R A M", "AGENDA", "SCHEDULE", "TIME TABLE", "タイムテーブル", "プログラム"}
-    # debugは引数のデフォルト値False
-        """
-        「座長」ラベル近傍から座長情報を抽出する
-        - 座長ラベルより上のブロックを優先検索（レイアウト修正）
-        - 「先生」付きテキストから名前部分を抽出
-        - speaker_mapから対応する所属情報を取得
-        """
-        # speaker_mapがNoneの場合は空辞書をセット
-        if speaker_map is None:
-            speaker_map = {}
-    
-        chair_anchor = None
-        for b in blocks:
-            if "座長" in b.text:
-                chair_anchor = b
-                break
-        if not chair_anchor:
-            return Chair()
-
-        # 座長ラベル近傍（下方向を優先）
-        x0 = chair_anchor.left - 200000
-        x1 = chair_anchor.left + 5000000
-        y0 = chair_anchor.top - 200000
-        y1 = chair_anchor.top + 1200000
-
-        near = [b for b in blocks if in_region(b, x0, y0, x1, y1)]
-        # 座長ラベルより上にあるブロックを優先（レイアウト修正）
-        above_chair = [b for b in near if b.top < chair_anchor.top]
-        below_chair = [b for b in near if b.top > chair_anchor.top]
-
-        # ① まず座長ラベル「より上」のブロックから人名らしい行を探す
-        for b in sorted(above_chair, key=lambda x: -x.top):  # 上から順
-            text = normalize_space(b.text)
-            print(f"[CHAIR DEBUG] 座長候補（上）: {b.text.strip()} (top: {b.top})")
-            print(f"[CHAIR DEBUG] 処理テキスト: '{text}'")
-            for line in text.split("\n"):
-                line = line.strip()
-                # 「先生」付きなら前方の部分を候補に
-                if "先生" in line:
-                    name_part = line.split("先生")[0].strip()
-                    # スペース・記号で分割
-                    words = re.split(r'[\s　,、，・/／（）\(\)\[\]【】]+', name_part)
-                    affiliation_words = []
-                    # 所属ワードリスト
-                    aff_words = {"大学", "病院", "センター", "外科", "内科", "教授", "医長", "診療科", "部", "科", "クリニック", "Department", "Hospital", "Center", "Clinic", "Professor"}
-                    # 2語目が所属ワードなら1語目だけを人名候補に
-                    if len(words) >= 2 and (words[1] in aff_words or any(w in words[1] for w in aff_words)):
-                        name_candidate = words[0]
-                        affiliation_words = words[1:]
-                    else:
-                        name_candidate = " ".join(words[:2]) if len(words) >= 2 else (words[0] if words else name_part)
-                        affiliation_words = words[2:] if len(words) > 2 else []
-                    affiliation_candidate = " ".join(affiliation_words)
-                    # 見出しワードやアルファベットは除外
-                    if name_candidate.upper() in heading_words or re.fullmatch(r'[A-Za-z\s\.\-]+', name_candidate):
-                        continue
-                    print(f"[CHAIR DEBUG] 先生付き: '{name_candidate}' → is_valid_person_name={is_valid_person_name(name_candidate)}")
-                    if is_valid_person_name(name_candidate):
-                        key = norm_name(name_candidate)
-                        aff = speaker_map.get(key, affiliation_candidate) if speaker_map else affiliation_candidate
-                        print(f"[CHAIR DEBUG] 座長選択（上・先生付き）: {key} / aff='{aff}'")
-                        return Chair(
-                            name=key,
-                            name_display=build_speaker_display(key),
-                            affiliation=normalize_space(aff),
-                        )
-                # 「先生」なしでも人名らしい行を候補に
-                elif is_valid_person_name(line):
-                    key = norm_name(line)
-                    aff = speaker_map.get(key, "") if speaker_map else ""
-                    print(f"[CHAIR DEBUG] 座長選択（上・人名判定）: {key}")
-                    return Chair(
-                        name=key,
-                        name_display=build_speaker_display(key),
-                        affiliation=normalize_space(aff),
-                    )
-
-        # ② 次に座長ラベル「より下」から探す
-        for b in sorted(below_chair, key=lambda x: x.top):
-            if "先生" in b.text:
-                # テキストから名前部分だけを抽出（所属は除去）
-                text = normalize_space(b.text)
-                # 「先生」以降のテキストから所属候補を抽出
-                after_sensei = text.split("先生", 1)[1].strip() if "先生" in text else ""
-                after_sensei = re.sub(r'^[（(]\s*', '', after_sensei)
-                after_sensei = re.sub(r'\s*[）)]$', '', after_sensei)
-                aff_from_text = after_sensei.strip()
-
-                # 「先生」前のテキストからも aff_words で名前と所属を分離
-                name_part_raw = text.split("先生")[0].strip()
-                words_below = re.split(r'[\s　,、，・/／（）\(\)\[\]【】]+', name_part_raw)
-                aff_words_below = {"大学", "病院", "センター", "外科", "内科", "教授", "医長", "診療科", "部", "科", "クリニック", "Department", "Hospital", "Center", "Clinic", "Professor"}
-                aff_candidate_below = ""
-                name_candidate_below = name_part_raw
-                if len(words_below) >= 2 and (words_below[1] in aff_words_below or any(w in words_below[1] for w in aff_words_below)):
-                    name_candidate_below = words_below[0]
-                    aff_candidate_below = " ".join(words_below[1:])
-
-                # 所属候補: 先生前から分離した所属 > 先生後テキスト > 空
-                fallback_aff = aff_candidate_below or aff_from_text
-
-                # パターン1: "名前先生\n（所属）" または "名前先生 （所属）" 形式から名前だけ抽出
-                name_match = re.match(r'^([^\n（(]+)先生[\n\s]*[（(]?', text)
-                if name_match:
-                    name_only = name_match.group(1).strip()
-                    # aff_words分離が行われた場合はそちらの名前を使う
-                    if aff_candidate_below:
-                        name_only = name_candidate_below
-                    key = norm_name(name_only)
-                    if key:
-                        aff = speaker_map.get(key, fallback_aff) if speaker_map else fallback_aff
-                        return Chair(
-                            name=key,
-                            name_display=build_speaker_display(key),
-                            affiliation=normalize_space(aff),
-                        )
-            
-                # パターン2: 単純に先生前の部分だけを抽出
-                if "先生" in text:
-                    if aff_candidate_below:
-                        key = norm_name(name_candidate_below)
-                    else:
-                        name_part = text.split("先生")[0].strip()
-                        key = norm_name(name_part)
-                    if key and len(key) >= 2:  # 名前として妥当な長さ
-                        aff = speaker_map.get(key, fallback_aff) if speaker_map else fallback_aff
-                        return Chair(
-                            name=key,
-                            name_display=build_speaker_display(key),
-                            affiliation=normalize_space(aff),
-                        )
-
-        # ③ フォールバック：speaker_map のキーが含まれるか
-        if speaker_map:
-            joined = normalize_key("\n".join(b.text for b in near))
-            for key, aff in speaker_map.items():
-                if key and key in joined:
-                    return Chair(
-                        name=key,
-                        name_display=build_speaker_display(key),
-                        affiliation=normalize_space(aff),
-                    )
-
-        return Chair()
     """
     「座長」ラベル近傍から座長情報を抽出する
     - 座長ラベルより上のブロックを優先検索（レイアウト修正）
     - 「先生」付きテキストから名前部分を抽出
     - speaker_mapから対応する所属情報を取得
     """
-    # speaker_mapがNoneの場合は空辞書をセット
-    if speaker_map is None:
-        speaker_map = {}
     if heading_words is None:
         heading_words = {"PROGRAM", "P R O G R A M", "AGENDA", "SCHEDULE", "TIME TABLE", "タイムテーブル", "プログラム"}
-    # debugは引数のデフォルト値False
-        
+    if speaker_map is None:
+        speaker_map = {}
+
     chair_anchor = None
     for b in blocks:
         if "座長" in b.text:
@@ -5242,23 +5105,27 @@ def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             # 「先生」付きなら前方の部分を候補に
             if "先生" in line:
                 name_part = line.split("先生")[0].strip()
-                # 日本語の単語だけを抽出
-                jp_words = re.findall(r'[一-龯ぁ-んァ-ヴー]+', name_part)
-                if len(jp_words) >= 2:
-                    candidate = jp_words[0] + " " + jp_words[1]
-                elif jp_words:
-                    candidate = jp_words[0]
+                # スペース・記号で分割
+                words = re.split(r'[\s　,、，・/／（）\(\)\[\]【】]+', name_part)
+                affiliation_words = []
+                # 所属ワードリスト
+                aff_words = {"大学", "病院", "センター", "外科", "内科", "教授", "医長", "診療科", "部", "科", "クリニック", "Department", "Hospital", "Center", "Clinic", "Professor"}
+                # 2語目が所属ワードなら1語目だけを人名候補に
+                if len(words) >= 2 and (words[1] in aff_words or any(w in words[1] for w in aff_words)):
+                    name_candidate = words[0]
+                    affiliation_words = words[1:]
                 else:
-                    candidate = name_part
+                    name_candidate = " ".join(words[:2]) if len(words) >= 2 else (words[0] if words else name_part)
+                    affiliation_words = words[2:] if len(words) > 2 else []
+                affiliation_candidate = " ".join(affiliation_words)
                 # 見出しワードやアルファベットは除外
-                heading_words = {"PROGRAM", "P R O G R A M", "AGENDA", "SCHEDULE", "TIME TABLE", "タイムテーブル", "プログラム"}
-                if candidate.upper() in heading_words or re.fullmatch(r'[A-Za-z\s\.\-]+', candidate):
+                if name_candidate.upper() in heading_words or re.fullmatch(r'[A-Za-z\s\.\-]+', name_candidate):
                     continue
-                print(f"[CHAIR DEBUG] 先生付き: '{candidate}' → is_valid_person_name={is_valid_person_name(candidate)}")
-                if is_valid_person_name(candidate):
-                    key = norm_name(candidate)
-                    aff = speaker_map.get(key, "") if speaker_map else ""
-                    print(f"[CHAIR DEBUG] 座長選択（上・先生付き）: {key}")
+                print(f"[CHAIR DEBUG] 先生付き: '{name_candidate}' → is_valid_person_name={is_valid_person_name(name_candidate)}")
+                if is_valid_person_name(name_candidate):
+                    key = norm_name(name_candidate)
+                    aff = speaker_map.get(key, affiliation_candidate) if speaker_map else affiliation_candidate
+                    print(f"[CHAIR DEBUG] 座長選択（上・先生付き）: {key} / aff='{aff}'")
                     return Chair(
                         name=key,
                         name_display=build_speaker_display(key),
@@ -5280,26 +5147,50 @@ def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
         if "先生" in b.text:
             # テキストから名前部分だけを抽出（所属は除去）
             text = normalize_space(b.text)
-            
+            # 「先生」以降のテキストから所属候補を抽出
+            after_sensei = text.split("先生", 1)[1].strip() if "先生" in text else ""
+            after_sensei = re.sub(r'^[（(]\s*', '', after_sensei)
+            after_sensei = re.sub(r'\s*[）)]$', '', after_sensei)
+            aff_from_text = after_sensei.strip()
+
+            # 「先生」前のテキストからも aff_words で名前と所属を分離
+            name_part_raw = text.split("先生")[0].strip()
+            words_below = re.split(r'[\s　,、，・/／（）\(\)\[\]【】]+', name_part_raw)
+            aff_words_below = {"大学", "病院", "センター", "外科", "内科", "教授", "医長", "診療科", "部", "科", "クリニック", "Department", "Hospital", "Center", "Clinic", "Professor"}
+            aff_candidate_below = ""
+            name_candidate_below = name_part_raw
+            if len(words_below) >= 2 and (words_below[1] in aff_words_below or any(w in words_below[1] for w in aff_words_below)):
+                name_candidate_below = words_below[0]
+                aff_candidate_below = " ".join(words_below[1:])
+
+            # 所属候補: 先生前から分離した所属 > 先生後テキスト > 空
+            fallback_aff = aff_candidate_below or aff_from_text
+
             # パターン1: "名前先生\n（所属）" または "名前先生 （所属）" 形式から名前だけ抽出
             name_match = re.match(r'^([^\n（(]+)先生[\n\s]*[（(]?', text)
             if name_match:
                 name_only = name_match.group(1).strip()
+                # aff_words分離が行われた場合はそちらの名前を使う
+                if aff_candidate_below:
+                    name_only = name_candidate_below
                 key = norm_name(name_only)
                 if key:
-                    aff = speaker_map.get(key, "") if speaker_map else ""
+                    aff = speaker_map.get(key, fallback_aff) if speaker_map else fallback_aff
                     return Chair(
                         name=key,
                         name_display=build_speaker_display(key),
                         affiliation=normalize_space(aff),
                     )
-            
+
             # パターン2: 単純に先生前の部分だけを抽出
             if "先生" in text:
-                name_part = text.split("先生")[0].strip()
-                key = norm_name(name_part)
+                if aff_candidate_below:
+                    key = norm_name(name_candidate_below)
+                else:
+                    name_part = text.split("先生")[0].strip()
+                    key = norm_name(name_part)
                 if key and len(key) >= 2:  # 名前として妥当な長さ
-                    aff = speaker_map.get(key, "") if speaker_map else ""
+                    aff = speaker_map.get(key, fallback_aff) if speaker_map else fallback_aff
                     return Chair(
                         name=key,
                         name_display=build_speaker_display(key),
@@ -5318,7 +5209,6 @@ def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                 )
 
     return Chair()
-
 
 
 def pick_time(texts: List[str], time_candidates: List[str]) -> str:
@@ -6666,7 +6556,7 @@ def apply_learned_text_roles(payload) -> object:
         for line in title_lines:
             key = _text_role_key(line)
             entry = cache.get(key) if key else None
-            if entry and entry["role"] == "affiliation" and entry["count"] >= 2:
+            if entry and entry["role"] == "affiliation" and entry["count"] >= 1:
                 moved_aff_parts.append(line)
                 print(f"[text-role-fix] moved from title to affiliation: '{line[:40]}'")
             else:
@@ -6683,7 +6573,7 @@ def apply_learned_text_roles(payload) -> object:
         if aff:
             key = _text_role_key(aff)
             entry = cache.get(key) if key else None
-            if entry and entry["role"] == "talk_title" and entry["count"] >= 2:
+            if entry and entry["role"] == "talk_title" and entry["count"] >= 1:
                 current_title = getattr(t, "title_lines", []) or []
                 if not current_title or not "".join(current_title).strip():
                     print(f"[text-role-fix] moved from affiliation to title: '{aff[:40]}'")
@@ -6717,25 +6607,36 @@ def apply_learned_affiliation_format(payload) -> object:
     if not cache:
         return payload
 
+    def _lookup(aff: str) -> str | None:
+        """完全一致 → 前方一致の順で学習済みフォーマットを検索"""
+        key = _aff_cache_key(aff)
+        if not key:
+            return None
+        # 完全一致
+        if key in cache:
+            return cache[key]
+        # 前方一致（施設名は同じだが役職等が追加されたケース）
+        for ck, cv in cache.items():
+            if ck and key.startswith(ck) and len(ck) >= 6:
+                suffix = key[len(ck):]
+                return cv + " " + suffix
+        return None
+
     # chair
     if getattr(payload, "chair", None):
         aff = getattr(payload.chair, "affiliation", "") or ""
-        key = _aff_cache_key(aff)
-        if key and key in cache:
-            learned = cache[key]
-            if learned != aff:
-                print(f"[affiliation-format-cache] chair: '{aff[:40]}' -> '{learned[:40]}'")
-                payload.chair.affiliation = learned
+        learned = _lookup(aff)
+        if learned and learned != aff:
+            print(f"[affiliation-format-cache] chair: '{aff[:40]}' -> '{learned[:40]}'")
+            payload.chair.affiliation = learned
 
     # talks
     for t in getattr(payload, "talks", []) or []:
         aff = getattr(t, "affiliation", "") or ""
-        key = _aff_cache_key(aff)
-        if key and key in cache:
-            learned = cache[key]
-            if learned != aff:
-                print(f"[affiliation-format-cache] talk: '{aff[:40]}' -> '{learned[:40]}'")
-                t.affiliation = learned
+        learned = _lookup(aff)
+        if learned and learned != aff:
+            print(f"[affiliation-format-cache] talk: '{aff[:40]}' -> '{learned[:40]}'")
+            t.affiliation = learned
 
     return payload
 
@@ -6789,13 +6690,35 @@ def save_correct_answer(
     job_id: str = "",
 ) -> None:
     """確定済みの正解データをPostgresに保存する（embedding付き）"""
-    # 保存前バリデーション: talks の affiliation に座長情報が混入していたら除去
+    _INVALID_NAMES = {"PROGRAM", "P R O G R A M", "AGENDA", "SCHEDULE", "TIME TABLE", "タイムテーブル", "プログラム"}
+
+    # 保存前バリデーション
+    # (A) chair の不正データ除去
+    ch = correct_json.get("chair") or {}
+    if ch:
+        ch_name = (ch.get("name") or "").strip()
+        if ch_name.upper() in _INVALID_NAMES:
+            print(f"[correct-answer] WARNING: clearing invalid chair name before save: '{ch_name}'")
+            ch["name"] = ""
+            ch["name_display"] = ""
+        ch_aff = (ch.get("affiliation") or "").strip()
+        if ch_aff.upper() in _INVALID_NAMES:
+            print(f"[correct-answer] WARNING: clearing invalid chair affiliation before save: '{ch_aff}'")
+            ch["affiliation"] = ""
+
+    # (B) talks の affiliation に座長情報が混入していたら除去
     if "talks" in correct_json:
         for t in correct_json.get("talks", []):
             aff = t.get("affiliation", "") or ""
             if "座長" in aff:
                 print(f"[correct-answer] WARNING: clearing chair-contaminated affiliation in talk before save: '{aff[:60]}'")
                 t["affiliation"] = ""
+            # speaker の不正値チェック
+            sp = (t.get("speaker") or "").strip()
+            if sp.upper() in _INVALID_NAMES:
+                print(f"[correct-answer] WARNING: clearing invalid speaker before save: '{sp}'")
+                t["speaker"] = ""
+                t["speaker_display"] = ""
 
     keywords = list(_extract_keywords(blocks_text + " " + event_title))
     truncated_text = blocks_text[:2000]
@@ -6913,6 +6836,10 @@ def _build_dynamic_few_shot(similar_answers: list[dict]) -> list[dict]:
                     "name": chair.get("name", ""),
                     "affiliation": chair.get("affiliation", ""),
                 }
+        if cj.get("organizer"):
+            summary["organizer"] = cj["organizer"]
+        if cj.get("datetime"):
+            summary["datetime"] = cj["datetime"]
 
         # 入力コンテキストを含めることでAIが「何に対してこの正解か」理解できるようにする
         blocks_excerpt = (ans.get("blocks_text", "") or "")[:500]
@@ -6970,9 +6897,15 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
         cc = correct.get("chair") or {}
         if cc and payload.chair:
             if cc.get("name"):
-                payload.chair.name = cc["name"]
+                # 見出しワードは名前として無効
+                _heading = {"PROGRAM", "P R O G R A M", "AGENDA", "SCHEDULE"}
+                if cc["name"].upper() not in _heading:
+                    payload.chair.name = cc["name"]
             if cc.get("affiliation"):
-                payload.chair.affiliation = cc["affiliation"]
+                # 明らかに不正な所属値は除外
+                _bad_aff = {"P R O G R A M", "PROGRAM", "AGENDA"}
+                if cc["affiliation"].upper().strip() not in _bad_aff:
+                    payload.chair.affiliation = cc["affiliation"]
 
         # ---- event_title ---- (sim >= 0.85: 同一/ほぼ同一イベントの可能性が高い)
         if sim >= 0.85:
