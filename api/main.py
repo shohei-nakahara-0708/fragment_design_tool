@@ -138,24 +138,35 @@ MEDICAL_TITLE_NORMALIZATION = {
 }
 
 def normalize_medical_terms(text: str) -> str:
-    """医療用語を標準化（より精密な処理）"""
+    """医療用語を標準化（日本語テキスト対応の境界検出）"""
     import re
     result = text
-    
-    # 組織名の標準化（完全一致または境界を考慮）
+
+    # 日本語対応の境界パターン（\b は日本語文字で機能しないため独自実装）
+    # 組織名・役職名の前後が漢字でないことを境界とする（助詞「の」「は」等は境界OK）
+    def _jp_boundary_pattern(variant: str) -> str:
+        escaped = re.escape(variant)
+        # CJK漢字を含むかチェック
+        has_cjk = bool(re.search(r'[\u4e00-\u9fff]', variant))
+        if has_cjk:
+            # 日本語の場合: 前後が漢字でないことを確認（ひらがな・カタカナ・記号は境界扱い）
+            return f'(?<![\u4e00-\u9fff]){escaped}(?![\u4e00-\u9fff])'
+        else:
+            # 英語の場合: 通常の \b を使用
+            return r'\b' + escaped + r'\b'
+
+    # 組織名の標準化
     for standard, variants in MEDICAL_ORGANIZATION_NORMALIZATION.items():
         for variant in variants:
-            # 完全一致または前後に区切り文字がある場合のみ置換
-            pattern = r'\b' + re.escape(variant) + r'\b'
+            pattern = _jp_boundary_pattern(variant)
             result = re.sub(pattern, standard, result)
-    
-    # 役職名の標準化（完全一致または境界を考慮）
+
+    # 役職名の標準化
     for standard, variants in MEDICAL_TITLE_NORMALIZATION.items():
         for variant in variants:
-            # 完全一致または前後に区切り文字がある場合のみ置換  
-            pattern = r'\b' + re.escape(variant) + r'\b'
+            pattern = _jp_boundary_pattern(variant)
             result = re.sub(pattern, standard, result)
-    
+
     return result
 
 ORG_CANON = {
@@ -6287,9 +6298,18 @@ def save_correct_answer(
     job_id: str = "",
 ) -> None:
     """確定済みの正解データをPostgresに保存する（embedding付き）"""
+    # 保存前バリデーション: talks の affiliation に座長情報が混入していたら除去
+    if "talks" in correct_json:
+        for t in correct_json.get("talks", []):
+            aff = t.get("affiliation", "") or ""
+            if "座長" in aff:
+                print(f"[correct-answer] WARNING: clearing chair-contaminated affiliation in talk before save: '{aff[:60]}'")
+                t["affiliation"] = ""
+
     keywords = list(_extract_keywords(blocks_text + " " + event_title))
     truncated_text = blocks_text[:2000]
     embedding = _compute_embedding(blocks_text + " " + event_title)
+    print(f"[correct-answer] saving job_id={job_id} event_title='{event_title[:60]}' blocks_text={len(blocks_text)} chars, embedding={'yes' if embedding else 'no'}")
 
     try:
         with db_connect() as con:
@@ -6332,6 +6352,7 @@ def find_similar_correct_answers(
 ) -> list[dict]:
     """類似する正解データを検索して返す（embedding優先、fallback: Jaccard）"""
     answers = _load_correct_answers()
+    print(f"[correct-answer-search] loaded {len(answers)} answers, query event_title='{event_title[:60]}', blocks_text={len(blocks_text)} chars")
     if not answers:
         return []
 
@@ -6358,11 +6379,23 @@ def find_similar_correct_answers(
     for idx, (sim, ans) in enumerate(scored):
         ans["_rank_index"] = idx
     scored.sort(key=lambda x: (-x[0], x[1].get("_rank_index", 0)))
-    return [item[1] for item in scored[:top_k]]
+
+    results = [item[1] for item in scored[:top_k]]
+    for r in results:
+        print(f"[correct-answer-search] match: sim={r.get('_similarity', 0):.3f} job_id={r.get('job_id', '')} title='{r.get('event_title', '')[:50]}'")
+    if not results:
+        # スコア上位を表示してデバッグ支援
+        all_scored = sorted([(s, a) for s, a in scored] if scored else [], key=lambda x: -x[0])
+        if not all_scored and answers:
+            print(f"[correct-answer-search] no matches above min_similarity={min_similarity}")
+        for s, a in all_scored[:3]:
+            print(f"[correct-answer-search] (below threshold) sim={s:.3f} title='{a.get('event_title', '')[:50]}'")
+
+    return results
 
 
 def _build_dynamic_few_shot(similar_answers: list[dict]) -> list[dict]:
-    """正解DBの類似結果をfew-shot messagesに変換"""
+    """正解DBの類似結果をfew-shot messagesに変換（入力コンテキスト付き）"""
     messages = []
     for ans in similar_answers:
         cj = ans.get("correct_json", {})
@@ -6385,7 +6418,13 @@ def _build_dynamic_few_shot(similar_answers: list[dict]) -> list[dict]:
                     "affiliation": chair.get("affiliation", ""),
                 }
 
-        user_msg = f"類似スライド: {ans.get('event_title', '(不明)')}"
+        # 入力コンテキストを含めることでAIが「何に対してこの正解か」理解できるようにする
+        blocks_excerpt = (ans.get("blocks_text", "") or "")[:500]
+        user_msg = (
+            f"過去の確定済み類似スライド（参考）:\n"
+            f"イベント: {ans.get('event_title', '(不明)')}\n"
+            f"ブロックテキスト抜粋: {blocks_excerpt}"
+        )
         assistant_msg = json.dumps(summary, ensure_ascii=False)
         messages.append({"role": "user", "content": user_msg})
         messages.append({"role": "assistant", "content": assistant_msg})
@@ -6396,8 +6435,9 @@ def _build_dynamic_few_shot(similar_answers: list[dict]) -> list[dict]:
 def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSON:
     """
     後処理で上書きされたフィールドを正解DBから復元する。
-    - 類似度 >= 0.70 : event_title, organizer, chair を復元
-    - 類似度 >= 0.85 : talks の speaker / affiliation / title も復元（同一書類の可能性が高い）
+    - 類似度 >= 0.80 : organizer, chair を復元
+    - 類似度 >= 0.85 : event_title も復元（類似だが別イベントの誤上書きを防止）
+    - 類似度 >= 0.90 : talks の speaker / affiliation / title も復元（同一書類の可能性が高い）
     """
     try:
         all_blocks_text = " ".join(
@@ -6413,18 +6453,11 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
         best = similar[0]
         sim = best.get("_similarity", 0.0)
 
-        if sim < 0.70:
+        if sim < 0.80:
             return payload
 
         correct = best.get("correct_json") or {}
         print(f"[correct-answer-overlay] sim={sim:.2f} job_id={best.get('job_id','')}")
-
-        # ---- event_title ---- (DB の改行位置をそのまま復元)
-        if correct.get("event_title_lines"):
-            payload.event_title_lines = correct["event_title_lines"]
-            payload.event_title = "\n".join(correct["event_title_lines"])
-        elif correct.get("event_title"):
-            payload.event_title = correct["event_title"]
 
         # ---- organizer ----
         if correct.get("organizer"):
@@ -6438,22 +6471,48 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
             if cc.get("affiliation"):
                 payload.chair.affiliation = cc["affiliation"]
 
-        # ---- talks (高類似度: 同一ドキュメントの可能性が高い) ----
+        # ---- event_title ---- (sim >= 0.85: 同一/ほぼ同一イベントの可能性が高い)
         if sim >= 0.85:
+            if correct.get("event_title_lines"):
+                payload.event_title_lines = correct["event_title_lines"]
+                payload.event_title = "\n".join(correct["event_title_lines"])
+            elif correct.get("event_title"):
+                payload.event_title = correct["event_title"]
+
+        # ---- talks (高類似度: 同一ドキュメントの可能性が高い) ----
+        if sim >= 0.90:
             ct_list = correct.get("talks") or []
-            if ct_list and payload.talks and len(ct_list) == len(payload.talks):
-                for i, ct in enumerate(ct_list):
-                    t = payload.talks[i]
-                    if ct.get("speaker"):
-                        t.speaker = ct["speaker"]
-                    if ct.get("affiliation"):
-                        t.affiliation = ct["affiliation"]
-                    # title_lines: DB の改行位置を復元 + fix_title_lines_jp で補正
-                    if ct.get("title_lines"):
-                        t.title_lines = fix_title_lines_jp(ct["title_lines"])
-                        t.title = "\n".join(t.title_lines)
-                    elif ct.get("title"):
-                        t.title = ct["title"]
+            if ct_list and payload.talks:
+                # 件数一致なら index ベースで復元
+                if len(ct_list) == len(payload.talks):
+                    for i, ct in enumerate(ct_list):
+                        t = payload.talks[i]
+                        if ct.get("speaker"):
+                            t.speaker = ct["speaker"]
+                        if ct.get("affiliation"):
+                            t.affiliation = ct["affiliation"]
+                        # title_lines: DB の改行位置を復元 + fix_title_lines_jp で補正
+                        if ct.get("title_lines"):
+                            t.title_lines = fix_title_lines_jp(ct["title_lines"])
+                            t.title = "\n".join(t.title_lines)
+                        elif ct.get("title"):
+                            t.title = ct["title"]
+                else:
+                    # 件数不一致: speaker名でマッチングして復元
+                    ct_by_speaker = {}
+                    for ct in ct_list:
+                        sp = (ct.get("speaker") or "").replace(" ", "").replace("\u3000", "")
+                        if sp:
+                            ct_by_speaker[sp] = ct
+                    for t in payload.talks:
+                        sp = (getattr(t, "speaker", "") or "").replace(" ", "").replace("\u3000", "")
+                        if sp and sp in ct_by_speaker:
+                            ct = ct_by_speaker[sp]
+                            if ct.get("affiliation"):
+                                t.affiliation = ct["affiliation"]
+                            if ct.get("title_lines"):
+                                t.title_lines = fix_title_lines_jp(ct["title_lines"])
+                                t.title = "\n".join(t.title_lines)
 
     except Exception as e:
         print(f"[correct-answer-overlay] error: {e}")
@@ -6730,9 +6789,15 @@ def clean_ai_talk_titles(payload: DesignJSON) -> DesignJSON:
             cleaned_speaker = normalize_person_name(t.speaker)
             t.speaker = normalize_medical_terms(cleaned_speaker).strip()
         if t.affiliation:
-            # 所属から肩書き除去 → 医療用語標準化
-            cleaned_affiliation = normalize_affiliation(t.affiliation)
-            t.affiliation = normalize_medical_terms(cleaned_affiliation).strip()
+            # 所属に「座長」情報が混入している場合は除去
+            aff_text = normalize_space(t.affiliation)
+            if "座長" in aff_text:
+                # 「座長 ○○ 先生 大阪刀根山…」のようなブロック全体が混入 → クリア
+                t.affiliation = ""
+            else:
+                # 所属から肩書き除去 → 医療用語標準化
+                cleaned_affiliation = normalize_affiliation(t.affiliation)
+                t.affiliation = normalize_medical_terms(cleaned_affiliation).strip()
     
     # 座長情報の肩書き除去と標準化
     if payload.chair:
@@ -6762,11 +6827,20 @@ def clean_ai_talk_titles(payload: DesignJSON) -> DesignJSON:
         for talk in payload.talks:
             talk_title = (talk.title or "").lower().strip()
             
-            # 講演タイトルが除外キーワードに該当するかチェック
-            is_non_lecture = any(keyword in talk_title for keyword in non_lecture_keywords)
+            # 講演タイトルが除外キーワードに完全一致または実質全体がキーワードかチェック
+            is_non_lecture = False
+            for keyword in non_lecture_keywords:
+                # タイトルがキーワードそのものか、キーワード+少量の装飾のみ
+                if talk_title == keyword or talk_title.strip("　 .-–—_") == keyword:
+                    is_non_lecture = True
+                    break
+                # タイトルの80%以上がキーワードで占められている場合
+                if keyword in talk_title and len(keyword) >= len(talk_title) * 0.7:
+                    is_non_lecture = True
+                    break
             
-            # タイトルが短すぎる場合（3文字以下）や空の場合も除外
-            if not is_non_lecture and len(talk_title.replace(" ", "")) > 3:
+            # タイトルが空の場合のみ除外（短いタイトルは医療用語で有り得る）
+            if not is_non_lecture and len(talk_title.replace(" ", "")) > 0:
                 filtered_talks.append(talk)
         
         payload.talks = filtered_talks
@@ -6878,9 +6952,9 @@ async def ai_refine_json(
             *few_shot_messages,
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.1,  # 少しだけ創造性を残して、より自然な結果を得る
+        "temperature": 0.05,  # より決定論的な出力で一貫性向上
         "top_p": 0.9,        # 高品質なトークンを優先
-        "presence_penalty": -0.1,  # 医療用語の正確性を重視
+        "presence_penalty": 0.0,   # 中立（負値はトークン繰り返しを促進し逆効果）
         "frequency_penalty": 0.1,  # 繰り返しを減らして品質向上
         "response_format": {"type": "json_object"},
         "max_tokens": 4000,  # 十分な応答長を確保
@@ -7151,6 +7225,9 @@ async def ai_refine_json(
                 # draft側が壊れている場合はAI側の講演数を信頼する
                 if any(_looks_bad_talk_seed(t) for t in (draft.talks or [])):
                     pass  # 壊れたseedがあるので数の不一致を許容
+                # AIが講演数を減らした場合（挨拶・休憩等の除外）は許容
+                elif len(parsed_talks) < len(draft.talks):
+                    pass  # non-lecture除外による減少は正当
                 else:
                     return False
 
@@ -7231,8 +7308,8 @@ async def ai_refine_json(
     if "event_title_lines" in parsed:
         lines = normalize_lines_keep_order(_safe_list_str(parsed.get("event_title_lines")))
         draft_lines = draft.event_title_lines or []
-        if lines and (len(lines) >= len(draft_lines)):
-            # AI が行数を増やす（サブタイトル追加等）は許可、減らす方向はブロック
+        if lines:
+            # AI がタイトル行を調整（増減両方許可）: 不要行の除去も精度向上に必要
             refined.event_title_lines = lines
             refined.event_title = "\n".join(lines).strip()
 
@@ -7302,7 +7379,14 @@ async def ai_refine_json(
     if isinstance(parsed_talks, list) and (not refined.talks or draft_is_bad):
         refined.talks = _build_talks_from_parsed(parsed_talks)
 
-    # 2) draft が健全な案件だけ index patch
+    # 2) AI が講演数を減らした場合（挨拶・休憩等の除外）→ AI talks を採用
+    elif isinstance(parsed_talks, list) and len(parsed_talks) < len(refined.talks):
+        # AIが除外した分が妥当かチェック: AI側の全talkが有効であれば採用
+        ai_talks = _build_talks_from_parsed(parsed_talks)
+        if ai_talks and not any(_looks_bad_talk_seed_strong(t) for t in ai_talks):
+            refined.talks = ai_talks
+
+    # 3) draft が健全な案件だけ index patch
     elif isinstance(parsed_talks, list) and len(parsed_talks) == len(refined.talks):
         for i, pt in enumerate(parsed_talks):
             if not isinstance(pt, dict):
@@ -7498,8 +7582,8 @@ async def ai_refine_json(
     rule_org = extract_organizer_from_blocks(blocks)
     if rule_org:
         refined.organizer = normalize_organizer(rule_org)
-
-    refined.organizer = normalize_organizer(refined.organizer)
+    elif refined.organizer:
+        refined.organizer = normalize_organizer(refined.organizer)
     refined.datetime = normalize_space(refined.datetime)
     refined.datetime_note = normalize_space(refined.datetime_note)
 
@@ -8688,6 +8772,10 @@ def apply_vm_hints_from_blocks(blocks: List[TextBlock], payload: DesignJSON, vm_
         if not pptx_aff:
             continue
 
+        # 座長情報が混入した結果を採用しない
+        if "座長" in pptx_aff or "演者" in pptx_aff:
+            continue
+
         cur = (t.affiliation or "").strip()
 
         # 欠損なら入れる。入ってるが別施設っぽければPPTX値で修正（PPTX由来なのでOK）
@@ -9032,8 +9120,15 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         for b in ordered:
             key = normalize_key(b.text or "")
             for lb in labels:
-                if normalize_key(lb) in key:
-                    return b
+                lb_key = normalize_key(lb)
+                # 数字末尾ラベルは後続数字があると誤マッチする
+                # 例: "講演1" が "特別講演18:30" にヒットしないよう
+                if lb_key and lb_key[-1].isdigit():
+                    if re.search(re.escape(lb_key) + r'(?!\d)', key):
+                        return b
+                else:
+                    if lb_key in key:
+                        return b
         return None
 
     def _looks_like_title(s: str) -> bool:
@@ -9360,6 +9455,10 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
     def clean_affiliation_text(s: str) -> str:
         s = normalize_space(s or "")
 
+        # 座長情報が混入していたら空にする
+        if "座長" in s:
+            return ""
+
         # 演者とか混ざってたら除去
         s = re.sub(r"(演者|座長)\s*", "", s)
 
@@ -9543,6 +9642,11 @@ def finalize_people_fields(payload: DesignJSON) -> DesignJSON:
             print(f"[DEBUG] Clearing invalid speaker: '{speaker}' (keyword context)")
             t.speaker = ""
             t.speaker_display = ""
+        
+        # 所属に座長情報が混入している場合の最終クリーニング
+        aff = normalize_space(getattr(t, "affiliation", "") or "")
+        if aff and "座長" in aff:
+            t.affiliation = ""
         
         t.affiliation = strip_outer_parens_suffix(t.affiliation or "")
 
