@@ -10887,19 +10887,25 @@ def upload_text_to_storage(text: str, remote_path: str, content_type: str, upser
         upsert=upsert,
     )
 
+def _storage_auth_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    }
+
+def _authenticated_storage_url(remote_path: str) -> str:
+    return f"{SUPABASE_URL}/storage/v1/object/authenticated/{SUPABASE_BUCKET}/{remote_path}"
+
 def download_storage_file(remote_path: str) -> bytes:
-    url = get_public_url(remote_path)
-    r = requests.get(url, timeout=30)
+    url = _authenticated_storage_url(remote_path)
+    r = requests.get(url, headers=_storage_auth_headers(), timeout=30)
     if r.status_code >= 400:
         raise HTTPException(status_code=404, detail=f"storage file not found: {remote_path}")
     return r.content
 
-def get_public_url(remote_path: str) -> str:
-    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{remote_path}"
-
 def download_storage_json(remote_path: str) -> dict:
-    url = get_public_url(remote_path)
-    r = requests.get(url, timeout=10)
+    url = _authenticated_storage_url(remote_path)
+    r = requests.get(url, headers=_storage_auth_headers(), timeout=10)
     if r.status_code >= 400:
         raise HTTPException(status_code=404, detail="job json not found")
     return r.json()
@@ -11686,16 +11692,11 @@ async def get_job(job_id: str):
 
 
 @app.get("/preview/{job_id}.jpg")
-async def preview(job_id: str, request: Request):
+async def preview(job_id: str):
     sp = storage_paths(job_id)
-    public_url = get_public_url(sp["preview"])
-
-    qs = str(request.url.query or "").strip()
-    if qs:
-        sep = "&" if "?" in public_url else "?"
-        public_url = f"{public_url}{sep}{qs}"
-
-    return RedirectResponse(url=public_url, status_code=307)
+    data = download_storage_file(sp["preview"])
+    return Response(content=data, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/export/{job_id}.zip")
@@ -11743,30 +11744,18 @@ async def download(job_id: str, background_tasks: BackgroundTasks):
     )
 
 @app.get("/debug/{job_id}/latest.json")
-async def debug_latest(job_id: str, request: Request):
+async def debug_latest(job_id: str):
     sp = storage_paths(job_id)
-    public_url = get_public_url(sp["json"])
-
-    qs = str(request.url.query or "").strip()
-    if qs:
-        sep = "&" if "?" in public_url else "?"
-        public_url = f"{public_url}{sep}{qs}"
-
-    return RedirectResponse(url=public_url, status_code=307)
+    data = download_storage_json(sp["json"])
+    return JSONResponse(content=data, headers={"Cache-Control": "no-cache"})
 
 
 
 @app.get("/debug/{job_id}/blocks.json")
-async def debug_blocks(job_id: str, request: Request):
+async def debug_blocks(job_id: str):
     sp = storage_paths(job_id)
-    public_url = get_public_url(sp["debug_blocks"])
-
-    qs = str(request.url.query or "").strip()
-    if qs:
-        sep = "&" if "?" in public_url else "?"
-        public_url = f"{public_url}{sep}{qs}"
-
-    return RedirectResponse(url=public_url, status_code=307)
+    data = download_storage_json(sp["debug_blocks"])
+    return JSONResponse(content=data, headers={"Cache-Control": "no-cache"})
 
 
 
