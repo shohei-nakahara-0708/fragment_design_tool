@@ -72,25 +72,25 @@ const ui = {
   muted: { fontSize: 12, color: "#666" },
 
   badge: (tone = "gray") => {
-  const base = {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 6,
-    padding: "5px 10px",
-    borderRadius: 999,
-    borderWidth: "1px",
-    borderStyle: "solid",
-    borderColor: "#e3e3e3",
-    fontSize: 12,
-    lineHeight: 1,
-    userSelect: "none",
-    whiteSpace: "nowrap",
-  };
-  if (tone === "green") return { ...base, background: "#ecf8ef", borderColor: "#bfe3c6", color: "#1b6b2f" };
-  if (tone === "red") return { ...base, background: "#fff2f2", borderColor: "#f2c2c2", color: "#a00000" };
-  if (tone === "blue") return { ...base, background: "#eef5ff", borderColor: "#c7ddff", color: "#1a4fb3" };
-  return { ...base, background: "#f6f6f6", color: "#444" };
-},
+    const base = {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: 6,
+      padding: "5px 10px",
+      borderRadius: 999,
+      borderWidth: "1px",
+      borderStyle: "solid",
+      borderColor: "#e3e3e3",
+      fontSize: 12,
+      lineHeight: 1,
+      userSelect: "none",
+      whiteSpace: "nowrap",
+    };
+    if (tone === "green") return { ...base, background: "#ecf8ef", borderColor: "#bfe3c6", color: "#1b6b2f" };
+    if (tone === "red") return { ...base, background: "#fff2f2", borderColor: "#f2c2c2", color: "#a00000" };
+    if (tone === "blue") return { ...base, background: "#eef5ff", borderColor: "#c7ddff", color: "#1a4fb3" };
+    return { ...base, background: "#f6f6f6", color: "#444" };
+  },
 
   grid2: { display: "grid", gridTemplateColumns: "1fr 160px", gap: 12, alignItems: "start" },
   field: { display: "grid", gap: 6, marginTop: 10 },
@@ -314,7 +314,7 @@ const ChairEditor = React.memo(function ChairEditor({ chair, updateAtPath, error
       <Field label="役職">
         <Control
           as="select"
-          
+
           value={c.role || ""}
           onChange={(e) => updateAtPath(["chair", "role"], e.target.value)}
         >
@@ -322,7 +322,7 @@ const ChairEditor = React.memo(function ChairEditor({ chair, updateAtPath, error
           <option value="座長">座長</option>
           <option value="総合司会">総合司会</option>
         </Control>
-     
+
       </Field>
 
       <Field label="名前">
@@ -524,11 +524,11 @@ const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath, error
 
             <Field label="時間" help="例: 19:00〜19:20">
               <Control
-               
+
                 value={t.time || ""}
                 onChange={(e) => setTalkField(idx, "time", e.target.value)}
               />
-             
+
             </Field>
 
             <Field label="タイトル" help="改行で行分割">
@@ -617,6 +617,7 @@ export default function JobEditorPage() {
   const [json, setJson] = useState(null);
   const [busy, setBusy] = useState(false);
   const [previewBuster, setPreviewBuster] = useState(Date.now());
+  const [previewSrc, setPreviewSrc] = useState("");
   const [errors, setErrors] = useState({});
   const [submitTried, setSubmitTried] = useState(false);
 
@@ -636,51 +637,57 @@ export default function JobEditorPage() {
       });
   }, [jobId]);
 
- const saveRender = async (payload, { validate = true } = {}) => {
-  if (!payload) return;
+  const saveRender = async (payload, { validate = true } = {}) => {
+    if (!payload) return;
 
-  const nextErrors = validateJob(payload);
-  setErrors(nextErrors);
+    const nextErrors = validateJob(payload);
+    setErrors(nextErrors);
 
-  if (validate && Object.keys(nextErrors).length > 0) {
-    setSubmitTried(true);
-    return;
-  }
-
-  if (inFlightRef.current) {
-    pendingRef.current = true;
-    return;
-  }
-
-  const s = JSON.stringify(payload);
-  if (s === lastSentRef.current) return;
-
-  inFlightRef.current = true;
-  setBusy(true);
-  try {
-    const r = await fetch(`${API_BASE}/render`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ jobId, design: payload }),
-    });
-    if (!r.ok) throw new Error("render failed");
-    lastSentRef.current = s;
-    setPreviewBuster(Date.now());
-  } finally {
-    setBusy(false);
-    inFlightRef.current = false;
-
-    if (pendingRef.current) {
-      pendingRef.current = false;
-      Promise.resolve().then(() => {
-        setJson((cur) => {
-          if (cur) saveRender(cur, { validate: false });
-          return cur;
-        });
-      });
+    if (validate && Object.keys(nextErrors).length > 0) {
+      setSubmitTried(true);
+      return;
     }
-  }
-};
+
+    if (inFlightRef.current) {
+      pendingRef.current = true;
+      return;
+    }
+
+    const s = JSON.stringify(payload);
+    if (s === lastSentRef.current) return;
+
+    inFlightRef.current = true;
+    setBusy(true);
+    try {
+      const r = await fetch(`${API_BASE}/render`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId, design: payload }),
+      });
+      if (!r.ok) throw new Error("render failed");
+      const d = await r.json();
+      lastSentRef.current = s;
+      if (d.previewDataUrl) {
+        setPreviewSrc(d.previewDataUrl);
+      } else {
+        setPreviewSrc(`${API_BASE}/preview/${jobId}.jpg?t=${Date.now()}`);
+      }
+      setPreviewBuster(Date.now());
+    } finally {
+      setBusy(false);
+      inFlightRef.current = false;
+
+      if (pendingRef.current) {
+        pendingRef.current = false;
+        Promise.resolve().then(() => {
+          setJson((cur) => {
+            if (cur) saveRender(cur, { validate: false });
+            return cur;
+          });
+        });
+      }
+    }
+  };
 
   async function downloadWithFilename(url, filename) {
     const r = await fetch(`${API_BASE}${url}`, { cache: "no-store" });
@@ -738,19 +745,19 @@ export default function JobEditorPage() {
     setErrors(validateJob(json));
   }, [json, submitTried]);
 
-useEffect(() => {
-  if (!json || !autoRender) return;
+  useEffect(() => {
+    if (!json || !autoRender) return;
 
-  if (debounceRef.current) clearTimeout(debounceRef.current);
-  debounceRef.current = setTimeout(() => {
-    const s = JSON.stringify(json);
-    if (s !== lastSentRef.current) {
-      saveRender(json, { validate: false });
-    }
-  }, 500);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      const s = JSON.stringify(json);
+      if (s !== lastSentRef.current) {
+        saveRender(json, { validate: false });
+      }
+    }, 500);
 
-  return () => debounceRef.current && clearTimeout(debounceRef.current);
-}, [json, autoRender]);
+    return () => debounceRef.current && clearTimeout(debounceRef.current);
+  }, [json, autoRender]);
 
   const updateAtPath = useCallback((path, value) => {
     setJson((prev) => {
@@ -976,10 +983,10 @@ useEffect(() => {
           </div>
 
           {errors.datetime_year ||
-          errors.datetime_month ||
-          errors.datetime_day ||
-          errors.datetime_dow ||
-          errors.datetime_time ? (
+            errors.datetime_month ||
+            errors.datetime_day ||
+            errors.datetime_dow ||
+            errors.datetime_time ? (
             <div style={{ ...ui.errorText, marginTop: 10 }}>
               {[errors.datetime_year, errors.datetime_month, errors.datetime_day, errors.datetime_dow, errors.datetime_time]
                 .filter(Boolean)
@@ -1075,7 +1082,7 @@ useEffect(() => {
         >
           <div style={styles.previewFrame}>
             <img
-              src={`${API_BASE}/preview/${jobId}.jpg?t=${previewBuster}`}
+              src={previewSrc || `${API_BASE}/preview/${jobId}.jpg?t=${previewBuster}`}
               style={{ width: "100%", maxWidth: 600, display: "block", margin: "0 auto" }}
               alt=""
             />

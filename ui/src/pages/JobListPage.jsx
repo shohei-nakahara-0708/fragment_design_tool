@@ -26,7 +26,7 @@ function clamp(v, min, max) {
 
 /** Blob download with custom filename */
 async function downloadWithFilename(url, filename) {
-  
+
   const r = await fetch(`${API_BASE}${url}`, { cache: "no-store" });
   if (!r.ok) throw new Error(`download failed: ${r.status} ${await r.text()}`);
   const blob = await r.blob();
@@ -101,7 +101,7 @@ const ui = {
     transition: "transform .12s ease, box-shadow .12s ease",
     userSelect: "none",
   },
-   buttonGhost2: {
+  buttonGhost2: {
     background: "rgba(255,255,255,0.85)",
     color: "#0f172a",
     padding: "10px 12px",
@@ -113,7 +113,7 @@ const ui = {
     transition: "transform .12s ease, box-shadow .12s ease",
     userSelect: "none",
   },
-  disabled: {opacity: 0.5, cursor: "not-allowed", pointerEvents: "none" },
+  disabled: { opacity: 0.5, cursor: "not-allowed", pointerEvents: "none" },
   buttonDanger: {
     background: "rgba(239,68,68,0.10)",
     color: "#991b1b",
@@ -230,7 +230,7 @@ const ui = {
     background: "#f8fafc",
     color: "#0f172a",
   },
-  cardActions: { display: "flex", gap: 8, alignItems: "center", marginTop: 2,flexWrap: "wrap" },
+  cardActions: { display: "flex", gap: 8, alignItems: "center", marginTop: 2, flexWrap: "wrap" },
   smallBtn: {
     padding: "8px 10px",
     borderRadius: 12,
@@ -255,13 +255,13 @@ const ui = {
   },
 
   // right preview
- sticky: {
-  position: "sticky",
-  top: 88,
-  height: "calc(100vh - 104px)",   // ← ここが重要（top分引く）
-  overflow: "hidden",              // 外枠は隠す
-  alignSelf: "start",
-},
+  sticky: {
+    position: "sticky",
+    top: 88,
+    height: "calc(100vh - 104px)",   // ← ここが重要（top分引く）
+    overflow: "hidden",              // 外枠は隠す
+    alignSelf: "start",
+  },
   previewTop: {
     padding: "12px 12px",
     borderBottom: "1px solid rgba(226,232,240,0.95)",
@@ -275,7 +275,7 @@ const ui = {
   previewMainTitle: { fontWeight: 900, fontSize: 14, color: "#0f172a" },
   previewMeta: { marginTop: 4, fontSize: 12, color: "#64748b", lineHeight: 1.4 },
   previewBtns: { display: "flex", gap: 8, flexWrap: "wrap" },
-  previewBody: { background: "#0b1220",overflow: "auto",    },
+  previewBody: { background: "#0b1220", overflow: "auto", },
   previewImgWrap: { padding: 12, display: "grid", placeItems: "center" },
   previewImg: {
     maxWidth: 600,
@@ -291,40 +291,40 @@ const ui = {
   pager: { marginTop: 14, display: "flex", gap: 10, alignItems: "center" },
 
   pagerInfo: {
-  color: "#64748b",
-  fontSize: 13,
-  whiteSpace: "nowrap",
-},
-pageNumbers: {
-  display: "flex",
-  gap: 6,
-  alignItems: "center",
-  flexWrap: "wrap",
-},
-pageBtn: {
-  minWidth: 36,
-  height: 36,
-  padding: "0 10px",
-  borderRadius: 10,
-  border: "1px solid rgba(226,232,240,0.95)",
-  background: "#fff",
-  color: "#334155",
-  fontSize: 13,
-  fontWeight: 800,
-  cursor: "pointer",
-},
-pageBtnActive: {
-  background: "#0f172a",
-  color: "#fff",
-  border: "1px solid #0f172a",
-},
-pageEllipsis: {
-  fontSize: 13,
-  color: "#94a3b8",
-  padding: "0 4px",
-},
+    color: "#64748b",
+    fontSize: 13,
+    whiteSpace: "nowrap",
+  },
+  pageNumbers: {
+    display: "flex",
+    gap: 6,
+    alignItems: "center",
+    flexWrap: "wrap",
+  },
+  pageBtn: {
+    minWidth: 36,
+    height: 36,
+    padding: "0 10px",
+    borderRadius: 10,
+    border: "1px solid rgba(226,232,240,0.95)",
+    background: "#fff",
+    color: "#334155",
+    fontSize: 13,
+    fontWeight: 800,
+    cursor: "pointer",
+  },
+  pageBtnActive: {
+    background: "#0f172a",
+    color: "#fff",
+    border: "1px solid #0f172a",
+  },
+  pageEllipsis: {
+    fontSize: 13,
+    color: "#94a3b8",
+    padding: "0 4px",
+  },
 
-  
+
 };
 
 export default function JobListPage() {
@@ -347,7 +347,7 @@ export default function JobListPage() {
 
   // jpg download cache buster (manual)
   const [previewBuster, setPreviewBuster] = useState(Date.now());
-  
+
 
   useEffect(() => {
     const run = async () => {
@@ -419,37 +419,37 @@ export default function JobListPage() {
   }, [visibleItems]);
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
-const startIndex = total === 0 ? 0 : (page - 1) * pageSize + 1;
-const endIndex = Math.min(page * pageSize, total);
+  const startIndex = total === 0 ? 0 : (page - 1) * pageSize + 1;
+  const endIndex = Math.min(page * pageSize, total);
 
-const pageNumbers = useMemo(() => {
-  const pages = [];
-  const maxVisible = 5;
+  const pageNumbers = useMemo(() => {
+    const pages = [];
+    const maxVisible = 5;
 
-  if (totalPages <= maxVisible) {
-    for (let i = 1; i <= totalPages; i++) pages.push(i);
+    if (totalPages <= maxVisible) {
+      for (let i = 1; i <= totalPages; i++) pages.push(i);
+      return pages;
+    }
+
+    const start = Math.max(1, page - 2);
+    const end = Math.min(totalPages, page + 2);
+
+    if (start > 1) {
+      pages.push(1);
+      if (start > 2) pages.push("...");
+    }
+
+    for (let i = start; i <= end; i++) {
+      pages.push(i);
+    }
+
+    if (end < totalPages) {
+      if (end < totalPages - 1) pages.push("...");
+      pages.push(totalPages);
+    }
+
     return pages;
-  }
-
-  const start = Math.max(1, page - 2);
-  const end = Math.min(totalPages, page + 2);
-
-  if (start > 1) {
-    pages.push(1);
-    if (start > 2) pages.push("...");
-  }
-
-  for (let i = start; i <= end; i++) {
-    pages.push(i);
-  }
-
-  if (end < totalPages) {
-    if (end < totalPages - 1) pages.push("...");
-    pages.push(totalPages);
-  }
-
-  return pages;
-}, [page, totalPages]);
+  }, [page, totalPages]);
 
   const toggle = (jobId) => {
     setSelected((prev) => {
@@ -489,88 +489,88 @@ const pageNumbers = useMemo(() => {
   };
 
   const downloadBlob = (blob, filename) => {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   };
-  
+
   const exportPdf = async () => {
-  if (selected.size === 0) return;
+    if (selected.size === 0) return;
 
-  const jobIds = Array.from(selected);
-  const r = await fetch(`${API_BASE}/jobs/export.pdf`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jobIds,
-      pageSize: "fit",   // or "a4"
-      orientation: "auto",
-    }),
-  });
+    const jobIds = Array.from(selected);
+    const r = await fetch(`${API_BASE}/jobs/export.pdf`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jobIds,
+        pageSize: "fit",   // or "a4"
+        orientation: "auto",
+      }),
+    });
 
-  if (!r.ok) {
-    const t = await r.text();
-    alert(`pdf export failed: ${r.status}\n${t}`);
-    return;
-  }
+    if (!r.ok) {
+      const t = await r.text();
+      alert(`pdf export failed: ${r.status}\n${t}`);
+      return;
+    }
 
-  await downloadBlobWithFilename(r, "selected.pdf");
-};
+    await downloadBlobWithFilename(r, "selected.pdf");
+  };
 
 
 
   const getFilenameFromDisposition = (disposition) => {
-  // Content-Disposition: attachment; filename="xxx.zip"
-  if (!disposition) return null;
-  const m = /filename\*=UTF-8''([^;]+)|filename="([^"]+)"/i.exec(disposition);
-  const raw = (m && (m[1] || m[2])) ? (m[1] || m[2]) : null;
-  if (!raw) return null;
-  try {
-    return decodeURIComponent(raw);
-  } catch {
-    return raw;
-  }
+    // Content-Disposition: attachment; filename="xxx.zip"
+    if (!disposition) return null;
+    const m = /filename\*=UTF-8''([^;]+)|filename="([^"]+)"/i.exec(disposition);
+    const raw = (m && (m[1] || m[2])) ? (m[1] || m[2]) : null;
+    if (!raw) return null;
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
   };
-  
-  async function downloadBlobWithFilename(response, fallbackFilename) {
-  const blob = await response.blob();
-  const cd = response.headers.get("Content-Disposition");
-  const suggested = getFilenameFromDisposition(cd);
-  const filename = suggested || fallbackFilename;
 
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
+  async function downloadBlobWithFilename(response, fallbackFilename) {
+    const blob = await response.blob();
+    const cd = response.headers.get("Content-Disposition");
+    const suggested = getFilenameFromDisposition(cd);
+    const filename = suggested || fallbackFilename;
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
 
 
   const exportOneZip = async (jobId, filename) => {
-  const API_BASE = import.meta.env.VITE_API_BASE || "";
+    const API_BASE = import.meta.env.VITE_API_BASE || "";
 
-  const r = await fetch(`${API_BASE}/export/${encodeURIComponent(jobId)}.zip`);
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    alert(`export failed: ${r.status}\n${t}`);
-    return;
-  }
+    const r = await fetch(`${API_BASE}/export/${encodeURIComponent(jobId)}.zip`);
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      alert(`export failed: ${r.status}\n${t}`);
+      return;
+    }
 
-  const blob = await r.blob();
-  const cd = r.headers.get("Content-Disposition");
-  const suggested = getFilenameFromDisposition(cd);
-  // const filename = suggested || filename || `export_${jobId}.zip`;
+    const blob = await r.blob();
+    const cd = r.headers.get("Content-Disposition");
+    const suggested = getFilenameFromDisposition(cd);
+    // const filename = suggested || filename || `export_${jobId}.zip`;
 
-  downloadBlob(blob, filename);
-};
+    downloadBlob(blob, filename);
+  };
 
   const deleteSelected = async () => {
     if (selected.size === 0) return;
@@ -588,7 +588,7 @@ const pageNumbers = useMemo(() => {
     }
 
     setItems((prev) => prev.filter((it) => !selected.has(it.job_id || it.jobId)));
-    
+
     clearSelected();
     setPreview(null);
   };
@@ -603,10 +603,9 @@ const pageNumbers = useMemo(() => {
 
   const buildPreview = useCallback((it) => {
     const id = it.job_id || it.jobId;
-    const updatedKey =
-      it.updated_at || it.updatedAt || it.preview_updated_at || it.previewUpdatedAt || it.created_at || it.createdAt || "";
     const previewUrl = it.previewUrl || `/preview/${id}.jpg`;
-    const src = `${previewUrl}?v=${encodeURIComponent(updatedKey || Date.now())}`;
+    const src = it.previewSignedUrl
+      || `${previewUrl}?v=${encodeURIComponent(it.updatedAt || it.updated_at || Date.now())}`;
 
     return {
       id,
@@ -656,7 +655,7 @@ const pageNumbers = useMemo(() => {
             <div style={ui.headerRight}>
 
 
-               <Link to="/diff" style={{ textDecoration: "none" }}>
+              <Link to="/diff" style={{ textDecoration: "none" }}>
                 <button
                   style={ui.buttonPrimary}
                   onMouseEnter={(e) => {
@@ -708,7 +707,7 @@ const pageNumbers = useMemo(() => {
                 削除
               </button>
 
-              
+
             </div>
           </div>
 
@@ -741,7 +740,7 @@ const pageNumbers = useMemo(() => {
                   setToDate(e.target.value);
                   setPage(1);
                 }}
-                 style={{ ...ui.input, width: 160 }}
+                style={{ ...ui.input, width: 160 }}
               />
 
               {/* <select value={sort} onChange={(e) => setSort(e.target.value)} style={ui.select}>
@@ -761,7 +760,7 @@ const pageNumbers = useMemo(() => {
                 選択解除
               </button>
 
-              
+
             </div>
           </div>
         </div>
@@ -800,13 +799,8 @@ const pageNumbers = useMemo(() => {
 
                       const API_BASE = import.meta.env.VITE_API_BASE || "";
 
-                      const previewUrl =
-                      it.previewUrl
-                        ? `${API_BASE}${it.previewUrl}`
-                        : `${API_BASE}/preview/${id}.jpg`;
-                      const updatedKey =
-                        it.updated_at || it.updatedAt || it.preview_updated_at || it.previewUpdatedAt || it.created_at || it.createdAt || "";
-                      const previewSrc = `${previewUrl}?v=${encodeURIComponent(updatedKey || Date.now())}`;
+                      const previewSrc = it.previewSignedUrl
+                        || `${API_BASE}${it.previewUrl || `/preview/${id}.jpg`}?v=${encodeURIComponent(it.updatedAt || it.updated_at || Date.now())}`;
 
                       const active = preview?.id === id;
 
@@ -819,8 +813,8 @@ const pageNumbers = useMemo(() => {
                               <span style={{ fontSize: 12, fontWeight: 900 }}>選択</span>
                             </label>
                             <button style={ui.smallBtn} onClick={() => nav(`/job/${id}`)}>
-                                編集
-                              </button>
+                              編集
+                            </button>
                           </div>
 
                           <div style={ui.cardBody}>
@@ -838,36 +832,36 @@ const pageNumbers = useMemo(() => {
 
                             <div style={ui.cardActions}>
 
-                              <div style={{ fontSize: 14, color: "#64748b",width: "100%",borderTop: "1px solid rgba(226,232,240,0.95)", paddingTop: 8 }}>
+                              <div style={{ fontSize: 14, color: "#64748b", width: "100%", borderTop: "1px solid rgba(226,232,240,0.95)", paddingTop: 8 }}>
                                 Download
                               </div>
 
                               <button style={ui.smallBtn2} onClick={async () => {
-                                  const eventIdLike = it.event_id || id || "event";
-                                  const filename = `${eventIdLike}_招聘.jpg`;
-                                  const url = `/download/${id}.jpg?t=${encodeURIComponent(previewBuster)}`;
-                                  await downloadWithFilename(url, filename);
-                                }}>
+                                const eventIdLike = it.event_id || id || "event";
+                                const filename = `${eventIdLike}_招聘.jpg`;
+                                const url = `/download/${id}.jpg?t=${encodeURIComponent(previewBuster)}`;
+                                await downloadWithFilename(url, filename);
+                              }}>
                                 JPG
-                              </button> 
+                              </button>
 
-                               <button style={ui.smallBtn2} onClick={async () => {
-                                  const eventIdLike = it.event_id || id || "event";
-                                  const filename = `${eventIdLike}_backup.json`;
-                                  const url = `/debug/${id}/latest.json?t=${encodeURIComponent(previewBuster)}`;
-                                  await downloadWithFilename(url, filename);
-                                }}>
+                              <button style={ui.smallBtn2} onClick={async () => {
+                                const eventIdLike = it.event_id || id || "event";
+                                const filename = `${eventIdLike}_backup.json`;
+                                const url = `/debug/${id}/latest.json?t=${encodeURIComponent(previewBuster)}`;
+                                await downloadWithFilename(url, filename);
+                              }}>
                                 JSON
-                              </button> 
+                              </button>
 
 
                               <button style={ui.smallBtn2} onClick={async () => {
-                                 const eventIdLike = it.event_id || id || "event";
-                                  const filename = `${eventIdLike}_export.zip`;
-                                  await exportOneZip(id,filename);
-                                }}>
+                                const eventIdLike = it.event_id || id || "event";
+                                const filename = `${eventIdLike}_export.zip`;
+                                await exportOneZip(id, filename);
+                              }}>
                                 まとめてダウンロード
-                              </button> 
+                              </button>
 
                               {debug && (
                                 <button style={ui.smallBtn2} onClick={() => {
@@ -880,10 +874,10 @@ const pageNumbers = useMemo(() => {
                                 </button>
                               )}
 
-                              
-                              
-                             
-          
+
+
+
+
                               {/* <button style={ui.smallBtn} onClick={() => setPreview(buildPreview(it))}>
                                 Preview
                               </button> */}
@@ -897,189 +891,189 @@ const pageNumbers = useMemo(() => {
               </div>
 
               {/* pager */}
-             <div style={{ ...ui.pager, flexWrap: "wrap" }}>
-  <button
-    style={ui.buttonGhost}
-    onClick={() => setPage((p) => Math.max(1, p - 1))}
-    disabled={page <= 1 || loading}
-  >
-    ← 前へ
-  </button>
+              <div style={{ ...ui.pager, flexWrap: "wrap" }}>
+                <button
+                  style={ui.buttonGhost}
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  disabled={page <= 1 || loading}
+                >
+                  ← 前へ
+                </button>
 
-  <div style={ui.pageNumbers}>
-    {pageNumbers.map((p, idx) =>
-      p === "..." ? (
-        <span key={`ellipsis-${idx}`} style={ui.pageEllipsis}>
-          …
-        </span>
-      ) : (
-        <button
-          key={p}
-          onClick={() => setPage(p)}
-          disabled={loading}
-          style={{
-            ...ui.pageBtn,
-            ...(p === page ? ui.pageBtnActive : null),
-            ...(loading ? ui.disabled : null),
-          }}
-        >
-          {p}
-        </button>
-      )
-    )}
-  </div>
+                <div style={ui.pageNumbers}>
+                  {pageNumbers.map((p, idx) =>
+                    p === "..." ? (
+                      <span key={`ellipsis-${idx}`} style={ui.pageEllipsis}>
+                        …
+                      </span>
+                    ) : (
+                      <button
+                        key={p}
+                        onClick={() => setPage(p)}
+                        disabled={loading}
+                        style={{
+                          ...ui.pageBtn,
+                          ...(p === page ? ui.pageBtnActive : null),
+                          ...(loading ? ui.disabled : null),
+                        }}
+                      >
+                        {p}
+                      </button>
+                    )
+                  )}
+                </div>
 
-  <button
-    style={ui.buttonGhost}
-    onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-    disabled={loading || page >= totalPages}
-  >
-    次へ →
-  </button>
+                <button
+                  style={ui.buttonGhost}
+                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                  disabled={loading || page >= totalPages}
+                >
+                  次へ →
+                </button>
 
-  <span style={ui.pagerInfo}>
-    {startIndex}–{endIndex} / {total}件（全{totalPages}ページ）
-  </span>
+                <span style={ui.pagerInfo}>
+                  {startIndex}–{endIndex} / {total}件（全{totalPages}ページ）
+                </span>
 
-  <button
-    style={ui.buttonGhost}
-    onClick={() => setPreviewBuster(Date.now())}
-    title="download/preview のキャッシュを更新"
-  >
-    ↻ キャッシュ更新
-  </button>
+                <button
+                  style={ui.buttonGhost}
+                  onClick={() => setPreviewBuster(Date.now())}
+                  title="download/preview のキャッシュを更新"
+                >
+                  ↻ キャッシュ更新
+                </button>
 
-  <label
-    style={{
-      fontSize: 13,
-      color: "#64748b",
-      marginLeft: "auto",
-      display: "flex",
-      alignItems: "center",
-      gap: 4,
-      cursor: "pointer",
-    }}
-  >
-    <input
-      type="checkbox"
-      checked={debug}
-      onChange={() => setDebug((d) => !d)}
-    />
-    デバッグ表示
-  </label>
-</div>
+                <label
+                  style={{
+                    fontSize: 13,
+                    color: "#64748b",
+                    marginLeft: "auto",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                    cursor: "pointer",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={debug}
+                    onChange={() => setDebug((d) => !d)}
+                  />
+                  デバッグ表示
+                </label>
+              </div>
             </div>
           </div>
 
-         {preview && (
-  <div
-    onMouseDown={(e) => {
-      if (e.target === e.currentTarget) setPreview(null);
-    }}
-    style={{
-      position: "fixed",
-      inset: 0,
-      background: "rgba(0,0,0,0.65)",
-      backdropFilter: "blur(6px)",
-      zIndex: 1000,
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      padding: 20,
-    }}
-  >
-    <div
-      style={{
-        width: "min(1400px, 96vw)",
-        height: "min(94vh, 1000px)",
-        background: "#fff",
-        borderRadius: 18,
-        overflow: "hidden",
-        boxShadow: "0 30px 80px rgba(0,0,0,0.35)",
-        display: "grid",
-        gridTemplateRows: "auto 1fr",
-      }}
-    >
-      {/* Header */}
-      <div
-        style={{
-          padding: "14px 18px",
-          borderBottom: "1px solid #eee",
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "flex-start",
-          gap: 16,
-        }}
-      >
-        <div style={{ minWidth: 0 }}>
-          <div
-            style={{
-              fontWeight: 900,
-              fontSize: 16,
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-            }}
-          >
-            {preview.title}
-          </div>
-
-          <div style={{ fontSize: 13, color: "#666", marginTop: 4 }}>
-            {preview.eventId && <>講演会ID：{preview.eventId}　</>}
-            {preview.filename && <>ファイル：{preview.filename}　</>}
-            {preview.createdAt && <>作成：{dateformated(preview.createdAt)}</>}
+          {preview && (
+            <div
+              onMouseDown={(e) => {
+                if (e.target === e.currentTarget) setPreview(null);
+              }}
+              style={{
+                position: "fixed",
+                inset: 0,
+                background: "rgba(0,0,0,0.65)",
+                backdropFilter: "blur(6px)",
+                zIndex: 1000,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                padding: 20,
+              }}
+            >
+              <div
+                style={{
+                  width: "min(1400px, 96vw)",
+                  height: "min(94vh, 1000px)",
+                  background: "#fff",
+                  borderRadius: 18,
+                  overflow: "hidden",
+                  boxShadow: "0 30px 80px rgba(0,0,0,0.35)",
+                  display: "grid",
+                  gridTemplateRows: "auto 1fr",
+                }}
+              >
+                {/* Header */}
+                <div
+                  style={{
+                    padding: "14px 18px",
+                    borderBottom: "1px solid #eee",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "flex-start",
+                    gap: 16,
+                  }}
+                >
+                  <div style={{ minWidth: 0 }}>
+                    <div
+                      style={{
+                        fontWeight: 900,
+                        fontSize: 16,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                      }}
+                    >
+                      {preview.title}
                     </div>
-                    
+
+                    <div style={{ fontSize: 13, color: "#666", marginTop: 4 }}>
+                      {preview.eventId && <>講演会ID：{preview.eventId}　</>}
+                      {preview.filename && <>ファイル：{preview.filename}　</>}
+                      {preview.createdAt && <>作成：{dateformated(preview.createdAt)}</>}
+                    </div>
+
                     <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
 
-                       <div style={{ fontSize: 14, color: "#64748b",width: "100%",borderTop: "1px solid rgba(226,232,240,0.95)", paddingTop: 8 }}>
-                                Download
-                              </div>
+                      <div style={{ fontSize: 14, color: "#64748b", width: "100%", borderTop: "1px solid rgba(226,232,240,0.95)", paddingTop: 8 }}>
+                        Download
+                      </div>
 
-                              <button style={ui.smallBtn2} onClick={async () => {
-                                  const eventIdLike = preview.eventId || preview.id || "event";
-                                  const filename = `${eventIdLike}_招聘.jpg`;
-                                  const url = `/download/${preview.id}.jpg?t=${encodeURIComponent(previewBuster)}`;
-                                  await downloadWithFilename(url, filename);
-                                }}>
-                                JPG
-                              </button> 
+                      <button style={ui.smallBtn2} onClick={async () => {
+                        const eventIdLike = preview.eventId || preview.id || "event";
+                        const filename = `${eventIdLike}_招聘.jpg`;
+                        const url = `/download/${preview.id}.jpg?t=${encodeURIComponent(previewBuster)}`;
+                        await downloadWithFilename(url, filename);
+                      }}>
+                        JPG
+                      </button>
 
-                               <button style={ui.smallBtn2} onClick={async () => {
-                                  const eventIdLike = preview.eventId || preview.id || "event";
-                                  const filename = `${eventIdLike}_backup.json`;
-                                  const url = `/debug/${preview.id}/latest.json?t=${encodeURIComponent(previewBuster)}`;
-                                  await downloadWithFilename(url, filename);
-                                }}>
-                                JSON
-                              </button> 
+                      <button style={ui.smallBtn2} onClick={async () => {
+                        const eventIdLike = preview.eventId || preview.id || "event";
+                        const filename = `${eventIdLike}_backup.json`;
+                        const url = `/debug/${preview.id}/latest.json?t=${encodeURIComponent(previewBuster)}`;
+                        await downloadWithFilename(url, filename);
+                      }}>
+                        JSON
+                      </button>
 
 
-                              <button style={ui.smallBtn2} onClick={async () => {
-                                 const eventIdLike = preview.eventId || preview.id || "event";
-                                  const filename = `${eventIdLike}_export.zip`;
-                                  await exportOneZip(preview.id,filename);
-                                }}>
-                                まとめてダウンロード
-                              </button> 
+                      <button style={ui.smallBtn2} onClick={async () => {
+                        const eventIdLike = preview.eventId || preview.id || "event";
+                        const filename = `${eventIdLike}_export.zip`;
+                        await exportOneZip(preview.id, filename);
+                      }}>
+                        まとめてダウンロード
+                      </button>
                     </div>
-        </div>
+                  </div>
 
-        <div style={{ display: "flex", gap: 10,flex:1,whiteSpace: "nowrap", justifyContent: "flex-end", alignItems: "center" }}>
-          <button
-            style={{
-              padding: "10px 14px",
-              borderRadius: 12,
-              border: "1px solid #ddd",
-              background: "#fff",
-              fontWeight: 700,
-              cursor: "pointer",
-            }}
-            onClick={() => nav(`/job/${preview.id}`)}
-          >
-            編集
-          </button>
+                  <div style={{ display: "flex", gap: 10, flex: 1, whiteSpace: "nowrap", justifyContent: "flex-end", alignItems: "center" }}>
+                    <button
+                      style={{
+                        padding: "10px 14px",
+                        borderRadius: 12,
+                        border: "1px solid #ddd",
+                        background: "#fff",
+                        fontWeight: 700,
+                        cursor: "pointer",
+                      }}
+                      onClick={() => nav(`/job/${preview.id}`)}
+                    >
+                      編集
+                    </button>
 
-          {/* <button
+                    {/* <button
             style={{
               padding: "10px 14px",
               borderRadius: 12,
@@ -1095,45 +1089,45 @@ const pageNumbers = useMemo(() => {
             ⬇ Download
           </button> */}
 
-          <button
-            style={{
-              padding: "10px 14px",
-              borderRadius: 12,
-              border: "1px solid #ddd",
-              background: "#fff",
-              fontWeight: 700,
-              cursor: "pointer",
-            }}
-            onClick={() => setPreview(null)}
-          >
-            ✕
-          </button>
-        </div>
-      </div>
+                    <button
+                      style={{
+                        padding: "10px 14px",
+                        borderRadius: 12,
+                        border: "1px solid #ddd",
+                        background: "#fff",
+                        fontWeight: 700,
+                        cursor: "pointer",
+                      }}
+                      onClick={() => setPreview(null)}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </div>
 
-      {/* Body */}
-      <div
-        style={{
-          overflow: "scroll",
-          background: "#111",
-          display: "flex",
-          justifyContent: "center",
-          alignItems: "flex-start",
-          padding: 24,
-        }}
-      >
-        <img
-          src={`${API_BASE}${preview.src}`}
-          alt=""
-          style={{
-            maxWidth: "100%",
-            background: "#fff",
-          }}
-        />
-      </div>
-    </div>
-  </div>
-)}
+                {/* Body */}
+                <div
+                  style={{
+                    overflow: "scroll",
+                    background: "#111",
+                    display: "flex",
+                    justifyContent: "center",
+                    alignItems: "flex-start",
+                    padding: 24,
+                  }}
+                >
+                  <img
+                    src={`${API_BASE}${preview.src}`}
+                    alt=""
+                    style={{
+                      maxWidth: "100%",
+                      background: "#fff",
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>

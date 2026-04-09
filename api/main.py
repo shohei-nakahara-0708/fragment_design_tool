@@ -3877,6 +3877,8 @@ def init_db():
             """)
             con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at);")
             con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_event_id ON jobs(event_id);")
 
             con.execute("""
             CREATE TABLE IF NOT EXISTS correct_answers (
@@ -10894,7 +10896,7 @@ def _storage_auth_headers() -> dict:
     }
 
 def _authenticated_storage_url(remote_path: str) -> str:
-    return f"{SUPABASE_URL}/storage/v1/object/authenticated/{SUPABASE_BUCKET}/{remote_path}"
+    return f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{remote_path}"
 
 def download_storage_file(remote_path: str) -> bytes:
     url = _authenticated_storage_url(remote_path)
@@ -10909,6 +10911,42 @@ def download_storage_json(remote_path: str) -> dict:
     if r.status_code >= 400:
         raise HTTPException(status_code=404, detail="job json not found")
     return r.json()
+
+def _normalize_signed_url(signed: str) -> str:
+    if signed.startswith("http"):
+        return signed
+    if signed.startswith("/") and not signed.startswith("/storage/v1"):
+        signed = f"/storage/v1{signed}"
+    return f"{SUPABASE_URL}{signed}"
+
+def create_signed_url(remote_path: str, expires_in: int = 3600) -> str:
+    url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/{remote_path}"
+    headers = {**_storage_auth_headers(), "Content-Type": "application/json"}
+    r = requests.post(url, headers=headers, json={"expiresIn": expires_in}, timeout=10)
+    if r.status_code >= 400:
+        raise RuntimeError(f"signed url failed: {r.status_code} {r.text}")
+    body = r.json()
+    signed = body.get("signedURL") or body.get("signedUrl") or ""
+    if not signed:
+        raise RuntimeError(f"signed url empty: {body}")
+    return _normalize_signed_url(signed)
+
+def create_signed_urls_batch(remote_paths: list[str], expires_in: int = 3600) -> dict[str, str]:
+    if not remote_paths:
+        return {}
+    url = f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}"
+    headers = {**_storage_auth_headers(), "Content-Type": "application/json"}
+    r = requests.post(url, headers=headers, json={"expiresIn": expires_in, "paths": remote_paths}, timeout=15)
+    if r.status_code >= 400:
+        logger.warning(f"batch signed url failed: {r.status_code} {r.text}")
+        return {}
+    result = {}
+    for item in r.json():
+        path = item.get("path", "")
+        signed = item.get("signedURL") or item.get("signedUrl") or ""
+        if path and signed:
+            result[path] = _normalize_signed_url(signed)
+    return result
 
 def delete_storage_files(paths: list[str]):
     if not paths:
@@ -11409,11 +11447,8 @@ async def render(req: RenderReq):
             # blocksをストレージから取得
             blocks_text = ""
             sp = storage_paths(req.jobId)
-            blocks_url = f"{SUPABASE_URL}/storage/v1/object/authenticated/{sp['debug_blocks']}"
-            headers_s = {
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-            }
+            blocks_url = _authenticated_storage_url(sp['debug_blocks'])
+            headers_s = _storage_auth_headers()
             resp = requests.get(blocks_url, headers=headers_s, timeout=30)
             if resp.status_code == 200:
                 blocks_data = resp.json()
@@ -11470,6 +11505,7 @@ async def render(req: RenderReq):
         "warnings": getattr(payload, "warnings", None),
         "previewUrl": f"/preview/{req.jobId}.jpg",
         "downloadUrl": f"/download/{req.jobId}.jpg",
+        "previewDataUrl": f"data:image/jpeg;base64,{base64.b64encode(jpg_bytes).decode('ascii')}",
     })
 
 def _parse_date_start(s: str) -> Optional[datetime]:
@@ -11642,6 +11678,18 @@ async def list_jobs(
         ).fetchall()
 
     items = [row_to_job_item(r) for r in rows]
+
+    # 一覧画像を CDN 直読みにするため署名付き URL を一括発行
+    preview_paths = [f"{it['jobId']}/preview.jpg" for it in items]
+    try:
+        signed_map = create_signed_urls_batch(preview_paths, expires_in=3600)
+    except Exception:
+        signed_map = {}
+    for it in items:
+        p = f"{it['jobId']}/preview.jpg"
+        if p in signed_map:
+            it["previewSignedUrl"] = signed_map[p]
+
     return {
         "page": page,
         "pageSize": page_size,
@@ -11694,9 +11742,13 @@ async def get_job(job_id: str):
 @app.get("/preview/{job_id}.jpg")
 async def preview(job_id: str):
     sp = storage_paths(job_id)
-    data = download_storage_file(sp["preview"])
-    return Response(content=data, media_type="image/jpeg",
-                    headers={"Cache-Control": "no-cache"})
+    try:
+        signed = create_signed_url(sp["preview"], expires_in=600)
+        return RedirectResponse(url=signed, status_code=307)
+    except Exception:
+        data = download_storage_file(sp["preview"])
+        return Response(content=data, media_type="image/jpeg",
+                        headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/export/{job_id}.zip")
