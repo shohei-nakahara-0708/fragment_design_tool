@@ -6354,7 +6354,10 @@ def find_similar_correct_answers(
             ans["_similarity"] = sim
             scored.append((sim, ans))
 
-    scored.sort(key=lambda x: -x[0])
+    # 同一類似度では新しいレコードを優先（created_at DESCでロード済みなので index が小さいほうが新しい）
+    for idx, (sim, ans) in enumerate(scored):
+        ans["_rank_index"] = idx
+    scored.sort(key=lambda x: (-x[0], x[1].get("_rank_index", 0)))
     return [item[1] for item in scored[:top_k]]
 
 
@@ -6416,7 +6419,7 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
         correct = best.get("correct_json") or {}
         print(f"[correct-answer-overlay] sim={sim:.2f} job_id={best.get('job_id','')}")
 
-        # ---- event_title ---- (title_lines を正とし、title を再合成)
+        # ---- event_title ---- (DB の改行位置をそのまま復元)
         if correct.get("event_title_lines"):
             payload.event_title_lines = correct["event_title_lines"]
             payload.event_title = "\n".join(correct["event_title_lines"])
@@ -6445,7 +6448,7 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
                         t.speaker = ct["speaker"]
                     if ct.get("affiliation"):
                         t.affiliation = ct["affiliation"]
-                    # title_lines を正とし、title を再合成
+                    # title_lines: DB の改行位置を復元 + fix_title_lines_jp で補正
                     if ct.get("title_lines"):
                         t.title_lines = fix_title_lines_jp(ct["title_lines"])
                         t.title = "\n".join(t.title_lines)
