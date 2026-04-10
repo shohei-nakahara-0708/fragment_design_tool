@@ -732,6 +732,7 @@ export default function UploadPage() {
 
   return (
     <div style={ui.page}>
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
       <div style={ui.container}>
         {/* Header */}
         <div style={ui.header}>
@@ -875,7 +876,10 @@ export default function UploadPage() {
                 {uploading && (
                   <div style={ui.progressCard}>
                     <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#475569", fontWeight: 900 }}>
-                      <span>⏳ {progressText || "処理中…"}</span>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#2563eb" strokeWidth="2.5" strokeLinecap="round" style={{ animation: "spin 1s linear infinite" }}><path d="M21 12a9 9 0 1 1-6.219-8.56" /></svg>
+                        {progressText || "処理中…"}
+                      </span>
                       <span>{progress}%</span>
                     </div>
                     <div style={{ marginTop: 8, height: 10, background: "rgba(226,232,240,0.9)", borderRadius: 999, overflow: "hidden" }}>
@@ -1037,7 +1041,10 @@ export default function UploadPage() {
                 {simpleUploading && (
                   <div style={ui.progressCard}>
                     <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#475569", fontWeight: 900 }}>
-                      <span>⏳ {simpleProgress || "処理中…"}</span>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#2563eb" strokeWidth="2.5" strokeLinecap="round" style={{ animation: "spin 1s linear infinite" }}><path d="M21 12a9 9 0 1 1-6.219-8.56" /></svg>
+                        {simpleProgress || "処理中…"}
+                      </span>
                       <span>{simpleProgressPercent}%</span>
                     </div>
                     <div style={{ marginTop: 8, height: 10, background: "rgba(226,232,240,0.9)", borderRadius: 999, overflow: "hidden" }}>
@@ -1276,7 +1283,7 @@ export default function UploadPage() {
                             <StatusPill status={it.status} />
                           </div>
 
-                          <div style={{ display: "none", justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
+                          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
                             {/* pendingでも消せる */}
                             <button
                               style={ui.btnSmall}

@@ -1,6 +1,42 @@
 import React, { useEffect, useMemo, useState, useCallback } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 const API_BASE = import.meta.env.VITE_API_BASE || "";
+
+/** ---------- warning chip config ---------- */
+const WARNING_MAP = {
+  ai_refined: { label: "AI解析済", tone: "blue", icon: "✦" },
+  ai_refined_fallback: { label: "AI解析（予備）", tone: "yellow", icon: "⚠" },
+  ai_json_parse_failed: { label: "AIパース失敗", tone: "red", icon: "✕" },
+  ai_patch_rejected: { label: "AI補正不採用", tone: "red", icon: "✕" },
+  vm_match_not_confident: { label: "VM照合 低信頼", tone: "yellow", icon: "?" },
+  missing_chair: { label: "座長なし", tone: "yellow", icon: "!" },
+  missing_organizer: { label: "主催/共催なし", tone: "yellow", icon: "!" },
+  talks_pruned_by_vm_hint: { label: "VM絞り込み", tone: "gray", icon: "▾" },
+  talks_pruned_heuristic_only: { label: "自動絞り込み", tone: "gray", icon: "▾" },
+};
+const TONE_STYLES = {
+  blue: { bg: "rgba(37,99,235,0.10)", bd: "rgba(37,99,235,0.25)", fg: "#1d4ed8" },
+  green: { bg: "rgba(34,197,94,0.10)", bd: "rgba(34,197,94,0.25)", fg: "#166534" },
+  yellow: { bg: "rgba(234,179,8,0.12)", bd: "rgba(202,138,4,0.30)", fg: "#854d0e" },
+  red: { bg: "rgba(239,68,68,0.10)", bd: "rgba(239,68,68,0.25)", fg: "#991b1b" },
+  gray: { bg: "rgba(148,163,184,0.12)", bd: "rgba(148,163,184,0.25)", fg: "#475569" },
+};
+function WarningChip({ code }) {
+  const m = WARNING_MAP[code] || { label: code, tone: "gray", icon: "•" };
+  const t = TONE_STYLES[m.tone] || TONE_STYLES.gray;
+  return (
+    <span style={{
+      display: "inline-flex", alignItems: "center", gap: 4,
+      fontSize: 11, fontWeight: 800, padding: "3px 8px",
+      borderRadius: 999, border: `1px solid ${t.bd}`,
+      background: t.bg, color: t.fg, whiteSpace: "nowrap",
+    }}>
+      <span style={{ fontSize: 10 }}>{m.icon}</span>
+      {m.label}
+    </span>
+  );
+}
+
 /** ---------- helpers ---------- */
 function toIsoStart(dateStr) {
   return dateStr || "";
@@ -616,7 +652,7 @@ export default function JobListPage() {
     const id = it.job_id || it.jobId;
     const previewUrl = it.previewUrl || `/preview/${id}.jpg`;
     const src = it.previewSignedUrl
-      || `${previewUrl}?v=${encodeURIComponent(it.updatedAt || it.updated_at || Date.now())}`;
+      || `${previewUrl}?v=${previewBuster}`;
 
     return {
       id,
@@ -627,7 +663,7 @@ export default function JobListPage() {
       eventId: it.event_id || "",
       warnings: it.warnings || [],
     };
-  }, []);
+  }, [previewBuster]);
 
   const openPreview = (it) => setPreview(buildPreview(it));
 
@@ -667,54 +703,26 @@ export default function JobListPage() {
 
 
               <Link to="/diff" style={{ textDecoration: "none" }}>
-                <button
-                  style={ui.buttonPrimary}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.transform = "translateY(-1px)";
-                    e.currentTarget.style.background = "#1d4ed8";
-                    e.currentTarget.style.boxShadow = "0 14px 26px rgba(37,99,235,0.22)";
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.transform = "none";
-                    e.currentTarget.style.background = "#2563eb";
-                    e.currentTarget.style.boxShadow = "0 10px 22px rgba(37,99,235,0.18)";
-                  }}
-                >
-                  ＋ Diff
+                <button style={ui.buttonGhost2}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "middle", marginRight: 4 }}><line x1="18" y1="20" x2="18" y2="10" /><line x1="12" y1="20" x2="12" y2="4" /><line x1="6" y1="20" x2="6" y2="14" /></svg>
+                  Diff
                 </button>
               </Link>
 
               <Link to="/upload" style={{ textDecoration: "none" }}>
-                <button
-                  style={ui.buttonPrimary}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.transform = "translateY(-1px)";
-                    e.currentTarget.style.background = "#1d4ed8";
-                    e.currentTarget.style.boxShadow = "0 14px 26px rgba(37,99,235,0.22)";
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.transform = "none";
-                    e.currentTarget.style.background = "#2563eb";
-                    e.currentTarget.style.boxShadow = "0 10px 22px rgba(37,99,235,0.18)";
-                  }}
-                >
-                  ＋ Upload
+                <button style={ui.buttonPrimary}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "middle", marginRight: 4 }}><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
+                  アップロード
                 </button>
               </Link>
 
-              {/* <button
-              style={{ ...ui.buttonGhost2, ...(selected.size === 0 ? ui.disabled : {}) }}
-              onClick={exportPdf}
-              disabled={selected.size === 0}
-            >
-              PDF Export
-            </button> */}
-
               <button style={{ ...ui.buttonGhost2, ...(selected.size === 0 ? ui.disabled : {}) }} onClick={exportZip} disabled={selected.size === 0}>
-                ZIP Export
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "middle", marginRight: 4 }}><rect x="2" y="2" width="20" height="20" rx="2" /><path d="M12 2v20" /><path d="M2 12h20" /></svg>
+                ZIP エクスポート
               </button>
 
               <button style={{ ...ui.buttonDanger, ...(selected.size === 0 ? ui.disabled : {}) }} onClick={deleteSelected} disabled={selected.size === 0}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "middle", marginRight: 4 }}><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /></svg>
                 削除
               </button>
 
@@ -835,7 +843,7 @@ export default function JobListPage() {
                       const API_BASE = import.meta.env.VITE_API_BASE || "";
 
                       const previewSrc = it.previewSignedUrl
-                        || `${API_BASE}${it.previewUrl || `/preview/${id}.jpg`}?v=${encodeURIComponent(it.updatedAt || it.updated_at || Date.now())}`;
+                        || `${API_BASE}${it.previewUrl || `/preview/${id}.jpg`}?v=${previewBuster}`;
 
                       const active = preview?.id === id;
 
@@ -859,17 +867,11 @@ export default function JobListPage() {
 
                             <div style={ui.chips}>
                               {(it.warnings || []).slice(0, 4).map((w) => (
-                                <span key={w} style={ui.chip}>
-                                  {w}
-                                </span>
+                                <WarningChip key={w} code={w} />
                               ))}
                             </div>
 
                             <div style={ui.cardActions}>
-
-                              <div style={{ fontSize: 14, color: "#64748b", width: "100%", borderTop: "1px solid rgba(226,232,240,0.95)", paddingTop: 8 }}>
-                                Download
-                              </div>
 
                               <button style={ui.smallBtn2} onClick={async () => {
                                 const eventIdLike = it.event_id || id || "event";
@@ -877,6 +879,7 @@ export default function JobListPage() {
                                 const url = `/download/${id}.jpg?t=${encodeURIComponent(previewBuster)}`;
                                 await downloadWithFilename(url, filename);
                               }}>
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "middle", marginRight: 4 }}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
                                 JPG
                               </button>
 
@@ -886,16 +889,17 @@ export default function JobListPage() {
                                 const url = `/debug/${id}/latest.json?t=${encodeURIComponent(previewBuster)}`;
                                 await downloadWithFilename(url, filename);
                               }}>
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "middle", marginRight: 4 }}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
                                 JSON
                               </button>
-
 
                               <button style={ui.smallBtn2} onClick={async () => {
                                 const eventIdLike = it.event_id || id || "event";
                                 const filename = `${eventIdLike}_export.zip`;
                                 await exportOneZip(id, filename);
                               }}>
-                                まとめてダウンロード
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "middle", marginRight: 4 }}><rect x="2" y="2" width="20" height="20" rx="2" /><path d="M12 2v20" /><path d="M2 12h20" /></svg>
+                                ZIP
                               </button>
 
                               {debug && (
@@ -1060,16 +1064,13 @@ export default function JobListPage() {
 
                     <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
 
-                      <div style={{ fontSize: 14, color: "#64748b", width: "100%", borderTop: "1px solid rgba(226,232,240,0.95)", paddingTop: 8 }}>
-                        Download
-                      </div>
-
                       <button style={ui.smallBtn2} onClick={async () => {
                         const eventIdLike = preview.eventId || preview.id || "event";
                         const filename = `${eventIdLike}_招聘.jpg`;
                         const url = `/download/${preview.id}.jpg?t=${encodeURIComponent(previewBuster)}`;
                         await downloadWithFilename(url, filename);
                       }}>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "middle", marginRight: 4 }}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
                         JPG
                       </button>
 
@@ -1079,16 +1080,17 @@ export default function JobListPage() {
                         const url = `/debug/${preview.id}/latest.json?t=${encodeURIComponent(previewBuster)}`;
                         await downloadWithFilename(url, filename);
                       }}>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "middle", marginRight: 4 }}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
                         JSON
                       </button>
-
 
                       <button style={ui.smallBtn2} onClick={async () => {
                         const eventIdLike = preview.eventId || preview.id || "event";
                         const filename = `${eventIdLike}_export.zip`;
                         await exportOneZip(preview.id, filename);
                       }}>
-                        まとめてダウンロード
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "middle", marginRight: 4 }}><rect x="2" y="2" width="20" height="20" rx="2" /><path d="M12 2v20" /><path d="M2 12h20" /></svg>
+                        ZIP
                       </button>
                     </div>
                   </div>

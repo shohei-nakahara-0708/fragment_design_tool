@@ -189,6 +189,69 @@ const styles = {
   },
 };
 
+function ToggleSwitch({ checked, onChange, label, disabled }) {
+  return (
+    <label style={{
+      display: "inline-flex", alignItems: "center", gap: 8,
+      cursor: disabled ? "not-allowed" : "pointer", userSelect: "none",
+      opacity: disabled ? 0.5 : 1,
+    }}>
+      <span
+        role="switch"
+        aria-checked={checked}
+        onClick={(e) => { e.preventDefault(); if (!disabled) onChange(!checked); }}
+        style={{
+          position: "relative", display: "inline-block",
+          width: 36, height: 20, borderRadius: 999, flexShrink: 0,
+          background: checked
+            ? "linear-gradient(135deg, #22c55e 0%, #16a34a 100%)"
+            : "#d1d5db",
+          transition: "background 0.2s ease",
+          boxShadow: checked
+            ? "0 0 0 2px rgba(34,197,94,0.15), inset 0 1px 2px rgba(0,0,0,0.06)"
+            : "inset 0 1px 2px rgba(0,0,0,0.08)",
+        }}
+      >
+        <span style={{
+          position: "absolute", top: 2, left: checked ? 18 : 2,
+          width: 16, height: 16, borderRadius: 999,
+          background: "#fff",
+          boxShadow: "0 1px 3px rgba(0,0,0,0.2), 0 0 0 0.5px rgba(0,0,0,0.04)",
+          transition: "left 0.15s cubic-bezier(0.4,0,0.2,1)",
+        }} />
+      </span>
+      <input
+        type="checkbox" checked={checked} readOnly
+        style={{ position: "absolute", opacity: 0, width: 0, height: 0 }}
+      />
+      {label && <span style={{ fontSize: 12, fontWeight: 700, color: "#374151" }}>{label}</span>}
+    </label>
+  );
+}
+
+function StatusDot({ tone, text, busy }) {
+  const colors = {
+    green: { bg: "#22c55e", ring: "rgba(34,197,94,0.2)" },
+    blue: { bg: "#3b82f6", ring: "rgba(59,130,246,0.2)" },
+    red: { bg: "#ef4444", ring: "rgba(239,68,68,0.2)" },
+    gray: { bg: "#9ca3af", ring: "rgba(156,163,175,0.2)" },
+  };
+  const c = colors[tone] || colors.gray;
+  return (
+    <span style={{
+      display: "inline-flex", alignItems: "center", gap: 6,
+      fontSize: 12, fontWeight: 700, color: "#475569",
+    }}>
+      <span style={{
+        width: 8, height: 8, borderRadius: 999, background: c.bg, flexShrink: 0,
+        boxShadow: `0 0 0 3px ${c.ring}`,
+        animation: (busy || tone === "green") ? "pulse-dot 2s ease-in-out infinite" : "none",
+      }} />
+      {text}
+    </span>
+  );
+}
+
 function Control({ as = "input", invalid = false, style, ...props }) {
   const Tag = as;
   const merged = {
@@ -830,7 +893,7 @@ export default function JobEditorPage() {
 
   const hasJsonErrors = useMemo(() => Object.keys(errors).length > 0, [errors]);
   const statusTone = hasJsonErrors ? "red" : busy ? "blue" : autoRender ? "green" : "gray";
-  const statusText = hasJsonErrors ? "必須項目未入力" : busy ? "Rendering..." : autoRender ? "Auto" : "Manual";
+  const statusText = hasJsonErrors ? "必須項目未入力" : busy ? "レンダリング中…" : autoRender ? "自動反映 ON" : "手動モード";
 
   if (!json) return (
     <div style={ui.page}>
@@ -884,7 +947,9 @@ export default function JobEditorPage() {
             </div>
           </div>
         </div>
-        <style>{`@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }`}</style>
+        <style>{`@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+@keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
       </div>
       {/* Right preview skeleton */}
       <div style={ui.rightCol}>
@@ -908,6 +973,8 @@ export default function JobEditorPage() {
 
   return (
     <div style={ui.page}>
+      <style>{`@keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
       {/* Left */}
       <div style={ui.leftCol}>
         <Card
@@ -923,14 +990,15 @@ export default function JobEditorPage() {
               </div>
             </div>
           }
-          right={<span style={ui.badge(statusTone)}>{statusText}</span>}
+          right={<StatusDot tone={statusTone} text={statusText} busy={busy} />}
         >
-          <div style={{ ...ui.row, marginTop: 10 }}>
-            <label style={ui.badge(autoRender ? "green" : "gray")}>
-              <input type="checkbox" checked={autoRender} onChange={(e) => setAutoRender(e.target.checked)} />
-              リアルタイム反映（0.5s）
-            </label>
-
+          <div style={{ display: "flex", alignItems: "center", gap: 16, marginTop: 10 }}>
+            <ToggleSwitch
+              checked={autoRender}
+              onChange={setAutoRender}
+              label="リアルタイム反映"
+            />
+            <span style={{ fontSize: 11, color: "#94a3b8" }}>編集後 0.5s で自動レンダー</span>
           </div>
         </Card>
 
@@ -1052,14 +1120,11 @@ export default function JobEditorPage() {
               }}
             />
 
-            <label style={ui.badge(!!json.datetime_time_newline ? "green" : "gray")}>
-              <input
-                type="checkbox"
-                checked={!!json.datetime_time_newline}
-                onChange={(e) => updateAtPath(["datetime_time_newline"], e.target.checked)}
-              />
-              時間を改行表示
-            </label>
+            <ToggleSwitch
+              checked={!!json.datetime_time_newline}
+              onChange={(v) => updateAtPath(["datetime_time_newline"], v)}
+              label="時間を改行表示"
+            />
 
             <Field label="注釈" help="日時の下に小さめの文字で表示される行。改行も可能。例: 各講演35分（Q&A含む）など ※VM(本社)の時のみ自動処理が実行されます。">
               <Control
@@ -1137,9 +1202,20 @@ export default function JobEditorPage() {
               width: "100%",
               opacity: busy ? 0.6 : 1,
               cursor: busy ? "not-allowed" : "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
             }}
           >
-            {busy ? "Rendering..." : "Save & Render"}
+            {busy ? (
+              <>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ animation: "spin 1s linear infinite" }}><path d="M21 12a9 9 0 1 1-6.219-8.56" /></svg>
+                レンダリング中…
+              </>
+            ) : (
+              <>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" /></svg>
+                保存 &amp; レンダー
+              </>
+            )}
           </button>
 
           {hasJsonErrors ? (
@@ -1155,44 +1231,7 @@ export default function JobEditorPage() {
         <Card
           title="Preview"
           right={
-            <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
-              <div style={{ fontSize: 14, color: "#64748b", width: "100%", paddingTop: 8 }}>Download</div>
-
-              <button
-                style={ui.smallBtn2}
-                onClick={async () => {
-                  const eventIdLike = json.event_id || jobId || "event";
-                  const filename = `${eventIdLike}_招聘.jpg`;
-                  const url = `/download/${jobId}.jpg?t=${encodeURIComponent(previewBuster)}`;
-                  await downloadWithFilename(url, filename);
-                }}
-              >
-                JPG
-              </button>
-
-              <button
-                style={ui.smallBtn2}
-                onClick={async () => {
-                  const eventIdLike = json.event_id || jobId || "event";
-                  const filename = `${eventIdLike}_backup.json`;
-                  const url = `/debug/${jobId}/latest.json?t=${encodeURIComponent(previewBuster)}`;
-                  await downloadWithFilename(url, filename);
-                }}
-              >
-                JSON
-              </button>
-
-              <button
-                style={ui.smallBtn2}
-                onClick={async () => {
-                  const eventIdLike = json.event_id || jobId || "event";
-                  const filename = `${eventIdLike}_export.zip`;
-                  await exportOneZip(jobId, filename);
-                }}
-              >
-                まとめてダウンロード
-              </button>
-            </div>
+            <StatusDot tone={statusTone} text={statusText} busy={busy} />
           }
         >
           <div style={styles.previewFrame}>
@@ -1201,6 +1240,60 @@ export default function JobEditorPage() {
               style={{ width: "100%", maxWidth: 600, display: "block", margin: "0 auto" }}
               alt=""
             />
+          </div>
+
+          <div style={{
+            display: "flex", gap: 8, marginTop: 12, paddingTop: 12,
+            borderTop: "1px solid #f0f0f0", flexWrap: "wrap", alignItems: "center",
+          }}>
+            <span style={{ fontSize: 11, fontWeight: 700, color: "#94a3b8", marginRight: 4 }}>DL</span>
+
+            <button
+              style={{
+                ...ui.smallBtn2,
+                display: "inline-flex", alignItems: "center", gap: 5,
+              }}
+              onClick={async () => {
+                const eventIdLike = json.event_id || jobId || "event";
+                const filename = `${eventIdLike}_招聘.jpg`;
+                const url = `/download/${jobId}.jpg?t=${encodeURIComponent(previewBuster)}`;
+                await downloadWithFilename(url, filename);
+              }}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
+              JPG
+            </button>
+
+            <button
+              style={{
+                ...ui.smallBtn2,
+                display: "inline-flex", alignItems: "center", gap: 5,
+              }}
+              onClick={async () => {
+                const eventIdLike = json.event_id || jobId || "event";
+                const filename = `${eventIdLike}_backup.json`;
+                const url = `/debug/${jobId}/latest.json?t=${encodeURIComponent(previewBuster)}`;
+                await downloadWithFilename(url, filename);
+              }}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
+              JSON
+            </button>
+
+            <button
+              style={{
+                ...ui.smallBtn2,
+                display: "inline-flex", alignItems: "center", gap: 5,
+              }}
+              onClick={async () => {
+                const eventIdLike = json.event_id || jobId || "event";
+                const filename = `${eventIdLike}_export.zip`;
+                await exportOneZip(jobId, filename);
+              }}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="4" width="20" height="16" rx="2" /><path d="M12 2v6" /><path d="M2 10h20" /></svg>
+              ZIP
+            </button>
           </div>
         </Card>
       </div>

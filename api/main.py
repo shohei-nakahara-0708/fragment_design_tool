@@ -11934,9 +11934,10 @@ async def upload_simple_stream(
                         debug_blocks_path=p.get("debug_blocks"),
                     )
 
-                    # ローカルにもJSONを保存（編集画面の初回表示高速化）
+                    # ローカルにもJSON・JPGを保存（一覧/編集画面の高速化）
                     try:
                         p["json"].write_text(json.dumps(payload_dict, ensure_ascii=False), encoding="utf-8")
+                        p["jpg"].write_bytes(jpg_bytes)
                     except Exception:
                         pass
 
@@ -12161,9 +12162,10 @@ async def upload_batch_stream(
                         debug_blocks_path=p.get("debug_blocks"),
                     )
 
-                    # ローカルにもJSONを保存（編集画面の初回表示高速化）
+                    # ローカルにもJSON・JPGを保存（一覧/編集画面の高速化）
                     try:
                         p["json"].write_text(json.dumps(payload_dict, ensure_ascii=False), encoding="utf-8")
+                        p["jpg"].write_bytes(jpg_bytes)
                     except Exception:
                         pass
 
@@ -12261,29 +12263,45 @@ async def render(req: RenderReq, background_tasks: BackgroundTasks):
 
     jpg_bytes, debug_html = await render_png_bytes(payload)
 
-    try:
-        await upload_all_assets_async(
-            req.jobId,
-            payload_dict=payload_dict,
-            jpg_bytes=jpg_bytes,
-            debug_html=debug_html,
-        )
-    except Exception as e:
-        print("[storage upload error][/render]", req.jobId, e)
-        raise HTTPException(500, f"storage upload failed: {e}")
-
-    # ローカルにもJSONを保存（次回の編集画面表示を高速化）
+    # ローカルにもJSON・JPGを保存（レスポンス前に完了 — 高速）
     try:
         rp = job_paths(req.jobId)
         rp["json"].write_text(json.dumps(payload_dict, ensure_ascii=False), encoding="utf-8")
+        rp["jpg"].write_bytes(jpg_bytes)
     except Exception:
         pass
-
-    upsert_job_ok(req.jobId, filename, payload, session_id, event_id)
 
     # invalidate signed URL cache for this preview (image changed)
     preview_cache_key = f"{req.jobId}/preview.jpg"
     _signed_url_cache.pop(preview_cache_key, None)
+
+    # Storage アップロード + DB更新はバックグラウンドで実行
+    # （レスポンスには previewDataUrl が含まれるので待つ必要なし）
+    _job_id_bg = req.jobId
+    _payload_dict_bg = payload_dict
+    _jpg_bytes_bg = jpg_bytes
+    _debug_html_bg = debug_html
+    _filename_bg = filename
+    _payload_bg = payload
+    _session_id_bg = session_id
+    _event_id_bg = event_id
+
+    async def _upload_and_upsert_bg():
+        try:
+            await upload_all_assets_async(
+                _job_id_bg,
+                payload_dict=_payload_dict_bg,
+                jpg_bytes=_jpg_bytes_bg,
+                debug_html=_debug_html_bg,
+            )
+        except Exception as e:
+            print("[storage upload error][/render bg]", _job_id_bg, e)
+        try:
+            upsert_job_ok(_job_id_bg, _filename_bg, _payload_bg, _session_id_bg, _event_id_bg)
+        except Exception as e:
+            print("[upsert error][/render bg]", _job_id_bg, e)
+
+    background_tasks.add_task(asyncio.ensure_future, _upload_and_upsert_bg())
 
     # manual_override=True → 正解DBに自動登録（バックグラウンドで実行）
     _job_id_for_bg = req.jobId
@@ -12424,6 +12442,14 @@ async def restore_from_json_batch(files: list[UploadFile] = File(...)):
             except Exception as e:
                 print("[storage upload error][/jobs/restore/batch]", job_id, e)
                 raise HTTPException(500, f"storage upload failed: {e}")
+
+            # ローカルにもJSON・JPGを保存（一覧/編集画面の高速化）
+            try:
+                rp = job_paths(job_id)
+                rp["json"].write_text(json.dumps(payload_dict, ensure_ascii=False), encoding="utf-8")
+                rp["jpg"].write_bytes(jpg_bytes)
+            except Exception:
+                pass
 
             event_id = getattr(payload, "event_id", "") or ""
             upsert_job_ok(job_id, f.filename or "restore.json", payload, session_id, event_id)
@@ -12599,25 +12625,54 @@ async def get_job(job_id: str):
 
 
 @app.get("/preview/{job_id}.jpg")
-async def preview(job_id: str):
+async def preview(job_id: str, background_tasks: BackgroundTasks):
+    # ローカルファイルがあれば高速に返す（リダイレクト不要）
+    # no-cache: ブラウザは毎回確認するが ETag/Last-Modified で 304 を返すので高速
+    local = DATA_DIR / job_id / "preview.jpg"
+    if local.exists() and local.stat().st_size > 0:
+        return FileResponse(local, media_type="image/jpeg",
+                            headers={"Cache-Control": "no-cache"})
+
     sp = storage_paths(job_id)
     try:
         signed = create_signed_url(sp["preview"], expires_in=600)
+        # バックグラウンドでローカルキャッシュ（次回から高速配信）
+        def _cache_preview():
+            try:
+                data = download_storage_file(sp["preview"])
+                local.parent.mkdir(parents=True, exist_ok=True)
+                local.write_bytes(data)
+            except Exception:
+                pass
+        background_tasks.add_task(_cache_preview)
         return RedirectResponse(url=signed, status_code=307,
-                                headers={"Cache-Control": "private, max-age=300"})
+                                headers={"Cache-Control": "no-cache"})
     except Exception:
         data = download_storage_file(sp["preview"])
+        try:
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.write_bytes(data)
+        except Exception:
+            pass
         return Response(content=data, media_type="image/jpeg",
-                        headers={"Cache-Control": "private, max-age=60"})
+                        headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/export/{job_id}.zip")
 async def export_zip_single(job_id: str, background_tasks: BackgroundTasks):
     event_id = resolve_event_id(job_id)
+    p = job_paths(job_id)
     sp = storage_paths(job_id)
 
-    jpg_bytes = download_storage_file(sp["preview"])
-    json_bytes = download_storage_file(sp["json"])
+    # ローカル優先 → Storage fallback
+    if p["jpg"].exists() and p["jpg"].stat().st_size > 0:
+        jpg_bytes = p["jpg"].read_bytes()
+    else:
+        jpg_bytes = download_storage_file(sp["preview"])
+    if p["json"].exists() and p["json"].stat().st_size > 0:
+        json_bytes = p["json"].read_bytes()
+    else:
+        json_bytes = download_storage_file(sp["json"])
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
     tmp_path = Path(tmp.name)
@@ -12637,10 +12692,19 @@ async def export_zip_single(job_id: str, background_tasks: BackgroundTasks):
 @app.get("/download/{job_id}.jpg")
 async def download(job_id: str, background_tasks: BackgroundTasks):
     event_id = resolve_event_id(job_id)
-    sp = storage_paths(job_id)
-
-    jpg_bytes = download_storage_file(sp["preview"])
     filename = f"{event_id}_招聘.jpg"
+
+    # ローカル優先 → Storage fallback
+    local = DATA_DIR / job_id / "preview.jpg"
+    if local.exists() and local.stat().st_size > 0:
+        return FileResponse(
+            local,
+            media_type="image/jpeg",
+            filename=filename,
+        )
+
+    sp = storage_paths(job_id)
+    jpg_bytes = download_storage_file(sp["preview"])
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
     tmp_path = Path(tmp.name)
@@ -12657,6 +12721,14 @@ async def download(job_id: str, background_tasks: BackgroundTasks):
 
 @app.get("/debug/{job_id}/latest.json")
 async def debug_latest(job_id: str):
+    # ローカル優先 → Storage fallback
+    local = DATA_DIR / job_id / "latest.json"
+    if local.exists() and local.stat().st_size > 0:
+        try:
+            data = json.loads(local.read_text(encoding="utf-8"))
+            return JSONResponse(content=data, headers={"Cache-Control": "no-cache"})
+        except Exception:
+            pass
     sp = storage_paths(job_id)
     data = download_storage_json(sp["json"])
     return JSONResponse(content=data, headers={"Cache-Control": "no-cache"})
@@ -12665,6 +12737,14 @@ async def debug_latest(job_id: str):
 
 @app.get("/debug/{job_id}/blocks.json")
 async def debug_blocks(job_id: str):
+    # ローカル優先 → Storage fallback
+    local = DATA_DIR / job_id / "blocks.json"
+    if local.exists() and local.stat().st_size > 0:
+        try:
+            data = json.loads(local.read_text(encoding="utf-8"))
+            return JSONResponse(content=data, headers={"Cache-Control": "no-cache"})
+        except Exception:
+            pass
     sp = storage_paths(job_id)
     data = download_storage_json(sp["debug_blocks"])
     return JSONResponse(content=data, headers={"Cache-Control": "no-cache"})
