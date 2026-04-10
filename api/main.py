@@ -12328,7 +12328,16 @@ async def render(req: RenderReq, background_tasks: BackgroundTasks):
         except Exception as e:
             print("[upsert error][/render bg]", _job_id_bg, e)
 
-    background_tasks.add_task(asyncio.ensure_future, _upload_and_upsert_bg())
+    def _upload_and_upsert_bg_sync():
+        """BackgroundTasks はワーカースレッドで実行されるため、
+        asyncio の event loop が存在しない。新しいループを作って実行する。"""
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_upload_and_upsert_bg())
+        finally:
+            loop.close()
+
+    background_tasks.add_task(_upload_and_upsert_bg_sync)
 
     # manual_override=True → 正解DBに自動登録（バックグラウンドで実行）
     _job_id_for_bg = req.jobId
