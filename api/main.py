@@ -11926,15 +11926,7 @@ async def upload_simple_stream(
 
                     jpg_bytes, debug_html = await render_png_bytes(payload)
 
-                    await upload_all_assets_async(
-                        job_id,
-                        payload_dict=payload_dict,
-                        jpg_bytes=jpg_bytes,
-                        debug_html=debug_html,
-                        debug_blocks_path=p.get("debug_blocks"),
-                    )
-
-                    # ローカルにもJSON・JPGを保存（一覧/編集画面の高速化）
+                    # ローカルにJSON・JPGを保存（一覧/編集画面の高速化）
                     try:
                         p["json"].write_text(json.dumps(payload_dict, ensure_ascii=False), encoding="utf-8")
                         p["jpg"].write_bytes(jpg_bytes)
@@ -11945,6 +11937,14 @@ async def upload_simple_stream(
                         p["debug_blocks"].unlink(missing_ok=True)
 
                     upsert_job_ok(job_id, filename, payload, session_id, "")
+
+                    # Storage アップロードはバックグラウンドで実行（ローカル保存済みなので遅延OK）
+                    asyncio.create_task(upload_all_assets_async(
+                        job_id,
+                        payload_dict=payload_dict,
+                        jpg_bytes=jpg_bytes,
+                        debug_html=debug_html,
+                    ))
 
                     out.append({"filename": filename, "jobId": job_id, "ok": True})
                     yield _sse("item_done", {"index": i, "filename": filename, "ok": True, "jobId": job_id})
@@ -12154,15 +12154,7 @@ async def upload_batch_stream(
 
                     jpg_bytes, debug_html = await render_png_bytes(payload)
 
-                    await upload_all_assets_async(
-                        job_id,
-                        payload_dict=payload_dict,
-                        jpg_bytes=jpg_bytes,
-                        debug_html=debug_html,
-                        debug_blocks_path=p.get("debug_blocks"),
-                    )
-
-                    # ローカルにもJSON・JPGを保存（一覧/編集画面の高速化）
+                    # ローカルにJSON・JPGを保存（一覧/編集画面の高速化）
                     try:
                         p["json"].write_text(json.dumps(payload_dict, ensure_ascii=False), encoding="utf-8")
                         p["jpg"].write_bytes(jpg_bytes)
@@ -12174,6 +12166,14 @@ async def upload_batch_stream(
                         p["debug_blocks"].unlink(missing_ok=True)
 
                     upsert_job_ok(job_id, filename, payload, session_id, event_id)
+
+                    # Storage アップロードはバックグラウンドで実行（ローカル保存済みなので遅延OK）
+                    asyncio.create_task(upload_all_assets_async(
+                        job_id,
+                        payload_dict=payload_dict,
+                        jpg_bytes=jpg_bytes,
+                        debug_html=debug_html,
+                    ))
 
                     out.append({
                         "filename": filename,
