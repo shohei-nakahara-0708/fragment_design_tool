@@ -8843,9 +8843,12 @@ def strip_outer_quotes_loose(s: str) -> str:
                 s = s[len(l):-len(r)].strip()
                 changed = True
 
-    # 片側だけ残った外カッコも落とす
-    s = re.sub(r'^[「『（(]+', '', s).strip()
-    s = re.sub(r'[」』）)]+$', '', s).strip()
+    # 片側だけ残った外カッコも落とす（カウントが不均衡な場合のみ）
+    for l, r in pairs:
+        while s.startswith(l) and s.count(l) > s.count(r):
+            s = s[len(l):].strip()
+        while s.endswith(r) and s.count(r) > s.count(l):
+            s = s[:-len(r)].strip()
 
     return s
 
@@ -9651,17 +9654,20 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         labels = labels_by_no.get(no, [f"講演{no}", f"講演{str(no).translate(str.maketrans('1234567890', '１２３４５６７８９０'))}"])
 
         for b in ordered:
-            key = normalize_key(b.text or "")
-            for lb in labels:
-                lb_key = normalize_key(lb)
-                # 数字末尾ラベルは後続数字があると誤マッチする
-                # 例: "講演1" が "特別講演18:30" にヒットしないよう
-                if lb_key and lb_key[-1].isdigit():
-                    if re.search(re.escape(lb_key) + r'(?!\d)', key):
-                        return b
-                else:
-                    if lb_key in key:
-                        return b
+            # 改行で分割してから各行を検索（時間が連結されて誤マッチを防ぐ）
+            lines = (b.text or "").split("\n")
+            for line in lines:
+                key = normalize_key(line)
+                for lb in labels:
+                    lb_key = normalize_key(lb)
+                    # 数字末尾ラベルは後続数字があると誤マッチする
+                    # 例: "講演1" が "特別講演18:30" にヒットしないよう
+                    if lb_key and lb_key[-1].isdigit():
+                        if re.search(re.escape(lb_key) + r'(?!\d)', key):
+                            return b
+                    else:
+                        if lb_key in key:
+                            return b
         return None
 
     def _looks_like_title(s: str) -> bool:
@@ -9883,6 +9889,10 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
             if "先生" in s:
                 return False
 
+            # 時間文字列は除外
+            if is_time_line(s):
+                return False
+
             # ★追加：短すぎる or 記号だけは除外
             if len(s) < 8:
                 return False
@@ -9922,16 +9932,24 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
 
                 title_lines.append(s)
 
-                if i + 1 < len(around):
-                    nxt = _clean_title_piece(around[i + 1].text)
+                # 後続ブロックを探索（講演ラベル・時間ブロックはスキップ）
+                for j in range(i + 1, min(i + 4, len(around))):
+                    raw_j = _norm(around[j].text)
+                    nxt = _clean_title_piece(around[j].text)
+
+                    # 名前・所属・演者ラベルに到達したら終了
+                    if _is_name_line(raw_j) or looks_like_affil_line(raw_j):
+                        break
+                    if "演者" in normalize_key(raw_j):
+                        break
+
+                    # 講演ラベル・時間ブロックはスキップして先を見る
+                    if any(x in raw_j for x in ["講演", "講 演"]) or is_time_line(raw_j):
+                        continue
+
                     if _looks_like_title_piece(nxt):
-                        # ★ここ追加
-                        if (
-                            s.startswith(("「", "『")) or
-                            nxt.endswith(("」", "』")) or
-                            nxt.startswith(("―", "-", "～", "〜"))
-                        ):
-                            title_lines.append(nxt)
+                        title_lines.append(nxt)
+                    break
 
                 break
 
@@ -9944,9 +9962,8 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
                 out.append(x)
                 seen.add(x)
 
-        title = "\n".join(out)
-        title = strip_outer_quotes_loose(title)
-        out = [strip_outer_quotes_loose(normalize_space(x)) for x in title.split("\n") if normalize_space(x)]
+        # 各行ごとに外側引用符を除去（改行を潰さない）
+        out = [strip_outer_quotes_loose(x) for x in out if x]
 
         return out[:4]
 
@@ -10038,9 +10055,17 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         title_lines = clean_title_lines2(title_lines)
         # title_lines = normalize_title_lines(title_lines)
 
-        if title_lines and not has_meaningful_title(t):
-            t.title_lines = title_lines
-            t.title = "\n".join(title_lines)
+        if title_lines:
+            if not has_meaningful_title(t):
+                t.title_lines = title_lines
+                t.title = "\n".join(title_lines)
+            else:
+                # ブロック抽出タイトルが既存タイトルを包含する場合は拡張適用
+                existing_key = (getattr(t, "title", "") or "").replace("\n", "").replace(" ", "").replace("\u3000", "")
+                extracted_key = "\n".join(title_lines).replace("\n", "").replace(" ", "").replace("\u3000", "")
+                if existing_key and existing_key in extracted_key and len(extracted_key) > len(existing_key):
+                    t.title_lines = title_lines
+                    t.title = "\n".join(title_lines)
 
         # speaker / affiliation
         speaker, affiliation = _extract_person_near_enja(seg,chair_name=getattr(payload.chair, "name", "") or "",chair_aff=getattr(payload.chair, "affiliation", "") or "",)
