@@ -3902,6 +3902,13 @@ def init_db():
             """).fetchone()
             if not row:
                 con.execute("ALTER TABLE correct_answers ADD COLUMN embedding DOUBLE PRECISION[];")
+            # layout_hints カラムが無ければ追加（レイアウトパターン学習用）
+            row = con.execute("""
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'correct_answers' AND column_name = 'layout_hints'
+            """).fetchone()
+            if not row:
+                con.execute("ALTER TABLE correct_answers ADD COLUMN layout_hints JSONB DEFAULT '{}';")
             con.commit()
             logger.info("Database tables initialized successfully")
         finally:
@@ -4834,6 +4841,156 @@ def is_valid_person_name(name: str) -> bool:
         
     return True
 
+
+def enrich_speaker_map_with_vm(
+    speaker_map: Dict[str, str],
+    blocks: List[TextBlock],
+    vm_rows: List[dict],
+) -> Dict[str, str]:
+    """
+    VMの医師名をblocksから直接検索し、speaker_mapに追加・補強する。
+    - VMに載っている演者名がblocks内に存在すれば speaker_map に追加
+    - blocks内の位置情報から所属(affiliation)も上下近傍ブロックを探索して取得
+    - 既存の speaker_map エントリが所属空の場合も補完する
+    """
+    if not vm_rows or not blocks:
+        return speaker_map
+
+    ordered = sorted(blocks, key=lambda b: (b.top, b.left))
+
+    # VM から演者名リストを抽出（役職=="演者" のみ）
+    vm_speakers: List[dict] = []
+    for r in vm_rows:
+        name_raw = (r.get("案内状掲載 医師名") or "").strip()
+        if not name_raw:
+            continue
+        name_norm = _norm_person_name(name_raw)
+        if not name_norm or len(name_norm) < 2:
+            continue
+        vm_speakers.append({
+            "name_norm": name_norm,
+            "name_raw": name_raw,
+            "facility": (r.get("案内状掲載 施設名") or "").strip(),
+            "dept": (r.get("案内状掲載 所属科") or "").strip(),
+            "role_title": (r.get("案内状掲載 役職") or "").strip(),
+            "is_speaker": (r.get("役職") or "") == "演者",
+        })
+
+    if not vm_speakers:
+        return speaker_map
+
+    def _find_name_in_blocks(name_norm: str) -> Optional[TextBlock]:
+        """blocks内にVM名がテキストとして存在するか検索"""
+        for b in ordered:
+            txt_ns = b.text.replace(" ", "").replace("\u3000", "").replace("先生", "")
+            if name_norm in txt_ns:
+                return b
+        return None
+
+    def _extract_affil_near_block(anchor: TextBlock, facility_hint: str = "") -> str:
+        """anchor(名前ブロック)の近傍から所属情報を抽出"""
+        # 上方向を優先的に探索（医療セミナーでは name の上に affiliation が多い）
+        cands_above: List[tuple] = []
+        cands_below: List[tuple] = []
+
+        for b in ordered:
+            if b is anchor:
+                continue
+            txt = normalize_space(b.text.replace("\n", " "))
+            if not txt or len(txt) < 3:
+                continue
+
+            # 人名単体は除外
+            if txt.endswith("先生") and len(txt) <= 16:
+                continue
+            # ラベル行は除外
+            txt_key = normalize_key(txt)
+            if txt_key in {"演者", "座長", "講演1", "講演2", "講演3", "講演4"}:
+                continue
+            if any(kw in txt_key for kw in ["座長", "演者", "主催", "共催", "日時", "会場", "形式", "視聴", "登録"]):
+                continue
+
+            # 所属っぽいか確認
+            is_aff = any(k in txt for k in [
+                "大学", "病院", "クリニック", "センター", "内科", "外科",
+                "部", "科", "教授", "准教授", "講師", "助教", "医長",
+                "部長", "院長", "研究", "機構", "医院", "診療",
+            ])
+            if not is_aff:
+                continue
+
+            # 横方向の距離制限
+            dx = abs((b.left + b.width / 2) - (anchor.left + anchor.width / 2))
+            if dx > 5000000:
+                continue
+
+            dy = anchor.top - b.top  # 正 = bがanchorの上
+            dist_y = abs(dy)
+            if dist_y > 2000000:
+                continue
+
+            # facility_hint があれば優先度を上げる
+            boost = 0
+            if facility_hint:
+                fac_ns = facility_hint.replace(" ", "").replace("\u3000", "")
+                txt_ns = txt.replace(" ", "").replace("\u3000", "")
+                if fac_ns in txt_ns:
+                    boost = -10000000  # 最優先
+
+            if dy > 0:
+                # bはanchorの上
+                cands_above.append((dist_y + boost, txt))
+            else:
+                # bはanchorの下
+                cands_below.append((dist_y + boost, txt))
+
+        # 上方向を優先（ただし近いものが一番）
+        cands_above.sort(key=lambda x: x[0])
+        cands_below.sort(key=lambda x: x[0])
+
+        # 上にあるaffが1200000以内なら優先
+        if cands_above and cands_above[0][0] < 1200000:
+            return cands_above[0][1]
+        # 下にあるaff
+        if cands_below and cands_below[0][0] < 1200000:
+            return cands_below[0][1]
+        # どちらかあれば返す
+        if cands_above:
+            return cands_above[0][1]
+        if cands_below:
+            return cands_below[0][1]
+        return ""
+
+    added = 0
+    enriched = 0
+    for vs in vm_speakers:
+        name_norm = vs["name_norm"]
+        name_block = _find_name_in_blocks(name_norm)
+        if not name_block:
+            continue
+
+        existing_aff = speaker_map.get(name_norm, "")
+
+        if name_norm not in speaker_map:
+            # speaker_map に無い → 新規追加
+            aff = _extract_affil_near_block(name_block, vs["facility"])
+            speaker_map[name_norm] = normalize_space(aff) if aff else ""
+            added += 1
+            print(f"[VM→speaker_map] 追加: {name_norm} aff='{speaker_map[name_norm][:40]}'")
+        elif not existing_aff:
+            # speaker_map にあるがaff空 → 補完
+            aff = _extract_affil_near_block(name_block, vs["facility"])
+            if aff:
+                speaker_map[name_norm] = normalize_space(aff)
+                enriched += 1
+                print(f"[VM→speaker_map] 補完: {name_norm} aff='{speaker_map[name_norm][:40]}'")
+
+    if added or enriched:
+        print(f"[VM→speaker_map] 合計: 追加={added}, 補完={enriched}")
+
+    return speaker_map
+
+
 def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, str]:
     mp: Dict[str, str] = {}
 
@@ -4923,11 +5080,41 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
             mp[key] = below[0][1]
             continue
 
-        # ★次に「右+下」広め（2カラム/右寄せ対策）
+        # ★ レイアウトパターンキャッシュから「上方向」を検索（学習済みパターンが上を示す場合）
+        lp_cache = _get_layout_pattern_cache()
+        lp_affil = lp_cache.get("affil_rel_to_speaker_y", {})
+        if lp_affil.get("above_ratio", 0) > 0.3 and lp_affil.get("count", 0) >= 3:
+            above = []
+            x0a = nb.left - 400000
+            x1a = nb.left + nb.width + 400000
+            y0a = nb.top - 1200000
+            y1a = nb.top + 100000
+            for b in ordered:
+                if b is nb:
+                    continue
+                if not in_region(b, x0a, y0a, x1a, y1a):
+                    continue
+                s = normalize_space(b.text.replace("\n", " "))
+                if looks_like_affil(s):
+                    clean_s = normalize_affiliation(s)
+                    clean_s = _remove_person_names_from_affiliation(clean_s, key)
+                    dy = abs(b.top - nb.top)
+                    # 学習済みmedianに近いほどスコア優遇
+                    median_y = lp_affil.get("median", -300000)
+                    rel_y = b.top - nb.top
+                    dist_from_median = abs(rel_y - median_y)
+                    above.append((dist_from_median, clean_s))
+            above.sort(key=lambda x: x[0])
+            if above:
+                mp[key] = above[0][1]
+                continue
+
+        # ★次に「右+下」広め（2カラム/右寄せ対策）— レイアウトパターンで上方向も含める
         cand = []
         x0 = nb.left - 200000
         x1 = nb.left + 6500000
-        y0 = nb.top - 200000
+        lp_above_ratio = lp_affil.get("above_ratio", 0) if lp_affil else 0
+        y0 = nb.top - (1200000 if lp_above_ratio > 0.3 else 200000)
         y1 = nb.top + 1800000
 
         for b in ordered:
@@ -4950,9 +5137,17 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
             ny = nb.top + nb.height / 2.0
 
             # ★「下方向」を強く優遇（所属は下に来ることが多い）
+            # レイアウトパターンがある場合はmedianに近いブロックを優遇
             dy = max(0, cy - ny)
             dx = abs(cx - nx)
             dist = dx + dy * 0.6  # 下を優遇
+            if lp_affil.get("count", 0) >= 3:
+                rel_y = b.top - nb.top
+                median_y = lp_affil.get("median", 0)
+                # medianに近いほどボーナス（最大50%減）
+                max_range = abs(lp_affil.get("q75", 0) - lp_affil.get("q25", 0)) or 1000000
+                closeness = 1.0 - min(abs(rel_y - median_y) / max_range, 1.0)
+                dist *= (1.0 - closeness * 0.5)
 
             cand.append((dist, clean_s))
 
@@ -6680,6 +6875,208 @@ def _extract_keywords(text: str) -> set[str]:
     return tokens
 
 
+# ---------- レイアウトパターン学習 ----------
+
+def _compute_layout_hints(blocks_json: list, correct_json: dict) -> dict:
+    """正解JSONの各フィールドがblocks内のどの位置にあるかを逆引きし、
+    アンカーからの相対位置を記録する。
+    blocks_json: [{"text":..., "top":..., "left":..., ...}, ...]
+    """
+    if not blocks_json or not correct_json:
+        return {}
+
+    def _find_block(text_query: str) -> dict | None:
+        """テキストを含むブロックを検索（スペース除去で比較）"""
+        if not text_query:
+            return None
+        q = text_query.replace(" ", "").replace("\u3000", "").replace("先生", "")
+        if len(q) < 2:
+            return None
+        for b in blocks_json:
+            bt = (b.get("text", "") if isinstance(b, dict) else "").replace(" ", "").replace("\u3000", "").replace("先生", "")
+            if q in bt:
+                return b
+        return None
+
+    def _find_anchor(label: str) -> dict | None:
+        """座長/演者/講演/PROGRAM等のラベルブロックを検索"""
+        lbl = label.replace(" ", "")
+        for b in blocks_json:
+            bt = (b.get("text", "") if isinstance(b, dict) else "").replace(" ", "").replace("\u3000", "")
+            if lbl in bt:
+                return b
+        return None
+
+    hints: dict = {"talks": []}
+
+    # PROGRAM アンカー
+    prog_block = _find_anchor("PROGRAM") or _find_anchor("プログラム")
+    if prog_block:
+        hints["program_top"] = prog_block.get("top", 0)
+
+    # 座長
+    chair = correct_json.get("chair") or {}
+    chair_name = (chair.get("name") or "").replace(" ", "").replace("\u3000", "")
+    chair_anchor = _find_anchor("座長")
+    if chair_name and chair_anchor:
+        name_block = _find_block(chair_name)
+        affil_block = _find_block(chair.get("affiliation") or "")
+        anchor_top = chair_anchor.get("top", 0)
+        ch_hint: dict = {"anchor_top": anchor_top}
+        if name_block:
+            ch_hint["name_top"] = name_block.get("top", 0)
+            ch_hint["name_rel_y"] = name_block.get("top", 0) - anchor_top
+        if affil_block:
+            ch_hint["affil_top"] = affil_block.get("top", 0)
+            ch_hint["affil_rel_y"] = affil_block.get("top", 0) - anchor_top
+        if name_block and affil_block:
+            ch_hint["affil_rel_to_name_y"] = affil_block.get("top", 0) - name_block.get("top", 0)
+        hints["chair"] = ch_hint
+
+    # 講演（talks）
+    talks = correct_json.get("talks") or []
+    for idx, t in enumerate(talks):
+        speaker = (t.get("speaker") or "").replace(" ", "").replace("\u3000", "")
+        affiliation = t.get("affiliation") or ""
+        if not speaker:
+            continue
+
+        speaker_block = _find_block(speaker)
+        if not speaker_block:
+            continue
+
+        sp_top = speaker_block.get("top", 0)
+        t_hint: dict = {"speaker_top": sp_top, "talk_index": idx}
+
+        # 演者ラベルを付近で検索
+        enja_anchor = None
+        for b in blocks_json:
+            bt = (b.get("text", "") if isinstance(b, dict) else "").replace(" ", "").replace("\u3000", "")
+            b_top = b.get("top", 0) if isinstance(b, dict) else 0
+            if "演者" in bt and abs(b_top - sp_top) < 1500000:
+                enja_anchor = b
+                break
+
+        if enja_anchor:
+            t_hint["enja_anchor_top"] = enja_anchor.get("top", 0)
+            t_hint["speaker_rel_to_enja_y"] = sp_top - enja_anchor.get("top", 0)
+
+        # 所属ブロック
+        if affiliation:
+            affil_block = _find_block(affiliation)
+            if affil_block:
+                aff_top = affil_block.get("top", 0)
+                t_hint["affil_top"] = aff_top
+                t_hint["affil_rel_to_speaker_y"] = aff_top - sp_top
+
+        # タイトルブロック
+        title_lines = t.get("title_lines") or []
+        title_text = title_lines[0] if title_lines else (t.get("title") or "")
+        if title_text:
+            title_block = _find_block(title_text)
+            if title_block:
+                t_hint["title_top"] = title_block.get("top", 0)
+                t_hint["title_rel_to_speaker_y"] = title_block.get("top", 0) - sp_top
+
+        hints["talks"].append(t_hint)
+
+    if not hints.get("talks") and not hints.get("chair"):
+        return {}
+
+    return hints
+
+
+# ---------- レイアウトパターンキャッシュ ----------
+
+_layout_pattern_cache: dict | None = None
+_layout_pattern_cache_loaded = False
+
+def _build_layout_pattern_cache() -> dict:
+    """正解DBに蓄積されたlayout_hintsを集計し、位置パターンの統計を返す。
+    Returns:
+        {
+            "affil_rel_to_speaker_y": {"median": -300000, "q25": -500000, "q75": -100000, "count": 50},
+            "affil_rel_to_name_y_chair": {"median": -200000, ...},
+            "speaker_rel_to_enja_y": {"median": 400000, ...},
+            "title_rel_to_speaker_y": {"median": -800000, ...},
+        }
+    """
+    affil_rels: list[int] = []
+    chair_affil_rels: list[int] = []
+    speaker_enja_rels: list[int] = []
+    title_rels: list[int] = []
+
+    try:
+        with db_connect() as con:
+            rows = con.execute(
+                "SELECT layout_hints FROM correct_answers WHERE layout_hints IS NOT NULL AND layout_hints != '{}'"
+            ).fetchall()
+        for r in rows:
+            hints = r["layout_hints"] if isinstance(r["layout_hints"], dict) else {}
+            if not hints:
+                continue
+            # chair
+            ch = hints.get("chair") or {}
+            if "affil_rel_to_name_y" in ch:
+                chair_affil_rels.append(ch["affil_rel_to_name_y"])
+            # talks
+            for th in (hints.get("talks") or []):
+                if "affil_rel_to_speaker_y" in th:
+                    affil_rels.append(th["affil_rel_to_speaker_y"])
+                if "speaker_rel_to_enja_y" in th:
+                    speaker_enja_rels.append(th["speaker_rel_to_enja_y"])
+                if "title_rel_to_speaker_y" in th:
+                    title_rels.append(th["title_rel_to_speaker_y"])
+    except Exception as e:
+        print(f"[layout-pattern-cache] error: {e}")
+
+    def _stats(vals: list[int]) -> dict:
+        if len(vals) < 3:
+            return {}
+        vals_sorted = sorted(vals)
+        n = len(vals_sorted)
+        return {
+            "median": vals_sorted[n // 2],
+            "q25": vals_sorted[n // 4],
+            "q75": vals_sorted[3 * n // 4],
+            "count": n,
+            "above_ratio": sum(1 for v in vals if v < 0) / n,
+        }
+
+    cache = {}
+    s = _stats(affil_rels)
+    if s:
+        cache["affil_rel_to_speaker_y"] = s
+    s = _stats(chair_affil_rels)
+    if s:
+        cache["affil_rel_to_name_y_chair"] = s
+    s = _stats(speaker_enja_rels)
+    if s:
+        cache["speaker_rel_to_enja_y"] = s
+    s = _stats(title_rels)
+    if s:
+        cache["title_rel_to_speaker_y"] = s
+
+    if cache:
+        print(f"[layout-pattern-cache] loaded {sum(v.get('count',0) for v in cache.values())} samples across {len(cache)} patterns")
+        for k, v in cache.items():
+            print(f"  {k}: median={v.get('median',0)}, above_ratio={v.get('above_ratio',0):.0%}, n={v.get('count',0)}")
+    return cache
+
+
+def _get_layout_pattern_cache() -> dict:
+    global _layout_pattern_cache, _layout_pattern_cache_loaded
+    if not _layout_pattern_cache_loaded:
+        _layout_pattern_cache = _build_layout_pattern_cache()
+        _layout_pattern_cache_loaded = True
+    return _layout_pattern_cache or {}
+
+
+def invalidate_layout_pattern_cache():
+    global _layout_pattern_cache_loaded
+    _layout_pattern_cache_loaded = False
+
+
 def _compute_similarity(kw_a: set[str], kw_b: set[str]) -> float:
     """Jaccard係数で類似度を計算"""
     if not kw_a or not kw_b:
@@ -6694,6 +7091,7 @@ def save_correct_answer(
     correct_json: dict,
     event_title: str = "",
     job_id: str = "",
+    blocks_json: list | None = None,
 ) -> None:
     """確定済みの正解データをPostgresに保存する（embedding付き）"""
     _INVALID_NAMES = {"PROGRAM", "P R O G R A M", "AGENDA", "SCHEDULE", "TIME TABLE", "タイムテーブル", "プログラム"}
@@ -6729,25 +7127,28 @@ def save_correct_answer(
     keywords = list(_extract_keywords(blocks_text + " " + event_title))
     truncated_text = blocks_text[:2000]
     embedding = _compute_embedding(blocks_text + " " + event_title)
-    print(f"[correct-answer] saving job_id={job_id} event_title='{event_title[:60]}' blocks_text={len(blocks_text)} chars, embedding={'yes' if embedding else 'no'}")
+    layout_hints = _compute_layout_hints(blocks_json or [], correct_json) if blocks_json else {}
+    print(f"[correct-answer] saving job_id={job_id} event_title='{event_title[:60]}' blocks_text={len(blocks_text)} chars, embedding={'yes' if embedding else 'no'}, layout_hints={len(layout_hints)} keys")
 
     try:
         with db_connect() as con:
             con.execute(
                 """
-                INSERT INTO correct_answers (job_id, event_title, blocks_text, keywords, correct_json, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO correct_answers (job_id, event_title, blocks_text, keywords, correct_json, embedding, layout_hints)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (job_id) DO UPDATE SET
                     event_title = EXCLUDED.event_title,
                     blocks_text = EXCLUDED.blocks_text,
                     keywords = EXCLUDED.keywords,
                     correct_json = EXCLUDED.correct_json,
                     embedding = EXCLUDED.embedding,
+                    layout_hints = EXCLUDED.layout_hints,
                     created_at = NOW()
                 """,
                 (job_id, event_title, truncated_text, keywords,
                  json.dumps(correct_json, ensure_ascii=False),
-                 embedding),
+                 embedding,
+                 json.dumps(layout_hints, ensure_ascii=False)),
             )
             # 500件を超えたら古い順に削除
             con.execute(
@@ -6767,6 +7168,7 @@ def save_correct_answer(
     invalidate_speaker_display_cache()
     invalidate_affiliation_format_cache()
     invalidate_text_role_cache()
+    invalidate_layout_pattern_cache()
 
 
 def find_similar_correct_answers(
@@ -6888,6 +7290,24 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
         correct = best.get("correct_json") or {}
         print(f"[correct-answer-overlay] sim={sim:.2f} job_id={best.get('job_id','')}")
 
+        def _pick_better_affiliation_simple(cur: str, ct: str) -> str:
+            """現在値と正解DB値を比較し、より詳細な方を返す"""
+            if not cur:
+                return ct
+            if not ct:
+                return cur
+            cur_ns = cur.replace(" ", "").replace("\u3000", "")
+            ct_ns = ct.replace(" ", "").replace("\u3000", "")
+            if cur_ns == ct_ns:
+                return ct
+            if cur_ns.startswith(ct_ns) or ct_ns in cur_ns:
+                print(f"[correct-answer-overlay] keep current affiliation (superset): '{cur[:50]}'")
+                return cur
+            if ct_ns.startswith(cur_ns) or cur_ns in ct_ns:
+                print(f"[correct-answer-overlay] use DB affiliation (superset): '{ct[:50]}'")
+                return ct
+            return ct
+
         # event_title 完全一致なら同一イベントの確度が非常に高い → talks 閾値を緩和
         correct_title = normalize_key(correct.get("event_title", ""))
         current_title = normalize_key(payload.event_title or "")
@@ -6920,7 +7340,10 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
                 # 明らかに不正な所属値は除外
                 _bad_aff = {"P R O G R A M", "PROGRAM", "AGENDA"}
                 if cc["affiliation"].upper().strip() not in _bad_aff:
-                    payload.chair.affiliation = cc["affiliation"]
+                    payload.chair.affiliation = _pick_better_affiliation_simple(
+                        getattr(payload.chair, "affiliation", "") or "",
+                        cc["affiliation"],
+                    )
 
         # ---- event_title ---- (sim >= 0.85: 同一/ほぼ同一イベントの可能性が高い)
         if sim >= 0.85:
@@ -6970,12 +7393,43 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
                         return False
                     return k1 == k2
 
+                def _pick_better_affiliation(cur: str, ct: str) -> str:
+                    """現在値と正解DB値を比較し、より詳細・正確な方を返す。
+                    判定基準:
+                      1. 片方が空 → 非空の方
+                      2. 正規化後に同一 → 正解DB値（フォーマットが正確）
+                      3. 一方が他方を包含 → 長い方（より詳細）
+                      4. どちらも包含しない → 正解DB値（学習済み正解を優先）
+                    """
+                    if not cur:
+                        return ct
+                    if not ct:
+                        return cur
+                    cur_ns = cur.replace(" ", "").replace("\u3000", "")
+                    ct_ns = ct.replace(" ", "").replace("\u3000", "")
+                    if cur_ns == ct_ns:
+                        # 内容同一 → 正解DB値を採用（ユーザー確定済みフォーマット）
+                        return ct
+                    if cur_ns.startswith(ct_ns) or ct_ns in cur_ns:
+                        # 現在値がDB値を包含 → 現在値を維持（より詳細）
+                        print(f"[correct-answer-overlay] keep current affiliation (superset): '{cur[:50]}'")
+                        return cur
+                    if ct_ns.startswith(cur_ns) or cur_ns in ct_ns:
+                        # DB値が現在値を包含 → DB値で上書き（より詳細）
+                        print(f"[correct-answer-overlay] use DB affiliation (superset): '{ct[:50]}'")
+                        return ct
+                    # 包含関係なし → 正解DB値を優先（学習済み正解）
+                    return ct
+
                 def _apply_talk_overlay(ct, t):
                     """1 talk分のoverlayを適用"""
                     if ct.get("speaker"):
                         t.speaker = ct["speaker"]
                     if ct.get("affiliation"):
-                        t.affiliation = ct["affiliation"]
+                        t.affiliation = _pick_better_affiliation(
+                            getattr(t, "affiliation", "") or "",
+                            ct["affiliation"] or "",
+                        )
                     # title: 内容が同じ場合のみ改行位置を復元（演題変更時は上書きしない）
                     ct_title = "\n".join(ct.get("title_lines", [])) or ct.get("title", "")
                     cur_title = getattr(t, "title", "") or ""
@@ -8773,7 +9227,7 @@ def repair_chair_from_multiline_block(payload: DesignJSON, blocks: list[TextBloc
     return payload
 
 # ---------------- Parse (Rule + AI) ----------------
-def parse_blocks_to_design_json(blocks: List[TextBlock]) -> DesignJSON:
+def parse_blocks_to_design_json(blocks: List[TextBlock], vm_rows: Optional[List[dict]] = None) -> DesignJSON:
     warnings: List[str] = []
     confidence = 0.78
 
@@ -8788,6 +9242,9 @@ def parse_blocks_to_design_json(blocks: List[TextBlock]) -> DesignJSON:
     org = extract_organizer_from_blocks(blocks)  # ←主催: を含めたいなら別途調整（必要なら次で直す）
 
     speaker_map = extract_speaker_affil_map_by_blocks(blocks)
+    # VMデータがあれば、VMの医師名をblocks内で検索してspeaker_mapを強化
+    if vm_rows:
+        speaker_map = enrich_speaker_map_with_vm(speaker_map, blocks, vm_rows)
     chair = extract_chair_by_blocks(blocks, speaker_map)
 
     talks = extract_talks_by_blocks(blocks, speaker_map, chair)
@@ -10581,9 +11038,11 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
         debug_blocks_path.write_text(json.dumps(dbg, ensure_ascii=False, indent=2), encoding="utf-8")
 
     speaker_map = extract_speaker_affil_map_by_blocks(blocks)
+    # VM医師名でspeaker_mapを強化（ブロック位置ベースで所属も取得）
+    speaker_map = enrich_speaker_map_with_vm(speaker_map, blocks, vm_rows)
     time_candidates = extract_time_candidates_from_blocks(blocks)
 
-    draft = parse_blocks_to_design_json(blocks)
+    draft = parse_blocks_to_design_json(blocks, vm_rows=vm_rows)
     print("draft", draft)
 
     refined = await ai_refine_json(blocks, draft, speaker_map, time_candidates, vm_rows)
@@ -11780,15 +12239,17 @@ async def render(req: RenderReq):
         try:
             # blocksをストレージから取得
             blocks_text = ""
+            _blocks_json_for_save = []
             sp = storage_paths(req.jobId)
             blocks_url = _authenticated_storage_url(sp['debug_blocks'])
             headers_s = _storage_auth_headers()
             resp = requests.get(blocks_url, headers=headers_s, timeout=30)
             if resp.status_code == 200:
                 blocks_data = resp.json()
+                _blocks_json_for_save = blocks_data if isinstance(blocks_data, list) else []
                 blocks_text = " ".join(
                     (b.get("text", "") if isinstance(b, dict) else "")
-                    for b in (blocks_data if isinstance(blocks_data, list) else [])
+                    for b in _blocks_json_for_save
                 )
             else:
                 print(f"[correct-answer] blocks fetch failed: {resp.status_code} for {req.jobId}")
@@ -11828,6 +12289,7 @@ async def render(req: RenderReq):
                 correct_json=payload_dict,
                 event_title=full_event_title,
                 job_id=req.jobId,
+                blocks_json=_blocks_json_for_save or None,
             )
             print(f"[correct-answer] saved for {req.jobId} (blocks_text={len(blocks_text)} chars)")
         except Exception as e:
@@ -12783,6 +13245,7 @@ async def register_correct_answer(req: CorrectAnswerReq):
 
     # blocksをストレージから取得
     blocks_text = ""
+    _blocks_json_for_save = []
     try:
         sp = storage_paths(job_id)
         blocks_url = f"{SUPABASE_URL}/storage/v1/object/authenticated/{sp['debug_blocks']}"
@@ -12793,9 +13256,10 @@ async def register_correct_answer(req: CorrectAnswerReq):
         resp = requests.get(blocks_url, headers=headers, timeout=30)
         if resp.status_code == 200:
             blocks_data = resp.json()
+            _blocks_json_for_save = blocks_data if isinstance(blocks_data, list) else []
             blocks_text = " ".join(
                 (b.get("text", "") if isinstance(b, dict) else "")
-                for b in (blocks_data if isinstance(blocks_data, list) else [])
+                for b in _blocks_json_for_save
             )
     except Exception as e:
         print(f"[correct-answer] blocks fetch failed: {e}")
@@ -12807,6 +13271,7 @@ async def register_correct_answer(req: CorrectAnswerReq):
         correct_json=design,
         event_title=event_title,
         job_id=job_id,
+        blocks_json=_blocks_json_for_save or None,
     )
 
     answers = _load_correct_answers()
