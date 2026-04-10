@@ -6892,6 +6892,7 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
         correct_title = normalize_key(correct.get("event_title", ""))
         current_title = normalize_key(payload.event_title or "")
         title_exact_match = (correct_title and current_title and correct_title == current_title)
+        _should_apply_title = title_exact_match  # デフォルト: 完全一致時のみ True (0.85 判定で更新)
         if title_exact_match:
             print(f"[correct-answer-overlay] event_title exact match → talks threshold lowered")
 
@@ -6923,15 +6924,35 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
 
         # ---- event_title ---- (sim >= 0.85: 同一/ほぼ同一イベントの可能性が高い)
         if sim >= 0.85:
-            if correct.get("event_title_lines"):
-                payload.event_title_lines = correct["event_title_lines"]
-                payload.event_title = "\n".join(correct["event_title_lines"])
-            elif correct.get("event_title"):
-                payload.event_title = correct["event_title"]
+            # 正解タイトルが現在タイトルと大きく異なる場合は上書きしない
+            # （類似ブロックテキストだがイベント名が違う別イベントへの誤適用を防ぐ）
+            _correct_etl = correct.get("event_title_lines") or ([correct["event_title"]] if correct.get("event_title") else [])
+            _correct_et = normalize_key("".join(_correct_etl))
+            _should_apply_title = True
+            if _correct_et and current_title and not title_exact_match:
+                # Jaccard係数でタイトル単体の類似度をチェック
+                _ct_chars = set(_correct_et)
+                _cur_chars = set(current_title)
+                _title_jaccard = len(_ct_chars & _cur_chars) / max(len(_ct_chars | _cur_chars), 1)
+                # さらにblocks内に正解タイトルの主要部分が存在するか確認
+                _blocks_text_ns = all_blocks_text.replace(" ", "").replace("\u3000", "")
+                _correct_et_ns = _correct_et.replace(" ", "").replace("\u3000", "")
+                _title_in_blocks = _correct_et_ns and _correct_et_ns in _blocks_text_ns
+                if _title_jaccard < 0.5 and not _title_in_blocks:
+                    _should_apply_title = False
+                    print(f"[correct-answer-overlay] event_title mismatch: jaccard={_title_jaccard:.2f}, skip title overlay ('{current_title[:30]}' vs '{_correct_et[:30]}')")
+
+            if _should_apply_title:
+                if correct.get("event_title_lines"):
+                    payload.event_title_lines = correct["event_title_lines"]
+                    payload.event_title = "\n".join(correct["event_title_lines"])
+                elif correct.get("event_title"):
+                    payload.event_title = correct["event_title"]
 
         # ---- talks (高類似度 or event_title完全一致: 同一ドキュメントの可能性が高い) ----
+        # ただしタイトルが別イベントと判定された場合はtalksも適用しない
         talks_threshold = 0.80 if title_exact_match else 0.90
-        if sim >= talks_threshold:
+        if sim >= talks_threshold and _should_apply_title:
             ct_list = correct.get("talks") or []
             if ct_list and payload.talks:
                 def _sp_key(s):
