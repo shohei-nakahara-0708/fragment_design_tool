@@ -461,8 +461,6 @@ TYPESET_JS = r"""
     // 位置のみを返す（重複除去）
     const positions = [...new Set(out.map(item => typeof item === 'number' ? item : item.pos))];
     return positions.sort((a, b) => a - b);
-
-    return Array.from(new Set(out)).sort((a, b) => a - b);
   };
 
   const shouldIgnoreParenSubtitle = (s, idx) => {
@@ -977,9 +975,17 @@ TYPESET_JS = r"""
   // =========================================================
   const wrapEl = document.querySelector(".wrap");
   const wrapW = wrapEl ? wrapEl.clientWidth : 600;
-  // pill(74px) + gap(24px) = 98px → content area = wrapW - 98
-  const contentMax = wrapW - 98;
+  // .sheet の padding を考慮して実コンテンツ幅を算出
+  const sheetEl = document.querySelector(".sheet");
+  let sheetInnerW = wrapW;
+  if (sheetEl) {
+    const cs = getComputedStyle(sheetEl);
+    sheetInnerW = sheetEl.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  }
+  // pill(74px) + gap(24px) = 98px → content area
+  const contentMax = sheetInnerW - 98;
   const talkMax = contentMax;
+  console.log('[TYPESET] wrapW:', wrapW, 'sheetInnerW:', sheetInnerW, 'contentMax:', contentMax);
 
   // =========================================================
   // styles
@@ -1016,11 +1022,13 @@ TYPESET_JS = r"""
   const wrapAffiliation = (text, maxPx, style) => {
     const s = oneLine(text);
     if (!s) return "";
+    // 安全マージンを適用（カラム落ち防止）
+    const safeMaxPx = getSmartMaxWidth(maxPx, 'normal');
     const w = measure(s, style);
-    if (w <= maxPx) return s;
+    if (w <= safeMaxPx) return s;
 
     // 所属テキスト用の改行候補を生成
-    const lines = wrapPx(s, maxPx, style, 3, {
+    const lines = wrapPx(s, safeMaxPx, style, 3, {
       forceSubtitle2ndHead: false,
       preferBalancedAscii: false,
       avoidSingleWordLastLine: false,
@@ -11885,14 +11893,26 @@ async def upload_simple_stream(
                 p = job_paths(job_id)
 
                 try:
+                    import time as _time_mod
+                    _t0 = _time_mod.monotonic()
+
                     payload = await pptx_to_json_vm_hint(
                         in_path,
                         [],  # VM rows なし
                         debug_blocks_path=p.get("debug_blocks"),
                     )
+                    _t1 = _time_mod.monotonic()
+                    print(f"[TIMING][simple] pptx_to_json_vm_hint: {_t1 - _t0:.2f}s")
+
                     payload = normalize_for_render(payload)
                     payload = post_format_design_initial(payload)
+                    _t2 = _time_mod.monotonic()
+                    print(f"[TIMING][simple] normalize+post_format: {_t2 - _t1:.2f}s")
+
                     payload = await apply_precise_typeset_initial(payload)
+                    _t3 = _time_mod.monotonic()
+                    print(f"[TIMING][simple] apply_precise_typeset: {_t3 - _t2:.2f}s")
+
                     payload = ensure_display_fields(payload)
 
                     _blocks_for_overlay = []
@@ -11905,6 +11925,8 @@ async def upload_simple_stream(
                         pass
                     payload = apply_correct_answer_overlay(payload, _blocks_for_overlay)
                     dump_titles("after apply_correct_answer_overlay", payload)
+                    _t4 = _time_mod.monotonic()
+                    print(f"[TIMING][simple] overlay+display: {_t4 - _t3:.2f}s")
 
                     payload.region = region
                     payload.unit = unit
@@ -11925,6 +11947,8 @@ async def upload_simple_stream(
                     )
 
                     jpg_bytes, debug_html = await render_png_bytes(payload)
+                    _t5 = _time_mod.monotonic()
+                    print(f"[TIMING][simple] render_png_bytes: {_t5 - _t4:.2f}s")
 
                     # ローカルにJSON・JPGを保存（一覧/編集画面の高速化）
                     try:
@@ -11937,6 +11961,9 @@ async def upload_simple_stream(
                         p["debug_blocks"].unlink(missing_ok=True)
 
                     upsert_job_ok(job_id, filename, payload, session_id, "")
+                    _t6 = _time_mod.monotonic()
+                    print(f"[TIMING][simple] local_save+upsert: {_t6 - _t5:.2f}s")
+                    print(f"[TIMING][simple] TOTAL: {_t6 - _t0:.2f}s")
 
                     # Storage アップロードはバックグラウンドで実行（ローカル保存済みなので遅延OK）
                     asyncio.create_task(upload_all_assets_async(
