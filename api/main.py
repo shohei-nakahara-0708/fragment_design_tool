@@ -54,6 +54,7 @@ import requests
 
 import io
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 import logging
 
@@ -11634,6 +11635,50 @@ def upload_optional_assets(
             upsert=True,
         )
 
+
+# --- 非同期並列版 Storage アップロード ---
+_upload_executor = ThreadPoolExecutor(max_workers=4)
+
+async def upload_all_assets_async(
+    job_id: str,
+    payload_dict: dict,
+    jpg_bytes: bytes,
+    debug_html: Optional[str] = None,
+    debug_blocks_path: Optional[Path] = None,
+):
+    """必須＋任意アセットを並列で Storage にアップロード"""
+    sp = storage_paths(job_id)
+    loop = asyncio.get_event_loop()
+
+    def _upload_jpg():
+        upload_bytes_to_storage(jpg_bytes, sp["preview"], content_type="image/jpeg", upsert=True)
+
+    def _upload_json():
+        upload_json_to_storage(payload_dict, sp["json"], upsert=True)
+
+    tasks = [
+        loop.run_in_executor(_upload_executor, _upload_jpg),
+        loop.run_in_executor(_upload_executor, _upload_json),
+    ]
+
+    if debug_html:
+        _dh = debug_html
+
+        def _upload_html():
+            upload_text_to_storage(_dh, sp["debug_html"], content_type="text/html; charset=utf-8", upsert=True)
+
+        tasks.append(loop.run_in_executor(_upload_executor, _upload_html))
+
+    if debug_blocks_path and debug_blocks_path.exists():
+        _dbp = debug_blocks_path
+
+        def _upload_blocks():
+            upload_to_storage(_dbp, sp["debug_blocks"], upsert=True)
+
+        tasks.append(loop.run_in_executor(_upload_executor, _upload_blocks))
+
+    await asyncio.gather(*tasks)
+
 # ---------------- App ----------------
 app = FastAPI(title="PPTX → JSON → HTML → jpg (Keep Newlines + Split ~...~)")
 
@@ -11878,16 +11923,19 @@ async def upload_simple_stream(
 
                     jpg_bytes, debug_html = await render_png_bytes(payload)
 
-                    upload_required_assets(
+                    await upload_all_assets_async(
                         job_id,
                         payload_dict=payload_dict,
                         jpg_bytes=jpg_bytes,
-                    )
-                    upload_optional_assets(
-                        job_id,
                         debug_html=debug_html,
                         debug_blocks_path=p.get("debug_blocks"),
                     )
+
+                    # ローカルにもJSONを保存（編集画面の初回表示高速化）
+                    try:
+                        p["json"].write_text(json.dumps(payload_dict, ensure_ascii=False), encoding="utf-8")
+                    except Exception:
+                        pass
 
                     if p.get("debug_blocks") and p["debug_blocks"].exists():
                         p["debug_blocks"].unlink(missing_ok=True)
@@ -12102,19 +12150,19 @@ async def upload_batch_stream(
 
                     jpg_bytes, debug_html = await render_png_bytes(payload)
 
-                    # 必須アップロード
-                    upload_required_assets(
+                    await upload_all_assets_async(
                         job_id,
                         payload_dict=payload_dict,
                         jpg_bytes=jpg_bytes,
-                    )
-
-                    # 任意アップロード
-                    upload_optional_assets(
-                        job_id,
                         debug_html=debug_html,
                         debug_blocks_path=p.get("debug_blocks"),
                     )
+
+                    # ローカルにもJSONを保存（編集画面の初回表示高速化）
+                    try:
+                        p["json"].write_text(json.dumps(payload_dict, ensure_ascii=False), encoding="utf-8")
+                    except Exception:
+                        pass
 
                     # debug_blocks 一時ファイル削除
                     if p.get("debug_blocks") and p["debug_blocks"].exists():
@@ -12178,7 +12226,7 @@ async def upload_batch_stream(
 
 
 @app.post("/render")
-async def render(req: RenderReq):
+async def render(req: RenderReq, background_tasks: BackgroundTasks):
     with db_connect() as con:
         row = con.execute(
             "SELECT locked, filename, session_id, event_id FROM jobs WHERE job_id=%s",
@@ -12211,22 +12259,22 @@ async def render(req: RenderReq):
     jpg_bytes, debug_html = await render_png_bytes(payload)
 
     try:
-        # 必須アップロード
-        upload_required_assets(
+        await upload_all_assets_async(
             req.jobId,
             payload_dict=payload_dict,
             jpg_bytes=jpg_bytes,
-        )
-
-        # 任意アップロード
-        upload_optional_assets(
-            req.jobId,
             debug_html=debug_html,
         )
-
     except Exception as e:
         print("[storage upload error][/render]", req.jobId, e)
         raise HTTPException(500, f"storage upload failed: {e}")
+
+    # ローカルにもJSONを保存（次回の編集画面表示を高速化）
+    try:
+        rp = job_paths(req.jobId)
+        rp["json"].write_text(json.dumps(payload_dict, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
     upsert_job_ok(req.jobId, filename, payload, session_id, event_id)
 
@@ -12234,66 +12282,85 @@ async def render(req: RenderReq):
     preview_cache_key = f"{req.jobId}/preview.jpg"
     _signed_url_cache.pop(preview_cache_key, None)
 
-    # manual_override=True → 正解DBに自動登録
-    if True:
+    # manual_override=True → 正解DBに自動登録（バックグラウンドで実行）
+    _job_id_for_bg = req.jobId
+    _payload_for_bg = payload
+    _payload_dict_for_bg = payload_dict
+
+    def _save_correct_answer_bg():
         try:
-            # blocksをストレージから取得
+            # blocksをローカル → Storage の順で取得
             blocks_text = ""
             _blocks_json_for_save = []
-            sp = storage_paths(req.jobId)
-            blocks_url = _authenticated_storage_url(sp['debug_blocks'])
-            headers_s = _storage_auth_headers()
-            resp = requests.get(blocks_url, headers=headers_s, timeout=30)
-            if resp.status_code == 200:
-                blocks_data = resp.json()
-                _blocks_json_for_save = blocks_data if isinstance(blocks_data, list) else []
-                blocks_text = " ".join(
-                    (b.get("text", "") if isinstance(b, dict) else "")
-                    for b in _blocks_json_for_save
-                )
-            else:
-                print(f"[correct-answer] blocks fetch failed: {resp.status_code} for {req.jobId}")
+
+            # ローカルファイルを先に試す
+            _local_blocks = job_paths(_job_id_for_bg).get("debug_blocks")
+            if _local_blocks and _local_blocks.exists():
+                try:
+                    blocks_data = json.loads(_local_blocks.read_text(encoding="utf-8"))
+                    _blocks_json_for_save = blocks_data if isinstance(blocks_data, list) else []
+                    blocks_text = " ".join(
+                        (b.get("text", "") if isinstance(b, dict) else "")
+                        for b in _blocks_json_for_save
+                    )
+                except Exception:
+                    pass
 
             if not blocks_text.strip():
-                # blocks取得失敗時はpayloadからテキスト素材を合成（embeddingの精度を確保）
+                # ローカルになければ Storage fallback
+                sp = storage_paths(_job_id_for_bg)
+                blocks_url = _authenticated_storage_url(sp['debug_blocks'])
+                headers_s = _storage_auth_headers()
+                resp = requests.get(blocks_url, headers=headers_s, timeout=30)
+                if resp.status_code == 200:
+                    blocks_data = resp.json()
+                    _blocks_json_for_save = blocks_data if isinstance(blocks_data, list) else []
+                    blocks_text = " ".join(
+                        (b.get("text", "") if isinstance(b, dict) else "")
+                        for b in _blocks_json_for_save
+                    )
+                else:
+                    print(f"[correct-answer] blocks fetch failed: {resp.status_code} for {_job_id_for_bg}")
+
+            if not blocks_text.strip():
                 parts = []
-                # event_title_lines のサブタイトルも含める
-                etl = getattr(payload, "event_title_lines", None) or []
+                etl = getattr(_payload_for_bg, "event_title_lines", None) or []
                 if etl:
                     parts.extend(etl)
-                elif getattr(payload, "event_title", ""):
-                    parts.append(payload.event_title)
-                if getattr(payload, "organizer", ""):
-                    parts.append(payload.organizer)
-                if getattr(payload, "datetime", ""):
-                    parts.append(payload.datetime)
-                for t in (payload.talks or []):
+                elif getattr(_payload_for_bg, "event_title", ""):
+                    parts.append(_payload_for_bg.event_title)
+                if getattr(_payload_for_bg, "organizer", ""):
+                    parts.append(_payload_for_bg.organizer)
+                if getattr(_payload_for_bg, "datetime", ""):
+                    parts.append(_payload_for_bg.datetime)
+                for t in (_payload_for_bg.talks or []):
                     if getattr(t, "title", ""):
                         parts.append(t.title)
                     if getattr(t, "speaker", ""):
                         parts.append(t.speaker)
                     if getattr(t, "affiliation", ""):
                         parts.append(t.affiliation)
-                if getattr(payload, "chair", None):
-                    if getattr(payload.chair, "name", ""):
-                        parts.append(payload.chair.name)
+                if getattr(_payload_for_bg, "chair", None):
+                    if getattr(_payload_for_bg.chair, "name", ""):
+                        parts.append(_payload_for_bg.chair.name)
                 blocks_text = " ".join(parts)
                 print(f"[correct-answer] using payload fallback for blocks_text ({len(blocks_text)} chars)")
 
-            # event_title は event_title_lines 全行を含めてembeddingの精度を確保
-            etl = getattr(payload, "event_title_lines", None) or []
-            full_event_title = " ".join(etl) if etl else (getattr(payload, "event_title", "") or "")
+            etl = getattr(_payload_for_bg, "event_title_lines", None) or []
+            full_event_title = " ".join(etl) if etl else (getattr(_payload_for_bg, "event_title", "") or "")
 
             save_correct_answer(
                 blocks_text=blocks_text,
-                correct_json=payload_dict,
+                correct_json=_payload_dict_for_bg,
                 event_title=full_event_title,
-                job_id=req.jobId,
+                job_id=_job_id_for_bg,
                 blocks_json=_blocks_json_for_save or None,
             )
-            print(f"[correct-answer] saved for {req.jobId} (blocks_text={len(blocks_text)} chars)")
+            print(f"[correct-answer] saved for {_job_id_for_bg} (blocks_text={len(blocks_text)} chars)")
         except Exception as e:
-            print(f"[correct-answer][auto-register] {req.jobId}: {e}")
+            print(f"[correct-answer][auto-register] {_job_id_for_bg}: {e}")
+
+    background_tasks.add_task(_save_correct_answer_bg)
 
     return JSONResponse({
         "jobId": req.jobId,
@@ -12345,19 +12412,12 @@ async def restore_from_json_batch(files: list[UploadFile] = File(...)):
             jpg_bytes, debug_html = await render_png_bytes(payload)
 
             try:
-                # 必須
-                upload_required_assets(
+                await upload_all_assets_async(
                     job_id,
                     payload_dict=payload_dict,
                     jpg_bytes=jpg_bytes,
-                )
-
-                # 任意
-                upload_optional_assets(
-                    job_id,
                     debug_html=debug_html,
                 )
-
             except Exception as e:
                 print("[storage upload error][/jobs/restore/batch]", job_id, e)
                 raise HTTPException(500, f"storage upload failed: {e}")
@@ -12520,9 +12580,13 @@ async def get_job(job_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="job not found")
 
-    # 3) Storage fallback
+    # 3) Storage fallback → ダウンロード後ローカルにキャッシュ
     try:
         data = download_storage_json(f"{job_id}/latest.json")
+        try:
+            p["json"].write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass  # キャッシュ書き込み失敗は無視
         return JSONResponse({"jobId": job_id, "json": data})
     except HTTPException:
         raise
