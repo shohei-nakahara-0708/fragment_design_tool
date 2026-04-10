@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { Link, useParams, useNavigate } from "react-router-dom";
 
 /**
@@ -225,6 +225,29 @@ function Card({ title, right, children }) {
 }
 
 /** ---------- helpers ---------- **/
+function applyPathUpdate(obj, path, value) {
+  const next = Array.isArray(obj) ? [...obj] : { ...obj };
+  let curPrev = obj;
+  let curNext = next;
+
+  for (let i = 0; i < path.length - 1; i++) {
+    const k = path[i];
+    const prevChild = curPrev?.[k];
+
+    let nextChild;
+    if (Array.isArray(prevChild)) nextChild = [...prevChild];
+    else if (prevChild && typeof prevChild === "object") nextChild = { ...prevChild };
+    else nextChild = typeof path[i + 1] === "number" ? [] : {};
+
+    curNext[k] = nextChild;
+    curPrev = prevChild;
+    curNext = nextChild;
+  }
+
+  curNext[path[path.length - 1]] = value;
+  return next;
+}
+
 function ensureBaseDefaults(j) {
   const next = { ...(j || {}) };
 
@@ -628,17 +651,25 @@ export default function JobEditorPage() {
   const lastSentRef = useRef("");
   const inFlightRef = useRef(false);
   const pendingRef = useRef(false);
+  const isInitialLoadRef = useRef(true);
 
   useEffect(() => {
     fetch(`${API_BASE}/job/${jobId}`)
       .then((r) => r.json())
       .then((d) => {
         const j = ensureBaseDefaults(d.json || {});
+        // 初期ロード時は render を走らせない: lastSentRef を先にセットして
+        // デバウンスeffectsが「変更なし」と判断するようにする
+        lastSentRef.current = JSON.stringify(j);
         setJson(j);
+        // 既存のプレビュー画像を即座に表示
+        setPreviewSrc(`${API_BASE}/preview/${jobId}.jpg?t=${Date.now()}`);
+        // 次のtickでフラグ解除（初回のjson変更でrenderが走らないようにする）
+        requestAnimationFrame(() => { isInitialLoadRef.current = false; });
       });
   }, [jobId]);
 
-  const saveRender = async (payload, { validate = true } = {}) => {
+  const saveRender = useCallback(async (payload, { validate = true } = {}) => {
     if (!payload) return;
 
     const nextErrors = validateJob(payload);
@@ -688,7 +719,7 @@ export default function JobEditorPage() {
         });
       }
     }
-  };
+  }, [jobId]);
 
   async function downloadWithFilename(url, filename) {
     const r = await fetch(`${API_BASE}${url}`, { cache: "no-store" });
@@ -746,14 +777,23 @@ export default function JobEditorPage() {
     setErrors(validateJob(json));
   }, [json, submitTried]);
 
+  // jsonの最新値をrefに保持（デバウンスeffectがjsonに依存しないようにする）
+  const jsonRef = useRef(json);
+  jsonRef.current = json;
+
+  const saveRenderRef = useRef(saveRender);
+  saveRenderRef.current = saveRender;
+
   useEffect(() => {
     if (!json || !autoRender) return;
 
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
-      const s = JSON.stringify(json);
+      const cur = jsonRef.current;
+      if (!cur) return;
+      const s = JSON.stringify(cur);
       if (s !== lastSentRef.current) {
-        saveRender(json, { validate: false });
+        saveRenderRef.current(cur, { validate: false });
       }
     }, 500);
 
@@ -763,29 +803,34 @@ export default function JobEditorPage() {
   const updateAtPath = useCallback((path, value) => {
     setJson((prev) => {
       if (!prev) return prev;
+      return applyPathUpdate(prev, path, value);
+    });
+  }, []);
 
-      const next = Array.isArray(prev) ? [...prev] : { ...prev };
-      let curPrev = prev;
-      let curNext = next;
-
-      for (let i = 0; i < path.length - 1; i++) {
-        const k = path[i];
-        const prevChild = curPrev?.[k];
-
-        let nextChild;
-        if (Array.isArray(prevChild)) nextChild = [...prevChild];
-        else if (prevChild && typeof prevChild === "object") nextChild = { ...prevChild };
-        else nextChild = typeof path[i + 1] === "number" ? [] : {};
-
-        curNext[k] = nextChild;
-        curPrev = prevChild;
-        curNext = nextChild;
+  /** バッチ更新: 複数パスを1回のsetJsonで適用（日時フィールド等）
+   *  使用法: updateMultiple([path1, val1], [path2, val2], ...)
+   */
+  const updateMultiple = useCallback((...updates) => {
+    setJson((prev) => {
+      if (!prev) return prev;
+      let next = prev;
+      for (const [path, value] of updates) {
+        next = applyPathUpdate(next, path, value);
       }
-
-      curNext[path[path.length - 1]] = value;
       return next;
     });
   }, []);
+
+  const dt = useMemo(() => (json?.datetime_parts) || { year: "", month: "", day: "", dow: "", time: "" }, [json?.datetime_parts]);
+
+  const rebuildDatetime = useCallback((parts) => {
+    if (!parts.year || !parts.month || !parts.day) return "";
+    return `${parts.year}年${parts.month}月${parts.day}日（${parts.dow || ""}）${parts.time || ""}`;
+  }, []);
+
+  const hasJsonErrors = useMemo(() => Object.keys(errors).length > 0, [errors]);
+  const statusTone = hasJsonErrors ? "red" : busy ? "blue" : autoRender ? "green" : "gray";
+  const statusText = hasJsonErrors ? "必須項目未入力" : busy ? "Rendering..." : autoRender ? "Auto" : "Manual";
 
   if (!json) return (
     <div style={ui.page}>
@@ -860,17 +905,6 @@ export default function JobEditorPage() {
       </div>
     </div>
   );
-
-  const dt = json.datetime_parts || { year: "", month: "", day: "", dow: "", time: "" };
-
-  const rebuildDatetime = (parts) => {
-    if (!parts.year || !parts.month || !parts.day) return "";
-    return `${parts.year}年${parts.month}月${parts.day}日（${parts.dow || ""}）${parts.time || ""}`;
-  };
-
-  const hasJsonErrors = Object.keys(errors).length > 0;
-  const statusTone = hasJsonErrors ? "red" : busy ? "blue" : autoRender ? "green" : "gray";
-  const statusText = hasJsonErrors ? "必須項目未入力" : busy ? "Rendering..." : autoRender ? "Auto" : "Manual";
 
   return (
     <div style={ui.page}>
@@ -960,8 +994,8 @@ export default function JobEditorPage() {
               placeholder="2026"
               value={dt.year}
               onChange={(e) => {
-                updateAtPath(["datetime_parts", "year"], e.target.value);
-                updateAtPath(["datetime"], rebuildDatetime({ ...dt, year: e.target.value }));
+                const v = e.target.value;
+                updateMultiple([["datetime_parts", "year"], v], [["datetime"], rebuildDatetime({ ...dt, year: v })]);
               }}
             />
             <div style={ui.muted}>年</div>
@@ -972,8 +1006,8 @@ export default function JobEditorPage() {
               placeholder="3"
               value={dt.month}
               onChange={(e) => {
-                updateAtPath(["datetime_parts", "month"], e.target.value);
-                updateAtPath(["datetime"], rebuildDatetime({ ...dt, month: e.target.value }));
+                const v = e.target.value;
+                updateMultiple([["datetime_parts", "month"], v], [["datetime"], rebuildDatetime({ ...dt, month: v })]);
               }}
             />
             <div style={ui.muted}>月</div>
@@ -984,8 +1018,8 @@ export default function JobEditorPage() {
               placeholder="6"
               value={dt.day}
               onChange={(e) => {
-                updateAtPath(["datetime_parts", "day"], e.target.value);
-                updateAtPath(["datetime"], rebuildDatetime({ ...dt, day: e.target.value }));
+                const v = e.target.value;
+                updateMultiple([["datetime_parts", "day"], v], [["datetime"], rebuildDatetime({ ...dt, day: v })]);
               }}
             />
             <div style={ui.muted}>日</div>
@@ -998,8 +1032,8 @@ export default function JobEditorPage() {
               placeholder="水"
               value={dt.dow}
               onChange={(e) => {
-                updateAtPath(["datetime_parts", "dow"], e.target.value);
-                updateAtPath(["datetime"], rebuildDatetime({ ...dt, dow: e.target.value }));
+                const v = e.target.value;
+                updateMultiple([["datetime_parts", "dow"], v], [["datetime"], rebuildDatetime({ ...dt, dow: v })]);
               }}
             />
 
@@ -1013,8 +1047,8 @@ export default function JobEditorPage() {
               placeholder="19:00~20:20（改行もOK）"
               value={dt.time}
               onChange={(e) => {
-                updateAtPath(["datetime_parts", "time"], e.target.value);
-                updateAtPath(["datetime"], rebuildDatetime({ ...dt, time: e.target.value }));
+                const v = e.target.value;
+                updateMultiple([["datetime_parts", "time"], v], [["datetime"], rebuildDatetime({ ...dt, time: v })]);
               }}
             />
 
