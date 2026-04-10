@@ -1129,7 +1129,7 @@ export default function UploadPage() {
                     </div>
 
                     <div>
-                      <input
+                      <textarea
                         value={r.unit}
                         disabled={simpleUploading || r.status === "ok"}
                         onChange={(e) => setSimpleField(r.id, "unit", e.target.value)}

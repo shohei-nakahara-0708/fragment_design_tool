@@ -7472,6 +7472,32 @@ async def ai_refine_json(
 
     content = (data["choices"][0]["message"]["content"] or "").strip()
 
+    def _is_plausible_speaker_name(s: str) -> bool:
+        """文字列が日本人名として妥当かチェック"""
+        s = normalize_space(s or "").replace("先生", "").strip()
+        s_compact = s.replace(" ", "").replace("\u3000", "")
+        if not s_compact:
+            return False
+        # 長さチェック: 2〜8文字
+        if len(s_compact) < 2 or len(s_compact) > 8:
+            return False
+        # 漢字が中心か（ひらがな・カタカナ名も一応許容）
+        kanji_kana = sum(1 for c in s_compact if '\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or '\u3400' <= c <= '\u4dbf' or '\uf900' <= c <= '\ufaff')
+        if kanji_kana < len(s_compact) * 0.7:
+            return False
+        # 明らかに人名でないキーワード
+        bad_words = [
+            "大学", "病院", "センター", "クリニック", "医院", "研究", "科",
+            "教授", "講師", "部長", "医長", "セミナー", "講演", "株式会社",
+            "治療", "経験", "検討", "課題", "予防", "医療", "診療",
+            "主催", "共催", "座長", "演者", "手術", "管理", "使用",
+            "シンポジウム", "プログラム", "休憩", "質疑応答", "挨拶",
+            "開会", "閉会", "司会", "後援",
+        ]
+        if any(w in s_compact for w in bad_words):
+            return False
+        return True
+
     def _looks_bad_talk_seed_strong(t) -> bool:
         """強化された講演データ品質チェック"""
         title_lines = getattr(t, "title_lines", None) or []
@@ -7489,11 +7515,17 @@ async def ai_refine_json(
         if not speaker:
             return True
 
+        # speaker が人名として不正
+        if not _is_plausible_speaker_name(speaker):
+            return True
+
         # 医療セミナー特有の無効パターンをチェック
         bad_speakers = {
             "課題", "腎移植", "逐次薬物治療", "治療", "講演", "演者",
             "胆道", "肝内胆管癌治療", "肝外胆管癌治療", "休憩", "質疑応答",
-            "開会", "閉会", "挨拶", "司会", "座長", "コーヒーブレイク"
+            "開会", "閉会", "挨拶", "司会", "座長", "コーヒーブレイク",
+            "使用経験", "検討", "株式会社", "セミナー", "シンポジウム",
+            "プログラム", "主催", "共催", "後援",
         }
         if speaker in bad_speakers:
             return True
@@ -7845,11 +7877,26 @@ async def ai_refine_json(
             draft_name_ns = refined.chair.name.replace(" ", "").replace("\u3000", "")
             ai_name_ns = name.replace(" ", "").replace("\u3000", "")
             if draft_name_ns != ai_name_ns:
-                # AIが座長名を別人に変更しようとしている → 名前変更を拒否
-                # affiliationはブロックから後工程で補完される
-                print(f"[AI REFINE DEBUG] AI座長名変更を拒否: {refined.chair.name} → {name}")
-                # AIが座長と演者を逆転させた可能性が高い → talk側のspeaker/affiliationも保護
-                _ai_swapped_chair_speaker = True
+                # ドラフトのspeakerが全て不正なら、座長抽出自体が間違っている可能性が高い
+                # → AI変更を受け入れる
+                draft_speakers_all_bad = bool(refined.talks) and all(
+                    not _is_plausible_speaker_name(getattr(t, "speaker", "") or "")
+                    for t in refined.talks
+                )
+                if draft_speakers_all_bad:
+                    # ドラフトの座長抽出が誤り → AI結果を採用
+                    print(f"[AI REFINE DEBUG] ドラフト speaker 全不正 → AI座長名を採用: {refined.chair.name} → {name}")
+                    if role:
+                        refined.chair.role = normalize_chair_role(role)
+                    refined.chair.name = name
+                    if aff:
+                        refined.chair.affiliation = aff
+                else:
+                    # AIが座長名を別人に変更しようとしている → 名前変更を拒否
+                    # affiliationはブロックから後工程で補完される
+                    print(f"[AI REFINE DEBUG] AI座長名変更を拒否: {refined.chair.name} → {name}")
+                    # AIが座長と演者を逆転させた可能性が高い → talk側のspeaker/affiliationも保護
+                    _ai_swapped_chair_speaker = True
             else:
                 # 同一人物 → affiliation等の更新を許可
                 if role:
@@ -7879,14 +7926,16 @@ async def ai_refine_json(
         if _ai_swapped_chair_speaker and refined.talks:
             draft_people = [(t.speaker, t.affiliation) for t in refined.talks if t.speaker]
             refined.talks = _build_talks_from_parsed(parsed_talks)
-            # draft側のspeaker/affiliationで上書き復元
+            # draft側のspeaker/affiliationで上書き復元（人名として妥当な場合のみ）
             for i, t in enumerate(refined.talks):
-                if i < len(draft_people) and draft_people[i][0]:
+                if i < len(draft_people) and draft_people[i][0] and _is_plausible_speaker_name(draft_people[i][0]):
                     t.speaker = draft_people[i][0]
                     t.speaker_display = build_speaker_display(draft_people[i][0]) or draft_people[i][0]
                     if draft_people[i][1]:
                         t.affiliation = draft_people[i][1]
                     print(f"[AI REFINE DEBUG] AI座長演者逆転: talk[{i}] speaker/affiliation復元 ({t.speaker})")
+                elif i < len(draft_people) and draft_people[i][0]:
+                    print(f"[AI REFINE DEBUG] AI座長演者逆転: talk[{i}] draft speaker不正のためAI値を維持 ({draft_people[i][0]})")
         else:
             refined.talks = _build_talks_from_parsed(parsed_talks)
 
@@ -7915,9 +7964,20 @@ async def ai_refine_json(
                 t.title_lines = title_lines
                 t.title = "\n".join(title_lines).strip()
 
-            # AIが座長と演者を逆転させた場合、draftのspeaker/affiliationを保持
-            if _ai_swapped_chair_speaker and t.speaker and t.affiliation:
+            # AIが座長と演者を逆転させた場合、draftのspeaker/affiliationを保持（人名として妥当な場合のみ）
+            if _ai_swapped_chair_speaker and t.speaker and t.affiliation and _is_plausible_speaker_name(t.speaker):
                 print(f"[AI REFINE DEBUG] AI座長演者逆転検出: talk[{i}] speaker/affiliation保持 ({t.speaker})")
+            elif _ai_swapped_chair_speaker and t.speaker and not _is_plausible_speaker_name(t.speaker):
+                # draft speaker が不正 → AI値を採用
+                sp = _norm_speaker_candidate(pt.get("speaker", "") or "")
+                if sp:
+                    t.speaker = sp
+                    t.speaker_display = build_speaker_display(sp) or sp
+                aff = normalize_space(pt.get("affiliation", "") or "")
+                if aff:
+                    t.affiliation = aff
+                print(f"[AI REFINE DEBUG] AI座長演者逆転検出: talk[{i}] draft speaker不正のためAI値を採用 ({t.speaker})")
+            
             else:
                 sp = _norm_speaker_candidate(pt.get("speaker", "") or "")
                 if sp:
