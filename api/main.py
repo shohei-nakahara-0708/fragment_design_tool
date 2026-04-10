@@ -1894,8 +1894,23 @@ def blocks_to_dicts(blocks: list[Any]) -> list[dict]:
     return out
 
 def merge_event_title_blocks_strict(blocks: list[TextBlock]) -> list[TextBlock]:
-    # 上部の大フォントだけ抽出
-    candidates = [b for b in blocks if b.max_font_pt >= 22]
+    # 上部の大フォントだけ抽出（学習済みmedianをベースに閾値を決定）
+    _lp = _get_layout_pattern_cache()
+    _etfp = _lp.get("event_title_font_pt", {})
+    if _etfp.get("count", 0) >= 3:
+        # イベントタイトルとスピーカーの中間を閾値に（ノイズ除去）
+        _sp_median = _lp.get("speaker_font_pt", {}).get("median", 0)
+        _et_median = _etfp.get("median", 0)
+        if _et_median > 0 and _sp_median > 0:
+            _threshold = (_et_median + _sp_median) / 2.0
+        elif _et_median > 0:
+            _threshold = _et_median * 0.75  # イベントタイトルmedianの75%
+        else:
+            _threshold = 22.0
+        _threshold = max(16.0, min(_threshold, 32.0))  # 16〜32ptにクランプ
+    else:
+        _threshold = 22.0
+    candidates = [b for b in blocks if b.max_font_pt >= _threshold]
     if not candidates:
         return blocks
 
@@ -2318,6 +2333,11 @@ def format_affiliation_initial(raw: str, *, max_len: int, max_lines: int = 2) ->
     return "\n".join(lines[:max_lines]).strip()
 
 def post_format_design_initial(payload):
+    # 学習済み1行文字数を取得（learning-based max_len）
+    _llen = _get_title_line_len_cache()
+    _talk_max_len = int(max(14, min(_llen.get("talk_title_p90") or 18, 26)))
+    _event_max_len = int(max(16, min(_llen.get("event_title_p90") or 22, 30)))
+
     # event title
     if getattr(payload, "event_title_lines", None):
         payload.event_title_lines = [
@@ -2331,7 +2351,7 @@ def post_format_design_initial(payload):
             else:
                 payload.event_title_lines = format_title_initial(
                     base,
-                    max_len=22,
+                    max_len=_event_max_len,
                     max_lines=20,
                     force_tilde_second_line=False,
                 )
@@ -2347,7 +2367,7 @@ def post_format_design_initial(payload):
             if raw_title:
                 t.title_lines = format_title_initial(
                     raw_title,
-                    max_len=18,
+                    max_len=_talk_max_len,
                     max_lines=20,
                     force_tilde_second_line=True,
                 )
@@ -2602,6 +2622,12 @@ def fill_datetime_parts(payload, blocks=None):
         time_joined = full_time or ""
         newline = False
 
+    # ★ 正解DBで True 比率が70%超なら初期値を True に（案内状の多数派フォーマット優先）
+    if not newline:
+        _dnc = _get_datetime_newline_cache()
+        if _dnc.get("true_ratio", 0) >= 0.70:
+            newline = True
+
     parts.time = time_joined
 
     pset(payload, "datetime_parts", parts)
@@ -2630,6 +2656,11 @@ def looks_like_affil_line(s: str) -> bool:
     s = _norm1(s)
     if not s:
         return False
+
+    # 正解DBに登録済みの所属・施設なら即 True
+    _s_ns = re.sub(r'[\s\u3000]+', '', s)
+    if _s_ns and len(_s_ns) >= 3 and _s_ns in _get_facility_name_dict_cache():
+        return True
 
     # ラベル/案内っぽいのは除外
     if any(k in s for k in ["演題", "演者", "座長", "日時", "会場", "共催", "主催", "提供", "企画", "運営", "詳細は"]):
@@ -3574,7 +3605,11 @@ def build_speaker_display(name: str) -> str:
     # ① 正解DBから学習した分割位置（最優先）
     cache = _get_speaker_display_cache()
     if core in cache:
-        return cache[core]
+        cached_val = cache[core]
+        # キャッシュ値の文字（スペース除去）がnameと一致する場合のみ適用
+        # 異なる場合は誤ったDB登録の可能性があるためスキップ
+        if cached_val.replace(" ", "").replace("\u3000", "") == core:
+            return cached_val
 
     # ② 辞書
     v = split_name_by_dictionary(core)
@@ -4370,6 +4405,14 @@ def extract_event_title_lines_from_blocks(blocks: List[TextBlock]) -> List[str]:
         if "共催" in k or "主催" in k:
             return True
 
+        # 「座長 池上達義先生」「演者 二宮貴一朗先生」等の人名付き役職ブロックを除外
+        if "先生" in k and any(lbl in k for lbl in ["座長", "演者", "総合司会", "司会"]):
+            return True
+
+        # 「添田周先生福島県立医科大学産婦人科学講座教授」等の人名+先生+所属ブロックを除外
+        if "先生" in k and any(kw in k for kw in ["大学", "病院", "センター", "クリニック", "教授", "部長", "院長", "医長", "講師", "准教授"]):
+            return True
+
         return False
 
     def contains_japanese(s: str) -> bool:
@@ -4428,11 +4471,52 @@ def extract_event_title_lines_from_blocks(blocks: List[TextBlock]) -> List[str]:
             cand.append(b)
 
     if not cand:
-        cand2 = [b for b in blocks if b.text and not looks_like_datetime_text(b.text)]
+        # 上1/3に候補なし → 全体から同じフィルタ（top制限なし）で最大フォントを選ぶ
+        cand2 = []
+        for b in blocks:
+            s = normalize_space(b.text)
+            if not s:
+                continue
+            if looks_like_datetime_text(s) or looks_like_date_title_block(s) or looks_like_format_value(s) or looks_like_body_text_for_title(s):
+                continue
+            if is_title_excluded(s):
+                continue
+            cand2.append(b)
         if not cand2:
             return []
-        b0 = max(cand2, key=lambda x: x.max_font_pt or 0)
-        return [normalize_space(b0.text)]
+
+        # 最大フォントを特定し、同等フォントの全ブロックを top でグループ化
+        # （タイトルが画像化されて単語ごとに分割されているケースに対応）
+        max_font = max(b.max_font_pt or 0 for b in cand2)
+        large_blocks = [b for b in cand2 if (b.max_font_pt or 0) >= max_font - 2]
+        large_blocks.sort(key=lambda b: b.top)
+
+        # top が近いブロックを同一行にグループ化
+        rows: list = []
+        for b in large_blocks:
+            placed = False
+            for row in rows:
+                rep = row[0]
+                tol = max(rep.height or 400000, b.height or 400000) * 0.5
+                if abs(b.top - rep.top) <= tol:
+                    row.append(b)
+                    placed = True
+                    break
+            if not placed:
+                rows.append([b])
+
+        if not rows:
+            return []
+
+        # 最上段の行を1行目、直下の行を2行目として返す
+        rows.sort(key=lambda r: min(x.top for x in r))
+        out_lines = []
+        for row in rows[:2]:
+            row.sort(key=lambda b: b.left or 0)
+            merged = "".join(normalize_space(b.text) for b in row)
+            if merged:
+                out_lines.append(merged)
+        return out_lines if out_lines else []
 
     # head（タイトル本体）
     # head = sorted(cand, key=lambda b: ((b.max_font_pt or 0), -b.top), reverse=True)[0]
@@ -4628,6 +4712,20 @@ def extract_organizer_from_blocks(blocks: List[TextBlock]) -> str:
         if m:
             # 例: "共催：刈谷内科医会 MSD 株式会社"
             return s
+
+    # ★ 正解DBの主催者辞書と照合（ラベルなし行でも検出）
+    org_dict = _get_organizer_dict_cache()
+    if org_dict:
+        for l in lines:
+            s = normalize_space(l)
+            s_ns = re.sub(r'[\s\u3000]+', '', s)
+            if len(s_ns) < 4:
+                continue
+            if s_ns in org_dict:
+                return s
+            for known in org_dict:
+                if len(known) >= 6 and known in s_ns:
+                    return s
 
     # fallback（会社名っぽい行）
     corp_pat = re.compile(r"(株式会社|有限会社|合同会社|Inc\.|LLC|Ltd\.|Co\.,?\s*Ltd\.|GmbH)")
@@ -4860,7 +4958,12 @@ def is_valid_person_name(name: str) -> bool:
     """有効な人名かどうかをチェック（トップレベル関数）"""
     if not name or len(name) < 2:
         return False
-    
+
+    # 正解DBに登録済みの人名なら即 True（旧字体・珍しい姓も対応）
+    _name_ns = name.replace(" ", "").replace("\u3000", "")
+    if _name_ns and _name_ns in _get_person_name_dict_cache():
+        return True
+
     # 明らかに人名ではない単語を除外
     invalid_words = {
         "男子", "女子", "学生", "医師", "看護", "患者", "症例", 
@@ -5210,6 +5313,39 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
         if cand:
             mp[key] = cand[0][1]
 
+    # ★ 正解DBの人名辞書で「先生なし」ブロックも候補に追加
+    person_dict = _get_person_name_dict_cache()
+    if person_dict:
+        for b in ordered:
+            if "先生" in b.text:
+                continue
+            bt_ns = normalize_space(b.text).replace(" ", "").replace("\u3000", "")
+            if not bt_ns or bt_ns not in person_dict:
+                continue
+            # DB登録済み人名と一致 → name_blocksと同様に所属を探索
+            key = bt_ns
+            if key in mp:
+                continue
+            if not is_valid_person_name(key):
+                continue
+            mp[key] = ""
+            # 直下優先探索
+            x0 = b.left - 400000
+            x1 = b.left + b.width + 400000
+            y0 = b.top + b.height - 100000
+            y1 = b.top + b.height + 1200000
+            for ab in ordered:
+                if ab is b:
+                    continue
+                if not in_region(ab, x0, y0, x1, y1):
+                    continue
+                s = normalize_space(ab.text.replace("\n", " "))
+                if looks_like_affil(s):
+                    clean_s = normalize_affiliation(s)
+                    clean_s = _remove_person_names_from_affiliation(clean_s, key)
+                    mp[key] = clean_s
+                    break
+
     # ★ 学習済み所属フォーマットを適用（スペース位置の正規化）
     aff_cache = _get_affiliation_format_cache()
     if aff_cache:
@@ -5329,8 +5465,10 @@ def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
         speaker_map = {}
 
     chair_anchor = None
+    _chair_label_words = _get_chair_label_words()
     for b in blocks:
-        if "座長" in normalize_key(b.text):
+        b_key = normalize_key(b.text)
+        if any(lbl in b_key for lbl in _chair_label_words):
             chair_anchor = b
             break
     if not chair_anchor:
@@ -6969,6 +7107,16 @@ def _compute_layout_hints(blocks_json: list, correct_json: dict) -> dict:
     if prog_block:
         hints["program_top"] = prog_block.get("top", 0)
 
+    # イベントタイトルのフォントサイズを記録
+    _et_lines = correct_json.get("event_title_lines") or []
+    _et_text = _et_lines[0] if _et_lines else (correct_json.get("event_title") or "")
+    if _et_text:
+        _et_block = _find_block(_et_text[:12])  # 先頭12文字で検索
+        if _et_block:
+            _pt = float(_et_block.get("max_font_pt") or 0)
+            if _pt > 0:
+                hints["event_title_font_pt"] = _pt
+
     # 座長
     chair = correct_json.get("chair") or {}
     chair_name = (chair.get("name") or "").replace(" ", "").replace("\u3000", "")
@@ -7002,6 +7150,10 @@ def _compute_layout_hints(blocks_json: list, correct_json: dict) -> dict:
 
         sp_top = speaker_block.get("top", 0)
         t_hint: dict = {"speaker_top": sp_top, "talk_index": idx}
+        # 演者ブロックのフォントサイズを記録
+        _sp_pt = float(speaker_block.get("max_font_pt") or 0)
+        if _sp_pt > 0:
+            t_hint["speaker_font_pt"] = _sp_pt
 
         # 演者ラベルを付近で検索
         enja_anchor = None
@@ -7032,6 +7184,9 @@ def _compute_layout_hints(blocks_json: list, correct_json: dict) -> dict:
             if title_block:
                 t_hint["title_top"] = title_block.get("top", 0)
                 t_hint["title_rel_to_speaker_y"] = title_block.get("top", 0) - sp_top
+                _tt_pt = float(title_block.get("max_font_pt") or 0)
+                if _tt_pt > 0:
+                    t_hint["talk_title_font_pt"] = _tt_pt
 
         hints["talks"].append(t_hint)
 
@@ -7060,6 +7215,9 @@ def _build_layout_pattern_cache() -> dict:
     chair_affil_rels: list[int] = []
     speaker_enja_rels: list[int] = []
     title_rels: list[int] = []
+    event_title_font_pts: list[float] = []
+    speaker_font_pts: list[float] = []
+    talk_title_font_pts: list[float] = []
 
     try:
         with db_connect() as con:
@@ -7074,6 +7232,9 @@ def _build_layout_pattern_cache() -> dict:
             ch = hints.get("chair") or {}
             if "affil_rel_to_name_y" in ch:
                 chair_affil_rels.append(ch["affil_rel_to_name_y"])
+            # event title font
+            if "event_title_font_pt" in hints:
+                event_title_font_pts.append(float(hints["event_title_font_pt"]))
             # talks
             for th in (hints.get("talks") or []):
                 if "affil_rel_to_speaker_y" in th:
@@ -7082,6 +7243,10 @@ def _build_layout_pattern_cache() -> dict:
                     speaker_enja_rels.append(th["speaker_rel_to_enja_y"])
                 if "title_rel_to_speaker_y" in th:
                     title_rels.append(th["title_rel_to_speaker_y"])
+                if "speaker_font_pt" in th:
+                    speaker_font_pts.append(float(th["speaker_font_pt"]))
+                if "talk_title_font_pt" in th:
+                    talk_title_font_pts.append(float(th["talk_title_font_pt"]))
     except Exception as e:
         print(f"[layout-pattern-cache] error: {e}")
 
@@ -7098,6 +7263,19 @@ def _build_layout_pattern_cache() -> dict:
             "above_ratio": sum(1 for v in vals if v < 0) / n,
         }
 
+    def _fstats(vals: list[float]) -> dict:
+        """float リスト版の統計（フォントサイズ用）"""
+        if len(vals) < 3:
+            return {}
+        vals_sorted = sorted(vals)
+        n = len(vals_sorted)
+        return {
+            "median": vals_sorted[n // 2],
+            "q25": vals_sorted[n // 4],
+            "q75": vals_sorted[3 * n // 4],
+            "count": n,
+        }
+
     cache = {}
     s = _stats(affil_rels)
     if s:
@@ -7111,6 +7289,16 @@ def _build_layout_pattern_cache() -> dict:
     s = _stats(title_rels)
     if s:
         cache["title_rel_to_speaker_y"] = s
+    # フォントサイズ統計
+    s = _fstats(event_title_font_pts)
+    if s:
+        cache["event_title_font_pt"] = s
+    s = _fstats(speaker_font_pts)
+    if s:
+        cache["speaker_font_pt"] = s
+    s = _fstats(talk_title_font_pts)
+    if s:
+        cache["talk_title_font_pt"] = s
 
     if cache:
         print(f"[layout-pattern-cache] loaded {sum(v.get('count',0) for v in cache.values())} samples across {len(cache)} patterns")
@@ -7130,6 +7318,356 @@ def _get_layout_pattern_cache() -> dict:
 def invalidate_layout_pattern_cache():
     global _layout_pattern_cache_loaded
     _layout_pattern_cache_loaded = False
+
+
+# ---------- 人名辞書（正解DBから学習）----------
+# 正解 DB に登録された speaker / chair name（スペース除去キー）の集合。
+# 「先生」なしでも人名として確定できる。
+_person_name_dict_cache: set[str] | None = None
+_person_name_dict_cache_loaded: bool = False
+
+def _build_person_name_dict_cache() -> set[str]:
+    """正解DB の全レコードから speaker / chair 人名を収集してセットを返す。"""
+    names: set[str] = set()
+    try:
+        answers = _load_correct_answers()
+        for ans in answers:
+            cj = ans.get("correct_json") or {}
+            # talks
+            for t in (cj.get("talks") or []):
+                sp = (t.get("speaker") or "").replace(" ", "").replace("\u3000", "")
+                if sp and len(sp) >= 2:
+                    names.add(sp)
+            # chair
+            ch = cj.get("chair") or {}
+            cn = (ch.get("name") or "").replace(" ", "").replace("\u3000", "")
+            if cn and len(cn) >= 2:
+                names.add(cn)
+    except Exception as e:
+        print(f"[person-name-dict] build error: {e}")
+    if names:
+        print(f"[person-name-dict] loaded {len(names)} known names")
+    return names
+
+def _get_person_name_dict_cache() -> set[str]:
+    global _person_name_dict_cache, _person_name_dict_cache_loaded
+    if not _person_name_dict_cache_loaded:
+        _person_name_dict_cache = _build_person_name_dict_cache()
+        _person_name_dict_cache_loaded = True
+    return _person_name_dict_cache or set()
+
+def invalidate_person_name_dict_cache():
+    global _person_name_dict_cache_loaded
+    _person_name_dict_cache_loaded = False
+
+
+# ---------- 施設名辞書（正解DBから学習）----------
+# 正解 DB の affiliation から施設名・所属文字列（スペース除去キー）を収集。
+# 一般キーワード（病院/大学等）を含まない固有施設名も検出できる。
+_facility_name_dict_cache: set[str] | None = None
+_facility_name_dict_cache_loaded: bool = False
+
+# 所属文字列末尾に付く役職語（除去してコア施設名を得る）
+_ROLE_SUFFIX_WORDS = [
+    "主任教授", "教授", "准教授", "講師", "助教",
+    "病院長", "院長", "副院長", "部長", "副部長", "医長",
+    "センター長", "科長", "室長", "所長", "理事長",
+]
+
+def _strip_role_suffix(s: str) -> str:
+    """所属テキスト末尾の役職語を除去して施設・部署名を返す。"""
+    s = s.strip()
+    for role in _ROLE_SUFFIX_WORDS:
+        if s.endswith(role):
+            s = s[: -len(role)].strip()
+            break
+    return s
+
+def _build_facility_name_dict_cache() -> set[str]:
+    """正解DB の全 affiliation から施設名キーを収集してセットを返す。
+    フルの所属文字列（スペース除去）と、役職語を除いたコア部分の両方を登録。
+    3文字以上のものだけ追加してノイズを防ぐ。
+    """
+    keys: set[str] = set()
+    _bad = {"PROGRAM", "AGENDA", "SCHEDULE", ""}
+
+    def _add(raw: str) -> None:
+        raw = raw.strip()
+        if not raw or raw.upper() in _bad:
+            return
+        # フル文字列（スペース除去）
+        full_key = re.sub(r'[\s\u3000]+', '', raw)
+        if len(full_key) >= 3:
+            keys.add(full_key)
+        # 役職語を除いたコア部分
+        core = _strip_role_suffix(raw)
+        core_key = re.sub(r'[\s\u3000]+', '', core)
+        if len(core_key) >= 3 and core_key != full_key:
+            keys.add(core_key)
+
+    try:
+        answers = _load_correct_answers()
+        for ans in answers:
+            cj = ans.get("correct_json") or {}
+            for t in (cj.get("talks") or []):
+                _add(t.get("affiliation") or "")
+            ch = cj.get("chair") or {}
+            _add(ch.get("affiliation") or "")
+    except Exception as e:
+        print(f"[facility-name-dict] build error: {e}")
+    if keys:
+        print(f"[facility-name-dict] loaded {len(keys)} known facility keys")
+    return keys
+
+def _get_facility_name_dict_cache() -> set[str]:
+    global _facility_name_dict_cache, _facility_name_dict_cache_loaded
+    if not _facility_name_dict_cache_loaded:
+        _facility_name_dict_cache = _build_facility_name_dict_cache()
+        _facility_name_dict_cache_loaded = True
+    return _facility_name_dict_cache or set()
+
+def invalidate_facility_name_dict_cache():
+    global _facility_name_dict_cache_loaded
+    _facility_name_dict_cache_loaded = False
+
+
+# ---------- タイトル改行文字数キャッシュ（正解DBから学習）----------
+# 正解DBの title_lines / event_title_lines の各行文字数を集計し、
+# format_title_initial の max_len と fix_title_lines_jp の MAX_MERGE_LEN に利用する。
+
+_title_line_len_cache: dict | None = None
+_title_line_len_cache_loaded: bool = False
+
+def _build_title_line_len_cache() -> dict:
+    """正解DB の title_lines / event_title_lines から1行あたりの文字数分布を学習する。
+    Returns:
+        {
+            "talk_title_p90": int,      # トーク演題の90パーセンタイル文字数
+            "talk_title_median": int,   # 中央値
+            "event_title_p90": int,     # イベントタイトルの90パーセンタイル
+            "event_title_median": int,
+        }
+    """
+    talk_lens: list[int] = []
+    event_lens: list[int] = []
+    result: dict = {}
+    try:
+        answers = _load_correct_answers()
+        for ans in answers:
+            cj = ans.get("correct_json") or {}
+            # イベントタイトル各行
+            for line in (cj.get("event_title_lines") or []):
+                ln = len(re.sub(r'[\s\u3000]+', '', normalize_space(line)))
+                if ln >= 3:
+                    event_lens.append(ln)
+            # トーク演題各行
+            for t in (cj.get("talks") or []):
+                for line in (t.get("title_lines") or []):
+                    ln = len(re.sub(r'[\s\u3000]+', '', normalize_space(line)))
+                    if ln >= 3:
+                        talk_lens.append(ln)
+    except Exception as e:
+        print(f"[title-line-len-cache] build error: {e}")
+        return result
+
+    if len(talk_lens) >= 5:
+        st = sorted(talk_lens)
+        n = len(st)
+        result["talk_title_p90"] = st[min(int(n * 0.9), n - 1)]
+        result["talk_title_median"] = st[n // 2]
+        result["talk_count"] = n
+        print(f"[title-line-len] talk: median={result['talk_title_median']}, p90={result['talk_title_p90']}, n={n}")
+
+    if len(event_lens) >= 3:
+        se = sorted(event_lens)
+        n = len(se)
+        result["event_title_p90"] = se[min(int(n * 0.9), n - 1)]
+        result["event_title_median"] = se[n // 2]
+        result["event_count"] = n
+        print(f"[title-line-len] event: median={result['event_title_median']}, p90={result['event_title_p90']}, n={n}")
+
+    return result
+
+def _get_title_line_len_cache() -> dict:
+    global _title_line_len_cache, _title_line_len_cache_loaded
+    if not _title_line_len_cache_loaded:
+        _title_line_len_cache = _build_title_line_len_cache()
+        _title_line_len_cache_loaded = True
+    return _title_line_len_cache or {}
+
+def invalidate_title_line_len_cache():
+    global _title_line_len_cache_loaded
+    _title_line_len_cache_loaded = False
+
+
+# ---------- 主催者名辞書（正解DBから学習）----------
+_organizer_dict_cache: set[str] | None = None
+_organizer_dict_cache_loaded: bool = False
+
+def _build_organizer_dict_cache() -> set[str]:
+    """正解DB の organizer から既知の主催者文字列（スペース除去キー）を収集。"""
+    keys: set[str] = set()
+    try:
+        answers = _load_correct_answers()
+        for ans in answers:
+            cj = ans.get("correct_json") or {}
+            org = (cj.get("organizer") or "").strip()
+            if not org:
+                continue
+            # フル文字列キー
+            full_key = re.sub(r'[\s\u3000]+', '', org)
+            if len(full_key) >= 4:
+                keys.add(full_key)
+            # 「主催：」「共催：」等のラベルを除いたコア部分も追加
+            core = re.sub(r'^(主催|共催|提供|企画|運営)\s*[:：]\s*', '', org).strip()
+            core_key = re.sub(r'[\s\u3000]+', '', core)
+            if len(core_key) >= 4 and core_key != full_key:
+                keys.add(core_key)
+    except Exception as e:
+        print(f"[organizer-dict] build error: {e}")
+    if keys:
+        print(f"[organizer-dict] loaded {len(keys)} known organizer keys")
+    return keys
+
+def _get_organizer_dict_cache() -> set[str]:
+    global _organizer_dict_cache, _organizer_dict_cache_loaded
+    if not _organizer_dict_cache_loaded:
+        _organizer_dict_cache = _build_organizer_dict_cache()
+        _organizer_dict_cache_loaded = True
+    return _organizer_dict_cache or set()
+
+def invalidate_organizer_dict_cache():
+    global _organizer_dict_cache_loaded
+    _organizer_dict_cache_loaded = False
+
+
+# ---------- 座長ラベル語辞書（正解DBから学習）----------
+_chair_label_cache: dict | None = None   # {label_word: count}
+_chair_label_cache_loaded: bool = False
+
+def _build_chair_label_cache() -> dict:
+    """correct_json.chair.role の出現語を集計し {word: count} を返す。"""
+    counts: dict[str, int] = {}
+    _default = {"座長", "総合司会", "司会"}
+    try:
+        answers = _load_correct_answers()
+        for ans in answers:
+            cj = ans.get("correct_json") or {}
+            role = (cj.get("chair") or {}).get("role") or ""
+            role = role.strip()
+            if role:
+                counts[role] = counts.get(role, 0) + 1
+    except Exception as e:
+        print(f"[chair-label-cache] build error: {e}")
+    # デフォルト語を必ず含める
+    for w in _default:
+        counts.setdefault(w, 0)
+    if counts:
+        print(f"[chair-label-cache] labels: {counts}")
+    return counts
+
+def _get_chair_label_cache() -> dict:
+    global _chair_label_cache, _chair_label_cache_loaded
+    if not _chair_label_cache_loaded:
+        _chair_label_cache = _build_chair_label_cache()
+        _chair_label_cache_loaded = True
+    return _chair_label_cache or {}
+
+def _get_chair_label_words() -> list[str]:
+    """出現頻度の高い順に座長ラベル語リストを返す（最低でも「座長」を含む）。"""
+    c = _get_chair_label_cache()
+    if not c:
+        return ["座長", "総合司会", "司会"]
+    return [w for w, _ in sorted(c.items(), key=lambda x: -x[1]) if w]
+
+def invalidate_chair_label_cache():
+    global _chair_label_cache_loaded
+    _chair_label_cache_loaded = False
+
+
+# ---------- 講演数分布（正解DBから学習）----------
+_talk_count_cache: dict | None = None
+_talk_count_cache_loaded: bool = False
+
+def _build_talk_count_cache() -> dict:
+    """correct_json.talks の件数を集計し統計を返す。"""
+    counts: list[int] = []
+    try:
+        answers = _load_correct_answers()
+        for ans in answers:
+            cj = ans.get("correct_json") or {}
+            n = len(cj.get("talks") or [])
+            if n > 0:
+                counts.append(n)
+    except Exception as e:
+        print(f"[talk-count-cache] build error: {e}")
+    if len(counts) < 3:
+        return {}
+    counts_sorted = sorted(counts)
+    n = len(counts_sorted)
+    result = {
+        "median": counts_sorted[n // 2],
+        "q25": counts_sorted[n // 4],
+        "q75": counts_sorted[3 * n // 4],
+        "min": counts_sorted[0],
+        "max": counts_sorted[-1],
+        "count": n,
+    }
+    print(f"[talk-count-cache] median={result['median']}, q25={result['q25']}, q75={result['q75']}, n={n}")
+    return result
+
+def _get_talk_count_cache() -> dict:
+    global _talk_count_cache, _talk_count_cache_loaded
+    if not _talk_count_cache_loaded:
+        _talk_count_cache = _build_talk_count_cache()
+        _talk_count_cache_loaded = True
+    return _talk_count_cache or {}
+
+def invalidate_talk_count_cache():
+    global _talk_count_cache_loaded
+    _talk_count_cache_loaded = False
+
+
+# ---------- datetime_time_newline 分布（正解DBから学習）----------
+_datetime_newline_cache: dict | None = None
+_datetime_newline_cache_loaded: bool = False
+
+def _build_datetime_newline_cache() -> dict:
+    """correct_json.datetime_time_newline の True/False 出現比率を集計。"""
+    true_count = 0
+    false_count = 0
+    try:
+        answers = _load_correct_answers()
+        for ans in answers:
+            cj = ans.get("correct_json") or {}
+            val = cj.get("datetime_time_newline")
+            if val is True:
+                true_count += 1
+            elif val is False:
+                false_count += 1
+    except Exception as e:
+        print(f"[datetime-newline-cache] build error: {e}")
+    total = true_count + false_count
+    if total < 3:
+        return {}
+    result = {
+        "true_count": true_count,
+        "false_count": false_count,
+        "true_ratio": true_count / total,
+    }
+    print(f"[datetime-newline-cache] true={true_count}, false={false_count}, true_ratio={result['true_ratio']:.0%}")
+    return result
+
+def _get_datetime_newline_cache() -> dict:
+    global _datetime_newline_cache, _datetime_newline_cache_loaded
+    if not _datetime_newline_cache_loaded:
+        _datetime_newline_cache = _build_datetime_newline_cache()
+        _datetime_newline_cache_loaded = True
+    return _datetime_newline_cache or {}
+
+def invalidate_datetime_newline_cache():
+    global _datetime_newline_cache_loaded
+    _datetime_newline_cache_loaded = False
 
 
 def _compute_similarity(kw_a: set[str], kw_b: set[str]) -> float:
@@ -7224,6 +7762,13 @@ def save_correct_answer(
     invalidate_affiliation_format_cache()
     invalidate_text_role_cache()
     invalidate_layout_pattern_cache()
+    invalidate_person_name_dict_cache()
+    invalidate_facility_name_dict_cache()
+    invalidate_title_line_len_cache()
+    invalidate_organizer_dict_cache()
+    invalidate_chair_label_cache()
+    invalidate_talk_count_cache()
+    invalidate_datetime_newline_cache()
 
 
 def find_similar_correct_answers(
@@ -7318,12 +7863,13 @@ def _build_dynamic_few_shot(similar_answers: list[dict]) -> list[dict]:
     return messages
 
 
-def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSON:
+def apply_correct_answer_overlay(payload: DesignJSON, blocks: list, vm_rows: list | None = None) -> DesignJSON:
     """
     後処理で上書きされたフィールドを正解DBから復元する。
     - 類似度 >= 0.80 : organizer, chair を復元
     - 類似度 >= 0.85 : event_title も復元（類似だが別イベントの誤上書きを防止）
     - 類似度 >= 0.90 : talks の speaker / affiliation / title も復元（同一書類の可能性が高い）
+    vm_rows が指定されていてスピーカーが VM で確認済みの場合はタイトル上書きを行わない。
     """
     try:
         all_blocks_text = " ".join(
@@ -7346,7 +7892,8 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
         print(f"[correct-answer-overlay] sim={sim:.2f} job_id={best.get('job_id','')}")
 
         def _pick_better_affiliation_simple(cur: str, ct: str) -> str:
-            """現在値と正解DB値を比較し、より詳細な方を返す"""
+            """現在値と正解DB値を比較し、より詳細な方を返す。
+            Layer-3: 内容が同じならフォーマット復元、包含なら詳細な方、異なるなら現在値を優先。"""
             if not cur:
                 return ct
             if not ct:
@@ -7354,6 +7901,7 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
             cur_ns = cur.replace(" ", "").replace("\u3000", "")
             ct_ns = ct.replace(" ", "").replace("\u3000", "")
             if cur_ns == ct_ns:
+                # 内容同一 → DBのフォーマット（スペース位置）を採用
                 return ct
             if cur_ns.startswith(ct_ns) or ct_ns in cur_ns:
                 print(f"[correct-answer-overlay] keep current affiliation (superset): '{cur[:50]}'")
@@ -7361,7 +7909,8 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
             if ct_ns.startswith(cur_ns) or cur_ns in ct_ns:
                 print(f"[correct-answer-overlay] use DB affiliation (superset): '{ct[:50]}'")
                 return ct
-            return ct
+            # 包含関係なし → 現在の抽出結果を優先（完全上書き廃止）
+            return cur
 
         # event_title 完全一致なら同一イベントの確度が非常に高い → talks 閾値を緩和
         correct_title = normalize_key(correct.get("event_title", ""))
@@ -7387,7 +7936,22 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
                     _cc_name_key = cc_name.replace(" ", "").replace("\u3000", "")
                     _blocks_text = all_blocks_text.replace(" ", "").replace("\u3000", "")
                     if _cc_name_key and _cc_name_key in _blocks_text:
-                        payload.chair.name = cc_name
+                        # Layer 3: 同一人物ならスペース位置のみ復元、別人なら上書きしない
+                        _cur_chair_ns = (payload.chair.name or "").replace(" ", "").replace("\u3000", "")
+                        if not _cur_chair_ns or _cur_chair_ns == _cc_name_key:
+                            # 現在未設定 or 同一人物 → name/display を復元
+                            payload.chair.name = cc_name
+                            _cc_disp = cc.get("name_display") or ""
+                            if _cc_disp:
+                                # name_display がこの chair 名と対応しているか検証（corrupt DBエントリ対策）
+                                _disp_ns = _cc_disp.replace(" ", "").replace("\u3000", "")
+                                if _disp_ns == _cc_name_key:
+                                    payload.chair.name_display = _cc_disp
+                                else:
+                                    print(f"[correct-answer-overlay] skip name_display: mismatch '{_cc_disp}' for chair '{cc_name}'")
+                        else:
+                            print(f"[correct-answer-overlay] chair name differs, skip: cur='{_cur_chair_ns[:20]}' db='{_cc_name_key[:20]}'")
+                            cc_name = ""  # affiliation も適用しない
                     else:
                         print(f"[correct-answer-overlay] chair name '{cc_name}' not found in blocks, skip")
                         cc_name = ""  # affiliation も適用しない
@@ -7414,7 +7978,23 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
                 _blocks_text_lower = all_blocks_text.replace(" ", "").replace("\u3000", "").lower()
                 if _current_et_ns and _current_et_ns in _blocks_text_lower:
                     _should_apply_title = False
-                    print(f"[correct-answer-overlay] current event_title found in blocks, skip title overlay ('{current_title[:40]}')")
+                    # VM 講演会名 と 正解DBタイトルがほぼ一致 → 同一イベントと確認済みなので上書き許可
+                    # （画像タイトルを誤抽出して別テキストが selected されているケースへの対応）
+                    if vm_rows and _correct_et:
+                        _vm_title_ns = ""
+                        for _r in vm_rows:
+                            _d = _r if isinstance(_r, dict) and "data" not in _r else (_r.get("data") or {})
+                            _vt = normalize_space(_d.get("講演会名") or "")
+                            if _vt:
+                                _vm_title_ns = _vt.replace(" ", "").replace("\u3000", "")
+                                break
+                        if _vm_title_ns:
+                            _vm_db_sim = SequenceMatcher(None, _vm_title_ns.lower(), _correct_et.replace(" ", "").replace("\u3000", "").lower()).ratio()
+                            if _vm_db_sim >= 0.7:
+                                _should_apply_title = True
+                                print(f"[correct-answer-overlay] VM 講演会名≈DB title (vm_db_sim={_vm_db_sim:.2f}), allow title overlay")
+                    _reason = "VM title match" if _should_apply_title else ""
+                    print(f"[correct-answer-overlay] {_reason + ' + ' if _reason else ''}current event_title found in blocks, {'allow' if _should_apply_title else 'skip'} title overlay ('{current_title[:40]}')")
 
             if _should_apply_title and _correct_et and current_title and not title_exact_match:
                 # Jaccard係数でタイトル単体の類似度をチェック
@@ -7430,11 +8010,19 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
                     print(f"[correct-answer-overlay] event_title mismatch: jaccard={_title_jaccard:.2f}, skip title overlay ('{current_title[:30]}' vs '{_correct_et[:30]}')")
 
             if _should_apply_title:
-                if correct.get("event_title_lines"):
-                    payload.event_title_lines = correct["event_title_lines"]
-                    payload.event_title = "\n".join(correct["event_title_lines"])
-                elif correct.get("event_title"):
-                    payload.event_title = correct["event_title"]
+                _ct_etl = correct.get("event_title_lines") or ([correct["event_title"]] if correct.get("event_title") else [])
+                if _ct_etl:
+                    # Layer 2: 内容が同一なら改行位置のみ復元（テキスト内容は変更しない）
+                    _ct_et_ns = "".join(_ct_etl).replace(" ", "").replace("\u3000", "")
+                    _cur_et_ns = (payload.event_title or "").replace("\n", "").replace(" ", "").replace("\u3000", "")
+                    if _ct_et_ns and _cur_et_ns and _ct_et_ns == _cur_et_ns:
+                        # 内容同一 → title_lines の改行位置だけ復元
+                        payload.event_title_lines = _ct_etl
+                        payload.event_title = "\n".join(_ct_etl)
+                        print(f"[correct-answer-overlay] event_title_lines linebreak restored: {_ct_etl}")
+                    else:
+                        # 内容が異なる → 完全上書き廃止（Layer 2: テキスト変更なし）
+                        print(f"[correct-answer-overlay] event_title content differs, skip overwrite: cur='{_cur_et_ns[:30]}' db='{_ct_et_ns[:30]}'")
 
         # ---- talks (高類似度 or event_title完全一致: 同一ドキュメントの可能性が高い) ----
         # ただしタイトルが別イベントと判定された場合はtalksも適用しない
@@ -7482,13 +8070,25 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
                         # DB値が現在値を包含 → DB値で上書き（より詳細）
                         print(f"[correct-answer-overlay] use DB affiliation (superset): '{ct[:50]}'")
                         return ct
-                    # 包含関係なし → 正解DB値を優先（学習済み正解）
-                    return ct
+                    # 包含関係なし → 現在の抽出結果を優先（完全上書き廃止）
+                    return cur
 
                 def _apply_talk_overlay(ct, t):
                     """1 talk分のoverlayを適用"""
-                    if ct.get("speaker"):
-                        t.speaker = ct["speaker"]
+                    # Layer 3: speaker は内容が同じ場合のみスペース位置を復元（テキスト変更なし）
+                    ct_sp = ct.get("speaker") or ""
+                    if ct_sp:
+                        cur_sp = getattr(t, "speaker", "") or ""
+                        ct_sp_ns = ct_sp.replace(" ", "").replace("\u3000", "")
+                        cur_sp_ns = cur_sp.replace(" ", "").replace("\u3000", "")
+                        if ct_sp_ns and ct_sp_ns == cur_sp_ns:
+                            # 同一人物: スペース位置を復元
+                            t.speaker = ct_sp
+                            ct_disp = ct.get("speaker_display") or ""
+                            if ct_disp:
+                                t.speaker_display = ct_disp
+                        # 異なる場合は上書きしない（現在の抽出結果を信頼）
+                    # affiliation: Layer 3 — 内容同一ならフォーマット復元、包含なら詳細な方、異なるなら現在値を優先
                     if ct.get("affiliation"):
                         t.affiliation = _pick_better_affiliation(
                             getattr(t, "affiliation", "") or "",
@@ -9084,7 +9684,9 @@ def fix_title_lines_jp(lines: list[str]) -> list[str]:
                 arr[j + 1] = cur_j[-1] + nxt_j
 
     # ---- パス2: 短すぎる次行をマージ ----
-    MAX_MERGE_LEN = 28  # マージ後の最大文字数
+    # 学習済みp90が取得できればそれを上限に、なければ28文字をデフォルト
+    _llen_fix = _get_title_line_len_cache()
+    MAX_MERGE_LEN = int(max(20, min(_llen_fix.get("talk_title_p90") or 28, 35)))
     out = []
     i = 0
     while i < len(arr):
@@ -9300,6 +9902,27 @@ def parse_blocks_to_design_json(blocks: List[TextBlock], vm_rows: Optional[List[
     event_title_lines = extract_event_title_lines_from_blocks(blocks)
     event_title = "\n".join(event_title_lines).strip()
 
+    # VM に「講演会名」があれば、抽出タイトルが案内文ヘッダー等の場合に優先使用
+    if vm_rows:
+        _vm_title = ""
+        for _r in vm_rows:
+            _d = _r if isinstance(_r, dict) and "data" not in _r else (_r.get("data") or {})
+            _vt = normalize_space(_d.get("講演会名") or "")
+            if _vt:
+                _vm_title = _vt
+                break
+        if _vm_title:
+            _et_norm = event_title.replace(" ", "").replace("\u3000", "")
+            _vm_norm = _vm_title.replace(" ", "").replace("\u3000", "")
+            # VM 講演会名と抽出タイトルの Jaccard 類似度で判断
+            # Jaccard < 0.5（かなり違う）なら VM を優先（画像タイトル誤抽出・案内文ヘッダー誤採用等に対応）
+            # → 正解DBがない初回からも有効
+            _char_jaccard = len(set(_et_norm) & set(_vm_norm)) / max(len(set(_et_norm) | set(_vm_norm)), 1)
+            if not _et_norm or _char_jaccard < 0.5:
+                print(f"[vm-event-title] use VM 講演会名: '{_vm_title}' (was: '{event_title[:40]}', jaccard={_char_jaccard:.2f})")
+                event_title_lines = [_vm_title]
+                event_title = _vm_title
+
     print("event_title_lines:", event_title_lines)
 
     dt = extract_datetime_from_blocks(blocks)
@@ -9325,6 +9948,17 @@ def parse_blocks_to_design_json(blocks: List[TextBlock], vm_rows: Optional[List[
         warnings.append("missing_chair"); confidence -= 0.1
     if len(talks) == 0:
         warnings.append("no_talks"); confidence -= 0.35
+    else:
+        # 学習済み講演数分布と比較し、大幅に外れる場合は軽く減点
+        _tcache = _get_talk_count_cache()
+        if _tcache.get("count", 0) >= 5:
+            _q25 = _tcache.get("q25", 1)
+            _q75 = _tcache.get("q75", 4)
+            _iqr = max(_q75 - _q25, 1)
+            if len(talks) < _q25 - _iqr or len(talks) > _q75 + _iqr:
+                warnings.append("unusual_talk_count")
+                confidence -= 0.08
+                print(f"[confidence] unusual_talk_count: {len(talks)} (expected q25={_q25}~q75={_q75})")
 
     confidence = float(min(max(confidence, 0.0), 1.0))
 
@@ -9828,8 +10462,9 @@ def _find_best_block_idx_by_hint(blocks: List[TextBlock], hint: str, *, min_sim:
             best_i = i
     return best_i if best_sc >= min_sim else -1
 
-def _join_affiliation_near_facility(blocks: List[TextBlock], facility_hint: str, *, max_follow: int = 4, y_limit: int = 260) -> str:
-    """PPTX上の所属表記を優先して作る: 施設名ブロック + 近傍（科/役職）を結合"""
+def _join_affiliation_near_facility(blocks: List[TextBlock], facility_hint: str, *, max_follow: int = 4, y_limit: int | None = None) -> str:
+    """PPTX上の所属表記を優先して作る: 施設名ブロック + 近傍（科/役職）を結合。
+    Layer-1: 正解DBから学習した位置パターン（affil_rel_to_speaker_y）を使って y_limit を自動調整。"""
     if not facility_hint:
         return ""
     idx = _find_best_block_idx_by_hint(blocks, facility_hint, min_sim=0.60)
@@ -9839,6 +10474,18 @@ def _join_affiliation_near_facility(blocks: List[TextBlock], facility_hint: str,
     b0 = blocks[idx]
     base_top = b0.top
     base_left = b0.left
+
+    # Layer-1: 学習した affil_rel_to_speaker_y からブロック間隔の目安を算出
+    if y_limit is None:
+        lpc = _get_layout_pattern_cache()
+        aff_stats = lpc.get("affil_rel_to_speaker_y") or {}
+        if aff_stats.get("count", 0) >= 5:
+            # 学習済みパターンの四分位範囲の絶対最大値 x2 を許容範囲とする
+            learned_limit = max(abs(aff_stats.get("q25", 0)), abs(aff_stats.get("q75", 0))) * 2
+            y_limit = max(int(learned_limit), 300000)  # 最低 300000
+            print(f"[layout-pattern] _join_affil y_limit={y_limit} (learned from {aff_stats['count']} samples)")
+        else:
+            y_limit = 500000  # デフォルト（学習データ不足時）
 
     parts = [(b0.text or "").strip()]
     taken = 0
@@ -9853,7 +10500,7 @@ def _join_affiliation_near_facility(blocks: List[TextBlock], facility_hint: str,
         # 近傍制約（縦位置/横位置）
         if abs(bj.top - base_top) > y_limit:
             continue
-        if abs(bj.left - base_left) > 220:
+        if abs(bj.left - base_left) > y_limit // 2:
             # 横が大きくズレるものは別カラムの可能性
             continue
 
@@ -11138,6 +11785,46 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
     refined = await ai_refine_json(blocks, draft, speaker_map, time_candidates, vm_rows)
     dump_titles("after ai_refine_json", refined)
 
+    # AI が VM 講演会名を上書きした場合に再適用
+    if vm_rows:
+        _vm_title_post = ""
+        for _r in vm_rows:
+            _d = _r if isinstance(_r, dict) and "data" not in _r else (_r.get("data") or {})
+            _vt = normalize_space(_d.get("講演会名") or "")
+            if _vt:
+                _vm_title_post = _vt
+                break
+        if _vm_title_post:
+            _ai_et_norm = (refined.event_title or "").replace(" ", "").replace("\u3000", "")
+            _vm_post_norm = _vm_title_post.replace(" ", "").replace("\u3000", "")
+            _post_jaccard = len(set(_ai_et_norm) & set(_vm_post_norm)) / max(len(set(_ai_et_norm) | set(_vm_post_norm)), 1)
+            if _post_jaccard < 0.5:
+                print(f"[vm-event-title] restore VM 講演会名 after AI: '{_vm_title_post}' (was: '{refined.event_title[:40]}', jaccard={_post_jaccard:.2f})")
+                refined.event_title_lines = [_vm_title_post]
+                refined.event_title = _vm_title_post
+
+    # AI が VM 演題を上書きした場合に再適用（スピーカー名で照合）
+    if vm_rows and refined.talks:
+        _vm_by_speaker: dict[str, str] = {}
+        for _r in vm_rows:
+            _d = _r if isinstance(_r, dict) and "data" not in _r else (_r.get("data") or {})
+            _sp = _norm_person_name(_d.get("案内状掲載 医師名") or "")
+            _vt = normalize_space(_d.get("演題") or "")
+            if _sp and _vt:
+                _vm_by_speaker[_sp] = _vt
+        for _t in refined.talks:
+            _sp_key = _norm_person_name(getattr(_t, "speaker", "") or getattr(_t, "speaker_display", "") or "")
+            _vm_enden = _vm_by_speaker.get(_sp_key, "")
+            if not _vm_enden:
+                continue
+            _ai_title_norm = (getattr(_t, "title", "") or "").replace(" ", "").replace("\u3000", "")
+            _vm_enden_norm = _vm_enden.replace(" ", "").replace("\u3000", "")
+            _t_jaccard = len(set(_ai_title_norm) & set(_vm_enden_norm)) / max(len(set(_ai_title_norm) | set(_vm_enden_norm)), 1)
+            if _t_jaccard < 0.4:
+                print(f"[vm-talk-title] restore VM 演題 for '{_sp_key}': '{_vm_enden[:40]}' (was: '{_ai_title_norm[:40]}', jaccard={_t_jaccard:.2f})")
+                _t.title = _vm_enden
+                _t.title_lines = [ln for ln in _vm_enden.split("\n") if normalize_space(ln)]
+
     def has_chair_shift_pattern(payload: DesignJSON) -> bool:
         talks = list(payload.talks or [])
         if len(talks) < 2:
@@ -12187,7 +12874,7 @@ async def upload_batch_stream(
                 vm_sheet=VM_SHEET,
                 vm_header_row=VM_HEADER_ROW,
                 vm_id_col_candidates=["講演会ID"],
-                col_end="N",
+                col_end="Z",
             )
 
             # （あなたの _parse_ymd / presence_rows_by_file_index / vm_rows_by_file_index のロジックは
@@ -12243,7 +12930,7 @@ async def upload_batch_stream(
                             _blocks_for_overlay = _raw  # list[dict] – overlay は dict 対応済み
                     except Exception:
                         pass
-                    payload = apply_correct_answer_overlay(payload, _blocks_for_overlay)
+                    payload = apply_correct_answer_overlay(payload, _blocks_for_overlay, vm_rows=vm_rows)
                     dump_titles("after apply_correct_answer_overlay", payload)
 
                     payload.region = presence_rows[0].get("VP/PH/ONC", "")
