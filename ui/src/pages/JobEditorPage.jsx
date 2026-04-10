@@ -786,7 +786,79 @@ export default function JobEditorPage() {
     });
   }, []);
 
-  if (!json) return <div style={{ padding: 16 }}>loading...</div>;
+  if (!json) return (
+    <div style={ui.page}>
+      <div style={ui.leftCol}>
+        {/* Header skeleton */}
+        <div style={ui.card}>
+          <div style={{ display: "grid", gap: 10 }}>
+            <div style={{ height: 14, borderRadius: 6, background: "#eee", width: 80 }} />
+            <div style={{ height: 20, borderRadius: 6, background: "#e5e5e5", width: "60%" }} />
+          </div>
+        </div>
+        {/* Basic info skeleton */}
+        <div style={ui.card}>
+          <div style={{ display: "grid", gap: 14 }}>
+            <div style={{ height: 13, borderRadius: 6, background: "#eee", width: 100 }} />
+            <div style={{ height: 40, borderRadius: 12, background: "#f3f3f3" }} />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 160px", gap: 12 }}>
+              <div style={{ height: 80, borderRadius: 12, background: "#f3f3f3" }} />
+              <div style={{ height: 40, borderRadius: 12, background: "#f3f3f3" }} />
+            </div>
+          </div>
+        </div>
+        {/* Date skeleton */}
+        <div style={ui.card}>
+          <div style={{ display: "grid", gap: 14 }}>
+            <div style={{ height: 13, borderRadius: 6, background: "#eee", width: 50 }} />
+            <div style={{ display: "flex", gap: 10 }}>
+              {[100, 80, 80, 70].map((w, i) => (
+                <div key={i} style={{ height: 40, borderRadius: 12, background: "#f3f3f3", width: w }} />
+              ))}
+            </div>
+          </div>
+        </div>
+        {/* Chair skeleton */}
+        <div style={ui.card}>
+          <div style={{ display: "grid", gap: 14 }}>
+            <div style={{ height: 13, borderRadius: 6, background: "#eee", width: 120 }} />
+            {[1, 2, 3].map((i) => (
+              <div key={i} style={{ height: 40, borderRadius: 12, background: "#f3f3f3" }} />
+            ))}
+          </div>
+        </div>
+        {/* Talk skeleton */}
+        <div style={ui.card}>
+          <div style={{ display: "grid", gap: 14 }}>
+            <div style={{ height: 13, borderRadius: 6, background: "#eee", width: 60 }} />
+            <div style={{ border: "1px dashed #ddd", borderRadius: 12, padding: 12, display: "grid", gap: 12 }}>
+              {[1, 2, 3, 4].map((i) => (
+                <div key={i} style={{ height: 40, borderRadius: 12, background: "#f3f3f3" }} />
+              ))}
+            </div>
+          </div>
+        </div>
+        <style>{`@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }`}</style>
+      </div>
+      {/* Right preview skeleton */}
+      <div style={ui.rightCol}>
+        <div style={ui.card}>
+          <div style={{ display: "grid", gap: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ height: 13, borderRadius: 6, background: "#eee", width: 70 }} />
+            </div>
+            <div style={{
+              height: 400,
+              borderRadius: 14,
+              background: "linear-gradient(90deg, #eee 25%, #f5f5f5 50%, #eee 75%)",
+              backgroundSize: "400% 100%",
+              animation: "shimmer 1.2s ease-in-out infinite",
+            }} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 
   const dt = json.datetime_parts || { year: "", month: "", day: "", dow: "", time: "" };
 

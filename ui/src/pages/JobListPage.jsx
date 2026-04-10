@@ -337,7 +337,7 @@ export default function JobListPage() {
   const [fromDate, setFromDate] = useState(""); // "YYYY-MM-DD"
   const [toDate, setToDate] = useState(""); // "YYYY-MM-DD"
   const [page, setPage] = useState(1);
-  const [pageSize] = useState(30);
+  const [pageSize] = useState(15);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [debug, setDebug] = useState(false);
@@ -770,9 +770,33 @@ export default function JobListPage() {
           {/* Left panel */}
           <div style={ui.panel}>
             <div style={ui.panelInner}>
-              {groups.length === 0 && <div style={ui.empty}>該当なし</div>}
+              {loading && groups.length === 0 && (
+                <div style={ui.listGrid}>
+                  {Array.from({ length: 6 }).map((_, i) => (
+                    <div key={i} style={{ ...ui.card, overflow: "hidden" }}>
+                      <div style={{
+                        background: "linear-gradient(90deg, #eee 25%, #f5f5f5 50%, #eee 75%)",
+                        backgroundSize: "400% 100%",
+                        animation: "shimmer 1.2s ease-in-out infinite",
+                        height: 180,
+                      }} />
+                      <div style={{ padding: 12, display: "grid", gap: 10 }}>
+                        <div style={{ height: 14, borderRadius: 6, background: "#eee", width: "75%" }} />
+                        <div style={{ height: 12, borderRadius: 6, background: "#f0f0f0", width: "50%" }} />
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <div style={{ height: 22, borderRadius: 999, background: "#f3f3f3", width: 60 }} />
+                          <div style={{ height: 22, borderRadius: 999, background: "#f3f3f3", width: 80 }} />
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                  <style>{`@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }`}</style>
+                </div>
+              )}
 
-              <div style={ui.listGrid}>
+              {!loading && groups.length === 0 && <div style={ui.empty}>該当なし</div>}
+
+              <div style={{ ...ui.listGrid, opacity: loading && groups.length > 0 ? 0.5 : 1, transition: "opacity 0.15s ease" }}>
                 {groups.map((group) => (
                   <React.Fragment key={group.sessionId}>
                     <div style={ui.sessionHeader}>
