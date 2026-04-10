@@ -722,6 +722,30 @@ TYPESET_JS = r"""
       enableEarlyBreak = false,
     } = opts;
 
+        // 不自然な語中分割（例: つ|いて）を抑制
+        const isAwkwardPhraseSplit = (left, right) => {
+            const l = String(left || "");
+            const r = String(right || "");
+            const badPairs = [
+                ["につ", "いて"],
+                ["にお", "ける"],
+                ["に関", "する"],
+                ["によ", "る"],
+            ];
+            return badPairs.some(([a, b]) => l.endsWith(a) && r.startsWith(b));
+        };
+
+        // 意味的に自然な分割位置に小さなボーナス
+        const isPreferredPhraseBoundary = (left) => {
+            const l = String(left || "");
+            return (
+                l.endsWith("について") ||
+                l.endsWith("における") ||
+                l.endsWith("に関する") ||
+                l.endsWith("による")
+            );
+        };
+
     // subtitle rule
     if (forceSubtitle2ndHead) {
       const sp = splitBySubtitle(s);
@@ -786,6 +810,16 @@ TYPESET_JS = r"""
 
       const lines = [a, b];
       let score = scoreLines(lines, maxPx, style, { preferBalancedAscii });
+
+            // 語中分割は強くペナルティ
+            if (isAwkwardPhraseSplit(a, b)) {
+                score += 2200;
+            }
+
+            // 句として自然な境界はやや優遇
+            if (isPreferredPhraseBoundary(a)) {
+                score -= 180;
+            }
       
       // カタカナ語の途中分断を回避（フォーラム→フォー|ラム 等）
       if (/[ァ-ヶー]$/.test(a) && /^[ァ-ヶー]/.test(b)) {
@@ -834,8 +868,15 @@ TYPESET_JS = r"""
 
           if (avoidSingleWordLastLine && isMostlyAscii(c) && wordCount(c) === 1) continue;
 
-          const lines = [a, b, c];
-          const score = scoreLines(lines, maxPx, style, { preferBalancedAscii });
+                    const lines = [a, b, c];
+                    let score = scoreLines(lines, maxPx, style, { preferBalancedAscii });
+
+                    if (isAwkwardPhraseSplit(a, b) || isAwkwardPhraseSplit(b, c)) {
+                        score += 2200;
+                    }
+                    if (isPreferredPhraseBoundary(a) || isPreferredPhraseBoundary(b)) {
+                        score -= 180;
+                    }
 
           if (bestScore === null || score < bestScore) {
             bestScore = score;
@@ -883,7 +924,7 @@ TYPESET_JS = r"""
     // コンテキストに応じた安全マージン（改行時の各行の上限）
     const margins = {
       'hero': 0.96,    // イベントタイトル：4%マージン
-      'talk': 0.96,    // 演題タイトル：4%マージン  
+            'talk': 0.95,    // 演題タイトル：5%マージン（カラム落ち防止優先）
       'normal': 0.97   // 通常：3%マージン
     };
     
@@ -4970,6 +5011,11 @@ def enrich_speaker_map_with_vm(
             return cands_below[0][1]
         return ""
 
+    def _clean_affil_text(s: str) -> str:
+        """所属テキストから演題名（「...」）部分を除去"""
+        s = re.sub(r'\s*[「「][^」」]*[」」]?\s*$', '', s).strip()
+        return normalize_space(s) if s else ""
+
     added = 0
     enriched = 0
     for vs in vm_speakers:
@@ -4983,14 +5029,14 @@ def enrich_speaker_map_with_vm(
         if name_norm not in speaker_map:
             # speaker_map に無い → 新規追加
             aff = _extract_affil_near_block(name_block, vs["facility"])
-            speaker_map[name_norm] = normalize_space(aff) if aff else ""
+            speaker_map[name_norm] = _clean_affil_text(aff) if aff else ""
             added += 1
             print(f"[VM→speaker_map] 追加: {name_norm} aff='{speaker_map[name_norm][:40]}'")
         elif not existing_aff:
             # speaker_map にあるがaff空 → 補完
             aff = _extract_affil_near_block(name_block, vs["facility"])
             if aff:
-                speaker_map[name_norm] = normalize_space(aff)
+                speaker_map[name_norm] = _clean_affil_text(aff)
                 enriched += 1
                 print(f"[VM→speaker_map] 補完: {name_norm} aff='{speaker_map[name_norm][:40]}'")
 
@@ -7361,7 +7407,16 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
             _correct_etl = correct.get("event_title_lines") or ([correct["event_title"]] if correct.get("event_title") else [])
             _correct_et = normalize_key("".join(_correct_etl))
             _should_apply_title = True
-            if _correct_et and current_title and not title_exact_match:
+
+            # 現在のタイトルが blocks 内に実在する → 正しく取れているので上書きしない
+            if current_title and not title_exact_match:
+                _current_et_ns = current_title.replace(" ", "").replace("\u3000", "").lower()
+                _blocks_text_lower = all_blocks_text.replace(" ", "").replace("\u3000", "").lower()
+                if _current_et_ns and _current_et_ns in _blocks_text_lower:
+                    _should_apply_title = False
+                    print(f"[correct-answer-overlay] current event_title found in blocks, skip title overlay ('{current_title[:40]}')")
+
+            if _should_apply_title and _correct_et and current_title and not title_exact_match:
                 # Jaccard係数でタイトル単体の類似度をチェック
                 _ct_chars = set(_correct_et)
                 _cur_chars = set(current_title)
@@ -9051,8 +9106,9 @@ def fix_title_lines_jp(lines: list[str]) -> list[str]:
                 i += 2
                 continue
 
-            # 漢字1字 + 続き、みたいな不自然分割（性 －... など）
-            if re.match(r"^[一-龠々]", nxt) and len(cur) >= 6 and merged_len <= MAX_MERGE_LEN:
+            # 漢字1字だけ残った不自然分割（性 などの短いサフィックス）のみマージ
+            # nxt が長い独立した行（例:「実臨床データについて（仮）」）はマージしない
+            if re.match(r"^[一-龠々]", nxt) and len(cur) >= 6 and len(nxt) <= 3 and merged_len <= MAX_MERGE_LEN:
                 out.append(cur + nxt)
                 i += 2
                 continue
@@ -10046,17 +10102,17 @@ def append_vm_role_to_talk_affiliation(payload, vm_rows: list[dict]) -> None:
         role = normalize_space(role or "")
 
         if not role:
-            return aff
+            return affiliation  # \n を保持するため元の文字列を返す
         if not aff:
             return role
 
         # 同じ role が既に入っていれば追加しない
         if role in aff:
-            return aff
+            return affiliation  # \n を保持するため元の文字列を返す
 
         # 既に別の役職語が入っているなら、むやみに追加しない
         if any(rw in aff for rw in ROLE_WORDS):
-            return aff
+            return affiliation  # \n を保持するため元の文字列を返す
 
         return f"{aff} {role}".strip()
 
@@ -10223,6 +10279,8 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         if not s:
             return False
         if "講演" in s or "演者" in normalize_key(s) or "座長" in normalize_key(s):
+            return False
+        if re.match(r'^\s*(?:主催|共催)\s*[：:]', s):
             return False
         if looks_like_datetime_text(s):
             return False
@@ -10429,6 +10487,10 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
                 return False
 
             if any(x in s for x in ["講演", "演者", "座長"]):
+                return False
+
+            # 主催・共催行は演題ではない
+            if re.match(r'^\s*(?:主催|共催)\s*[：:]', s):
                 return False
 
             if looks_like_affil_line(s):
@@ -10757,7 +10819,22 @@ def finalize_people_fields(payload: DesignJSON) -> DesignJSON:
         if aff and "座長" in aff:
             t.affiliation = ""
         
+        # 所属に「演題名」が混入している場合の除去
+        # 例: 「大阪大学 ... 助教 「 癌と腸内細菌叢について （仮）」」
+        aff = getattr(t, "affiliation", "") or ""
+        if aff and re.search(r'[「「]', aff):
+            aff_clean = re.sub(r'\s*[「「][^」」]*[」」]?\s*$', '', aff).strip()
+            if aff_clean:
+                t.affiliation = aff_clean
+        
         t.affiliation = strip_outer_parens_suffix(t.affiliation or "")
+        
+        # 演題 title / title_lines から主催・共催行を除去
+        _tl = getattr(t, "title_lines", []) or []
+        _tl_clean = [ln for ln in _tl if not re.match(r'^\s*(?:主催|共催)\s*[：:]', ln)]
+        if _tl_clean and len(_tl_clean) < len(_tl):
+            t.title_lines = _tl_clean
+            t.title = "\n".join(_tl_clean)
 
     return payload
 
