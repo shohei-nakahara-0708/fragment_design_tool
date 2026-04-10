@@ -77,8 +77,8 @@ function StatusPill({ status }) {
     status === "ok"
       ? { bg: "rgba(34,197,94,0.12)", bd: "rgba(34,197,94,0.25)", fg: "#166534", label: "OK" }
       : status === "error"
-      ? { bg: "rgba(239,68,68,0.12)", bd: "rgba(239,68,68,0.25)", fg: "#991b1b", label: "ERROR" }
-      : { bg: "rgba(148,163,184,0.18)", bd: "rgba(148,163,184,0.28)", fg: "#334155", label: "PENDING" };
+        ? { bg: "rgba(239,68,68,0.12)", bd: "rgba(239,68,68,0.25)", fg: "#991b1b", label: "ERROR" }
+        : { bg: "rgba(148,163,184,0.18)", bd: "rgba(148,163,184,0.28)", fg: "#334155", label: "PENDING" };
 
   return (
     <span
@@ -211,7 +211,7 @@ const ui = {
   fileTitle: { fontWeight: 900, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
   fileSub: { marginTop: 4, fontSize: 12, color: "#64748b", lineHeight: 1.4 },
   msgErr: { marginTop: 6, fontSize: 12, color: "#991b1b", whiteSpace: "pre-wrap" },
-   tabs: {
+  tabs: {
     display: "inline-flex",
     gap: 6,
     padding: 6,
@@ -256,60 +256,60 @@ const ui = {
   },
 
   restoreHead: {
-  display: "grid",
-  gridTemplateColumns: "44px 1fr 140px 120px 220px",
-  gap: 10,
-  background: "#f8fafc",
-  borderBottom: "1px solid rgba(226,232,240,0.85)",
-  fontSize: 12,
-  color: "#64748b",
-  padding: "10px 12px",
-  fontWeight: 900,
-},
+    display: "grid",
+    gridTemplateColumns: "44px 1fr 140px 120px 220px",
+    gap: 10,
+    background: "#f8fafc",
+    borderBottom: "1px solid rgba(226,232,240,0.85)",
+    fontSize: 12,
+    color: "#64748b",
+    padding: "10px 12px",
+    fontWeight: 900,
+  },
 
-restoreRow: (tone) => ({
-  display: "grid",
-  gridTemplateColumns: "44px 1fr 140px 120px 220px",
-  gap: 10,
-  alignItems: "center",
-  padding: "12px 12px",
-  borderTop: "1px solid rgba(226,232,240,0.75)",
-  background:
-    tone === "error"
-      ? "rgba(239,68,68,0.04)"
-      : tone === "ok"
-      ? "rgba(34,197,94,0.04)"
-      : "#fff",
-  transition: "background .15s ease",
+  restoreRow: (tone) => ({
+    display: "grid",
+    gridTemplateColumns: "44px 1fr 140px 120px 220px",
+    gap: 10,
+    alignItems: "center",
+    padding: "12px 12px",
+    borderTop: "1px solid rgba(226,232,240,0.75)",
+    background:
+      tone === "error"
+        ? "rgba(239,68,68,0.04)"
+        : tone === "ok"
+          ? "rgba(34,197,94,0.04)"
+          : "#fff",
+    transition: "background .15s ease",
   }),
 
   codeChip: {
-  display: "inline-block",
-  padding: "3px 8px",
-  borderRadius: 999,
-  border: "1px solid rgba(226,232,240,0.95)",
-  background: "rgba(248,250,252,0.9)",
-  fontSize: 12,
-  fontWeight: 900,
-  color: "#0f172a",
+    display: "inline-block",
+    padding: "3px 8px",
+    borderRadius: 999,
+    border: "1px solid rgba(226,232,240,0.95)",
+    background: "rgba(248,250,252,0.9)",
+    fontSize: 12,
+    fontWeight: 900,
+    color: "#0f172a",
   },
-  
+
   dropRestore: (dragOver) => ({
-  border: "2px dashed " + (dragOver ? "rgba(37,99,235,0.7)" : "rgba(148,163,184,0.55)"),
-  borderRadius: 16,
-  padding: 18,
-  background: dragOver ? "rgba(37,99,235,0.06)" : "rgba(248,250,252,0.75)",
-  transition: "all .15s ease",
+    border: "2px dashed " + (dragOver ? "rgba(37,99,235,0.7)" : "rgba(148,163,184,0.55)"),
+    borderRadius: 16,
+    padding: 18,
+    background: dragOver ? "rgba(37,99,235,0.06)" : "rgba(248,250,252,0.75)",
+    transition: "all .15s ease",
   }),
-  
+
   progressCard: {
-  marginTop: 10,
-  background: "#fff",
-  border: "1px solid rgba(226,232,240,0.95)",
-  borderRadius: 12,
-  padding: 12,
-  boxShadow: "0 6px 16px rgba(2,6,23,0.04)",
-},
+    marginTop: 10,
+    background: "#fff",
+    border: "1px solid rgba(226,232,240,0.95)",
+    borderRadius: 12,
+    padding: 12,
+    boxShadow: "0 6px 16px rgba(2,6,23,0.04)",
+  },
 };
 
 export default function UploadPage() {
@@ -325,14 +325,157 @@ export default function UploadPage() {
 
   const inputRef = useRef(null);
 
-const [tab, setTab] = useState("upload"); // "upload" | "restore"
-const [restoring, setRestoring] = useState(false);
-const [restoreError, setRestoreError] = useState("");
-const restoreInputRef = useRef(null);
+  const [tab, setTab] = useState("upload"); // "upload" | "simple" | "restore"
+  const [restoring, setRestoring] = useState(false);
+  const [restoreError, setRestoreError] = useState("");
+  const restoreInputRef = useRef(null);
 
-const [restoreFiles, setRestoreFiles] = useState([]); // File[]
+  const [restoreFiles, setRestoreFiles] = useState([]); // File[]
   const [restoreRows, setRestoreRows] = useState([]);   // 結果の配列
   const [restoreDragOver, setRestoreDragOver] = useState(false);
+
+  // ---- simple upload (no spreadsheet) ----
+  const REGION_OPTIONS = [
+    { value: "", label: "-- 領域を選択 --" },
+    { value: "VP", label: "VP" },
+    { value: "PH", label: "PH" },
+    { value: "ONC", label: "ONC" },
+  ];
+  const [simpleRows, setSimpleRows] = useState([]);
+  const [simpleDragOver, setSimpleDragOver] = useState(false);
+  const [simpleUploading, setSimpleUploading] = useState(false);
+  const [simpleProgress, setSimpleProgress] = useState("");
+  const [simpleError, setSimpleError] = useState("");
+  const simpleInputRef = useRef(null);
+
+  const addSimpleFiles = (fileList) => {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    const next = files
+      .filter((f) => /\.pptx$/i.test(f.name) || /\.pdf$/i.test(f.name))
+      .map((file) => ({
+        id: crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        file,
+        filename: file.name,
+        size: file.size,
+        region: "",
+        unit: "",
+        status: "pending",
+        message: "",
+      }));
+    if (next.length !== files.length) setSimpleError("※ .pptx / .pdf 以外は無視しました");
+    else setSimpleError("");
+    setSimpleRows((prev) => [...prev, ...next]);
+    if (simpleInputRef.current) simpleInputRef.current.value = "";
+  };
+
+  const removeSimpleRow = (id) => {
+    if (simpleUploading) return;
+    setSimpleRows((prev) => prev.filter((r) => r.id !== id));
+  };
+
+  const clearSimpleAll = () => {
+    if (simpleUploading) return;
+    setSimpleRows([]);
+    setSimpleError("");
+  };
+
+  const setSimpleField = (id, field, value) => {
+    setSimpleRows((prev) =>
+      prev.map((r) => (r.id === id ? { ...r, [field]: value, status: r.status === "error" ? "pending" : r.status } : r))
+    );
+  };
+
+  const simpleValidate = useMemo(() => {
+    if (!simpleRows.length) return { ok: false, msg: "ファイルを追加してください" };
+    const noRegion = simpleRows.filter((r) => !r.region);
+    if (noRegion.length) return { ok: false, msg: `領域が未選択のファイルが ${noRegion.length} 件あります` };
+    return { ok: true, msg: "" };
+  }, [simpleRows]);
+
+  const simpleProgressPercent = useMemo(() => {
+    if (!simpleRows.length) return 0;
+    const done = simpleRows.filter((r) => r.status === "ok" || r.status === "error").length;
+    return Math.round((done / simpleRows.length) * 100);
+  }, [simpleRows]);
+
+  const uploadSimpleBatch = async () => {
+    setSimpleError("");
+    if (!simpleValidate.ok) { setSimpleError(simpleValidate.msg); return; }
+    if (simpleUploading) return;
+
+    setSimpleUploading(true);
+    setSimpleProgress("準備中…");
+
+    try {
+      setSimpleRows((prev) => prev.map((r) => ({ ...r, status: "pending", message: "" })));
+
+      const fd = new FormData();
+      simpleRows.forEach((r) => fd.append("files", r.file, r.filename));
+      simpleRows.forEach((r) => fd.append("regions", r.region));
+      simpleRows.forEach((r) => fd.append("units", r.unit || ""));
+
+      const API_BASE = import.meta.env.VITE_API_BASE || "";
+      const r = await fetch(`${API_BASE}/upload/simple/stream`, { method: "POST", body: fd });
+      if (!r.ok || !r.body) throw new Error(await r.text());
+
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buf = "";
+      let total = simpleRows.length;
+      let doneCount = 0;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const parsed = parseSseChunk(buf);
+        buf = parsed.rest;
+
+        for (const ev of parsed.events) {
+          if (ev.event === "start") {
+            total = ev.data.total ?? total;
+            setSimpleProgress(`開始（${total}件）`);
+          }
+          if (ev.event === "phase") {
+            setSimpleProgress(ev.data.message || ev.data.phase || "処理中…");
+          }
+          if (ev.event === "item_start") {
+            const i = ev.data.index;
+            setSimpleRows((prev) => {
+              const out = [...prev];
+              if (out[i]) out[i] = { ...out[i], status: "pending", message: "" };
+              return out;
+            });
+          }
+          if (ev.event === "item_done") {
+            const i = ev.data.index;
+            doneCount += 1;
+            setSimpleRows((prev) => {
+              const out = [...prev];
+              if (!out[i]) return out;
+              out[i] = {
+                ...out[i],
+                status: ev.data.ok ? "ok" : "error",
+                jobId: ev.data.jobId || out[i].jobId || "",
+                message: ev.data.ok ? "" : humanizeError(ev.data.error || ev.data.message),
+              };
+              return out;
+            });
+            setSimpleProgress(`処理中… ${doneCount}/${total}`);
+          }
+          if (ev.event === "fatal") throw new Error(ev.data?.message || "server fatal");
+          if (ev.event === "done") setSimpleProgress("完了");
+        }
+      }
+    } catch (e) {
+      console.error(e);
+      setSimpleError(String(e?.message || e));
+      setSimpleProgress("");
+    } finally {
+      setSimpleUploading(false);
+    }
+  };
 
   useEffect(() => {
     const handler = (e) => {
@@ -369,24 +512,24 @@ const [restoreFiles, setRestoreFiles] = useState([]); // File[]
   };
 
   const addRestoreFiles = (fileList) => {
-  const files = Array.from(fileList || []);
-  if (!files.length) return;
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
 
-  const jsons = files.filter((f) => /\.json$/i.test(f.name));
-  if (jsons.length !== files.length) {
-    setRestoreError("※ .json 以外は無視しました");
-  } else {
-    setRestoreError("");
-  }
+    const jsons = files.filter((f) => /\.json$/i.test(f.name));
+    if (jsons.length !== files.length) {
+      setRestoreError("※ .json 以外は無視しました");
+    } else {
+      setRestoreError("");
+    }
 
-  setRestoreFiles((prev) => {
-    const mp = new Map(prev.map((f) => [f.name + ":" + f.size, f]));
-    for (const f of jsons) mp.set(f.name + ":" + f.size, f); // 同名同サイズは重複排除
-    return Array.from(mp.values());
-  });
+    setRestoreFiles((prev) => {
+      const mp = new Map(prev.map((f) => [f.name + ":" + f.size, f]));
+      for (const f of jsons) mp.set(f.name + ":" + f.size, f); // 同名同サイズは重複排除
+      return Array.from(mp.values());
+    });
 
-  if (restoreInputRef.current) restoreInputRef.current.value = "";
-};
+    if (restoreInputRef.current) restoreInputRef.current.value = "";
+  };
 
   const removeRow = (id) => {
     if (uploading) return;
@@ -418,172 +561,172 @@ const [restoreFiles, setRestoreFiles] = useState([]); // File[]
     addFiles(e.dataTransfer.files);
   };
 
- const uploadBatch = async () => {
-  setGlobalError("");
-  if (!validate.ok) {
-    setGlobalError(validate.msg);
-    return;
-  }
-   if (uploading) return;
-   
+  const uploadBatch = async () => {
+    setGlobalError("");
+    if (!validate.ok) {
+      setGlobalError(validate.msg);
+      return;
+    }
+    if (uploading) return;
 
 
 
-  setUploading(true);
-  setProgressText("準備中…");
 
-  try {
-    setRows((prev) => prev.map((r) => ({ ...r, status: "pending", message: "" })));
+    setUploading(true);
+    setProgressText("準備中…");
 
-    const fd = new FormData();
-    // fd.append("sessionId", sessionId); // サーバで受けるなら追加してOK
-    rows.forEach((r) => fd.append("files", r.file, r.filename));
-    rows.forEach((r) => fd.append("eventIds", normalizeEventId(r.eventId)));
+    try {
+      setRows((prev) => prev.map((r) => ({ ...r, status: "pending", message: "" })));
 
-    const API_BASE = import.meta.env.VITE_API_BASE || "";
+      const fd = new FormData();
+      // fd.append("sessionId", sessionId); // サーバで受けるなら追加してOK
+      rows.forEach((r) => fd.append("files", r.file, r.filename));
+      rows.forEach((r) => fd.append("eventIds", normalizeEventId(r.eventId)));
+
+      const API_BASE = import.meta.env.VITE_API_BASE || "";
 
 
 
-    const r = await fetch(`${API_BASE}/upload/batch/stream`, { method: "POST", body: fd });
-    if (!r.ok || !r.body) throw new Error(await r.text());
+      const r = await fetch(`${API_BASE}/upload/batch/stream`, { method: "POST", body: fd });
+      if (!r.ok || !r.body) throw new Error(await r.text());
 
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    let buf = "";
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buf = "";
 
-    let total = rows.length;
-    let doneCount = 0;
-    let returnedSessionId = null;
+      let total = rows.length;
+      let doneCount = 0;
+      let returnedSessionId = null;
 
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
 
-      buf += decoder.decode(value, { stream: true });
-      const parsed = parseSseChunk(buf);
-      buf = parsed.rest;
+        buf += decoder.decode(value, { stream: true });
+        const parsed = parseSseChunk(buf);
+        buf = parsed.rest;
 
-      for (const ev of parsed.events) {
-        if (ev.event === "start") {
-          total = ev.data.total ?? total;
-          returnedSessionId = ev.data.sessionId ?? returnedSessionId;
-          setProgressText(`開始（${total}件）`);
-        }
+        for (const ev of parsed.events) {
+          if (ev.event === "start") {
+            total = ev.data.total ?? total;
+            returnedSessionId = ev.data.sessionId ?? returnedSessionId;
+            setProgressText(`開始（${total}件）`);
+          }
 
-        if (ev.event === "phase") {
-          setProgressText(ev.data.message || ev.data.phase || "処理中…");
-        }
+          if (ev.event === "phase") {
+            setProgressText(ev.data.message || ev.data.phase || "処理中…");
+          }
 
-        if (ev.event === "item_start") {
-          const i = ev.data.index;
-          // 行の表示を「処理中」に寄せたいなら message に入れる
-          setRows((prev) => {
-            const out = [...prev];
-            if (out[i]) out[i] = { ...out[i], status: "pending", message: "" };
-            return out;
-          });
-        }
+          if (ev.event === "item_start") {
+            const i = ev.data.index;
+            // 行の表示を「処理中」に寄せたいなら message に入れる
+            setRows((prev) => {
+              const out = [...prev];
+              if (out[i]) out[i] = { ...out[i], status: "pending", message: "" };
+              return out;
+            });
+          }
 
-        if (ev.event === "item_done") {
-          const i = ev.data.index;
-          doneCount += 1;
+          if (ev.event === "item_done") {
+            const i = ev.data.index;
+            doneCount += 1;
 
-          setRows((prev) => {
-            const out = [...prev];
-            if (!out[i]) return out;
-            out[i] = {
-              ...out[i],
-              status: ev.data.ok ? "ok" : "error",
-              jobId: ev.data.jobId || out[i].jobId || "",
-              message: ev.data.ok ? "" : humanizeError(ev.data.error || ev.data.message),
-            };
-            return out;
-          });
+            setRows((prev) => {
+              const out = [...prev];
+              if (!out[i]) return out;
+              out[i] = {
+                ...out[i],
+                status: ev.data.ok ? "ok" : "error",
+                jobId: ev.data.jobId || out[i].jobId || "",
+                message: ev.data.ok ? "" : humanizeError(ev.data.error || ev.data.message),
+              };
+              return out;
+            });
 
-          setProgressText(`処理中… ${doneCount}/${total}`);
-        }
+            setProgressText(`処理中… ${doneCount}/${total}`);
+          }
 
-        if (ev.event === "fatal") {
-          throw new Error(ev.data?.message || "server fatal");
-        }
+          if (ev.event === "fatal") {
+            throw new Error(ev.data?.message || "server fatal");
+          }
 
-        if (ev.event === "done") {
-          returnedSessionId = ev.data.sessionId ?? returnedSessionId;
-          setProgressText("完了");
-          // 少し待って一覧へ
-          // setTimeout(() => {
-          //   nav(`/jobs?session=${encodeURIComponent(returnedSessionId || "")}`);
-          // }, 250);
+          if (ev.event === "done") {
+            returnedSessionId = ev.data.sessionId ?? returnedSessionId;
+            setProgressText("完了");
+            // 少し待って一覧へ
+            // setTimeout(() => {
+            //   nav(`/jobs?session=${encodeURIComponent(returnedSessionId || "")}`);
+            // }, 250);
+          }
         }
       }
+    } catch (e) {
+      console.error(e);
+      setGlobalError(String(e?.message || e));
+      setProgressText("");
+    } finally {
+      setUploading(false);
     }
-  } catch (e) {
-    console.error(e);
-    setGlobalError(String(e?.message || e));
-    setProgressText("");
-  } finally {
-    setUploading(false);
-  }
- };
-  
-  
-const restoreBatchFromJson = async () => {
-  setRestoreError("");
-  setRestoreRows([]);
-  if (!restoreFiles.length) return;
-  if (uploading || restoring) return;
+  };
 
-  let returnedSessionId = null;
 
-  setRestoring(true);
-  try {
-    const API_BASE = import.meta.env.VITE_API_BASE || "";
-    const fd = new FormData();
-    restoreFiles.forEach((f) => fd.append("files", f, f.name));
+  const restoreBatchFromJson = async () => {
+    setRestoreError("");
+    setRestoreRows([]);
+    if (!restoreFiles.length) return;
+    if (uploading || restoring) return;
 
-    const r = await fetch(`${API_BASE}/jobs/restore/batch`, { method: "POST", body: fd });
-    if (!r.ok) {
-      const t = await r.text().catch(() => "");
-      throw new Error(`restore failed: ${r.status}\n${t}`);
+    let returnedSessionId = null;
+
+    setRestoring(true);
+    try {
+      const API_BASE = import.meta.env.VITE_API_BASE || "";
+      const fd = new FormData();
+      restoreFiles.forEach((f) => fd.append("files", f, f.name));
+
+      const r = await fetch(`${API_BASE}/jobs/restore/batch`, { method: "POST", body: fd });
+      if (!r.ok) {
+        const t = await r.text().catch(() => "");
+        throw new Error(`restore failed: ${r.status}\n${t}`);
+      }
+      const data = await r.json();
+      setRestoreRows(data.results || []);
+
+      returnedSessionId = data.sessionId ?? returnedSessionId;
+      // setTimeout(() => {
+      //         nav(`/jobs?session=${encodeURIComponent(returnedSessionId || "")}`);
+      // }, 250);
+
+    } catch (e) {
+      setRestoreError(String(e?.message || e));
+    } finally {
+      setRestoring(false);
     }
-    const data = await r.json();
-    setRestoreRows(data.results || []);
+  };
 
-    returnedSessionId = data.sessionId ?? returnedSessionId;
-    // setTimeout(() => {
-    //         nav(`/jobs?session=${encodeURIComponent(returnedSessionId || "")}`);
-    // }, 250);
-    
-  } catch (e) {
-    setRestoreError(String(e?.message || e));
-  } finally {
-    setRestoring(false);
-  }
-};
-  
   const restoreItems = useMemo(() => {
-  // filename -> result
-  const mp = new Map((restoreRows || []).map((r) => [String(r.filename || ""), r]));
-  return (restoreFiles || []).map((f) => {
-    const r = mp.get(String(f.name)) || null;
-    const status = r ? (r.ok ? "ok" : "error") : (restoring ? "pending" : "pending");
-    return {
-      key: f.name + ":" + f.size,
-      file: f,
-      filename: f.name,
-      size: f.size,
-      status,
-      result: r, // {ok, jobId, eventId, previewUrl, error, ...} or null
-    };
-  });
-}, [restoreFiles, restoreRows, restoring]);
+    // filename -> result
+    const mp = new Map((restoreRows || []).map((r) => [String(r.filename || ""), r]));
+    return (restoreFiles || []).map((f) => {
+      const r = mp.get(String(f.name)) || null;
+      const status = r ? (r.ok ? "ok" : "error") : (restoring ? "pending" : "pending");
+      return {
+        key: f.name + ":" + f.size,
+        file: f,
+        filename: f.name,
+        size: f.size,
+        status,
+        result: r, // {ok, jobId, eventId, previewUrl, error, ...} or null
+      };
+    });
+  }, [restoreFiles, restoreRows, restoring]);
 
 
-const progress = useMemo(() => {
-  if (!rows.length) return 0;
-  const done = rows.filter((r) => r.status === "ok" || r.status === "error").length;
-  return Math.round((done / rows.length) * 100);
-}, [rows]);
+  const progress = useMemo(() => {
+    if (!rows.length) return 0;
+    const done = rows.filter((r) => r.status === "ok" || r.status === "error").length;
+    return Math.round((done / rows.length) * 100);
+  }, [rows]);
 
   const hasFiles = rows.length > 0;
 
@@ -591,420 +734,608 @@ const progress = useMemo(() => {
     <div style={ui.page}>
       <div style={ui.container}>
         {/* Header */}
-    <div style={ui.header}>
-  {/* Left */}
-  <div style={ui.headerLeft}>
+        <div style={ui.header}>
+          {/* Left */}
+          <div style={ui.headerLeft}>
             <div style={ui.headerTitleBlock}>
-              <div style={{marginBottom:5}}>
-                              <Link to="/" style={{ textDecoration: "none" }}>
-                                ← 一覧へ
-                              </Link>
-                            </div>
-      <h1 style={ui.h1}>Upload</h1>
-      <div style={ui.sub}>
-        {tab === "upload"
-          ? "複数PPTX / PDFをまとめてアップロード → event_id を付与 → 生成"
-          : "backup用json（複数可）をアップロード → 復元して再生成"}
-      </div>
-    </div>
+              <div style={{ marginBottom: 5 }}>
+                <Link to="/" style={{ textDecoration: "none" }}>
+                  ← 一覧へ
+                </Link>
+              </div>
+              <h1 style={ui.h1}>Upload</h1>
+              <div style={ui.sub}>
+                {tab === "upload"
+                  ? "複数PPTX / PDFをまとめてアップロード → event_id を付与 → 生成"
+                  : tab === "simple"
+                    ? "スプレッドシート不要。領域を選択してアップロード → AI解析のみで生成"
+                    : "backup用json（複数可）をアップロード → 復元して再生成"}
+              </div>
+            </div>
 
-  
-  </div>
 
-  {/* Right */}
+          </div>
+
+          {/* Right */}
           <div style={ui.headerRight}>
-            
-            
 
-            
-              <div style={ui.tabs}>
-      <button
-        style={ui.tabBtn(tab === "upload")}
-        onClick={() => setTab("upload")}
-        disabled={uploading || restoring}
-      >
-        アップロード
-      </button>
-      <button
-        style={ui.tabBtn(tab === "restore")}
-        onClick={() => setTab("restore")}
-        disabled={uploading || restoring}
-      >
-        JSONから復元
-      </button>
-    </div>
 
-    {tab === "upload" ? (
-      <>
-        <button style={ui.btnDanger} onClick={clearAll} disabled={!hasFiles || uploading}>
-          全削除
-        </button>
-        <button style={ui.btnPrimary} onClick={uploadBatch} disabled={!hasFiles || uploading || !validate.ok}>
-          {uploading ? "アップロード中…" : "アップロードして生成"}
-        </button>
-      </>
-    ) : (
-      <>
-        <button
-          style={ui.btnDanger}
-          onClick={() => {
-            if (restoring || uploading) return;
-            setRestoreFiles([]);
-            setRestoreRows([]);
-            setRestoreError("");
-            if (restoreInputRef.current) restoreInputRef.current.value = "";
-          }}
-          disabled={restoring || uploading}
-        >
-          全削除
-        </button>
-        <button
-          style={ui.btnPrimary}
-          onClick={restoreBatchFromJson}
-          disabled={!restoreFiles.length || restoring || uploading}
-        >
-          {restoring ? "復元中…" : "復元して再生成"}
-        </button>
-      </>
-    )}
-  </div>
-</div>
 
-         {tab === "upload" && (
-          <>
-       
 
-        {/* Dropzone card */}
-        <div style={ui.card}>
-          <div style={ui.cardInner}>
-            <div
-              onDragOver={(e) => {
-                e.preventDefault();
-                setDragOver(true);
-              }}
-              onDragLeave={() => setDragOver(false)}
-              onDrop={onDrop}
-              style={ui.drop(dragOver)}
-            >
-              <div style={ui.row}>
-                <div style={{ fontWeight: 950 }}>
-                  ここに <span style={{ color: "#2563eb" }}>.pptx / .pdf</span> をドロップ
-                </div>
-                <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                  <input
-                    ref={inputRef}
-                    type="file"
-                    multiple
-                    accept=".pptx,.pdf"
-                    disabled={uploading}
-                    style={{display: "none"}}
-                    onChange={(e) => addFiles(e.target.files)}
-                  />
-                  <button style={ui.btnGhost} onClick={() => inputRef.current?.click?.()} disabled={uploading}>
-                    ファイル選択
-                  </button>
-                </div>
-              </div>
-
-              <div style={ui.hint}>
-                セッションID: <code>{sessionId.slice(0, 8)}…</code>（同時アップロードをまとめて表示する用）
-              </div>
+            <div style={ui.tabs}>
+              <button
+                style={ui.tabBtn(tab === "upload")}
+                onClick={() => setTab("upload")}
+                disabled={uploading || restoring || simpleUploading}
+              >
+                アップロード
+              </button>
+              <button
+                style={ui.tabBtn(tab === "simple")}
+                onClick={() => setTab("simple")}
+                disabled={uploading || restoring || simpleUploading}
+              >
+                簡易アップロード
+              </button>
+              <button
+                style={ui.tabBtn(tab === "restore")}
+                onClick={() => setTab("restore")}
+                disabled={uploading || restoring || simpleUploading}
+              >
+                JSONから復元
+              </button>
             </div>
 
-{uploading && (
-  <div style={ui.progressCard}>
-    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#475569", fontWeight: 900 }}>
-      <span>⏳ {progressText || "処理中…"}</span>
-      <span>{progress}%</span>
-    </div>
-    <div style={{ marginTop: 8, height: 10, background: "rgba(226,232,240,0.9)", borderRadius: 999, overflow: "hidden" }}>
-      <div style={{ width: `${progress}%`, height: "100%", background: "#2563eb", transition: "width 200ms ease" }} />
-    </div>
-  </div>
-)}
-
-            {!!globalError && <div style={ui.alertErr}>{globalError}</div>}
+            {tab === "upload" ? (
+              <>
+                <button style={ui.btnDanger} onClick={clearAll} disabled={!hasFiles || uploading}>
+                  全削除
+                </button>
+                <button style={ui.btnPrimary} onClick={uploadBatch} disabled={!hasFiles || uploading || !validate.ok}>
+                  {uploading ? "アップロード中…" : "アップロードして生成"}
+                </button>
+              </>
+            ) : tab === "simple" ? (
+              <>
+                <button style={ui.btnDanger} onClick={clearSimpleAll} disabled={!simpleRows.length || simpleUploading}>
+                  全削除
+                </button>
+                <button style={ui.btnPrimary} onClick={uploadSimpleBatch} disabled={!simpleRows.length || simpleUploading || !simpleValidate.ok}>
+                  {simpleUploading ? "アップロード中…" : "アップロードして生成"}
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  style={ui.btnDanger}
+                  onClick={() => {
+                    if (restoring || uploading) return;
+                    setRestoreFiles([]);
+                    setRestoreRows([]);
+                    setRestoreError("");
+                    if (restoreInputRef.current) restoreInputRef.current.value = "";
+                  }}
+                  disabled={restoring || uploading}
+                >
+                  全削除
+                </button>
+                <button
+                  style={ui.btnPrimary}
+                  onClick={restoreBatchFromJson}
+                  disabled={!restoreFiles.length || restoring || uploading}
+                >
+                  {restoring ? "復元中…" : "復元して再生成"}
+                </button>
+              </>
+            )}
           </div>
         </div>
 
-        {/* List header */}
-        <div style={ui.listHead}>
-          <div style={ui.listMeta}>
-            {rows.length} 件（event_id は必須）
-            {!validate.ok && rows.length > 0 ? (
-              <span style={{ marginLeft: 10, color: "#991b1b", fontWeight: 900 }}>※ {validate.msg}</span>
-            ) : null}
-          </div>
+        {tab === "upload" && (
+          <>
 
-          <div style={{ display: "flex", gap: 10 }}>
-            <button style={ui.btnGhost} onClick={clearAll} disabled={!hasFiles || uploading}>
-              クリア
-            </button>
-          </div>
-        </div>
 
-        {/* List card */}
-        <div style={{ ...ui.card, marginTop: 10 }}>
-          {/* header row */}
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "44px 1fr 240px 120px 120px 86px",
-              gap: 10,
-              background: "#f8fafc",
-              borderBottom: "1px solid rgba(226,232,240,0.85)",
-              fontSize: 12,
-              color: "#64748b",
-              padding: "10px 12px",
-              fontWeight: 900,
-            }}
-          >
-            <div>#</div>
-            <div>ファイル</div>
-            <div>講演会ID</div>
-            <div>サイズ</div>
-            <div>状態</div>
-            <div></div>
-          </div>
-
-          {rows.map((r, idx) => {
-            const invalid = !normalizeEventId(r.eventId);
-            return (
-              <div key={r.id} style={ui.item(r.status)}>
-                <div style={{ color: "#64748b", fontWeight: 900 }}>{idx + 1}</div>
-
-                <div style={{ minWidth: 0 }}>
-                  <div style={ui.fileTitle}>{r.filename}</div>
-                  {(r.jobId || r.previewUrl) && (
-                    <div style={ui.fileSub}>
-                      {r.jobId ? (
-                        <>
-                          jobId: <code>{String(r.jobId).slice(0, 8)}…</code>
-                        </>
-                      ) : null}
-                      {r.previewUrl ? (
-                        <>
-                          {" "}
-                          ・{" "}
-                          <a href={r.previewUrl} target="_blank" rel="noreferrer">
-                            preview
-                          </a>
-                        </>
-                      ) : null}
+            {/* Dropzone card */}
+            <div style={ui.card}>
+              <div style={ui.cardInner}>
+                <div
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setDragOver(true);
+                  }}
+                  onDragLeave={() => setDragOver(false)}
+                  onDrop={onDrop}
+                  style={ui.drop(dragOver)}
+                >
+                  <div style={ui.row}>
+                    <div style={{ fontWeight: 950 }}>
+                      ここに <span style={{ color: "#2563eb" }}>.pptx / .pdf</span> をドロップ
                     </div>
-                  )}
-                  {r.message ? <div style={ui.msgErr}>{r.message}</div> : null}
+                    <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                      <input
+                        ref={inputRef}
+                        type="file"
+                        multiple
+                        accept=".pptx,.pdf"
+                        disabled={uploading}
+                        style={{ display: "none" }}
+                        onChange={(e) => addFiles(e.target.files)}
+                      />
+                      <button style={ui.btnGhost} onClick={() => inputRef.current?.click?.()} disabled={uploading}>
+                        ファイル選択
+                      </button>
+                    </div>
+                  </div>
+
+                  <div style={ui.hint}>
+                    セッションID: <code>{sessionId.slice(0, 8)}…</code>（同時アップロードをまとめて表示する用）
+                  </div>
                 </div>
 
-                <div>
-                  <input
-                    value={r.eventId}
-                    disabled={uploading || r.status === "ok"}
-                    onChange={(e) => setEventId(r.id, e.target.value)}
-                    placeholder="例: EM0000-00000000"
-                    style={ui.input(invalid, uploading)}
-                  />
-                </div>
+                {uploading && (
+                  <div style={ui.progressCard}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#475569", fontWeight: 900 }}>
+                      <span>⏳ {progressText || "処理中…"}</span>
+                      <span>{progress}%</span>
+                    </div>
+                    <div style={{ marginTop: 8, height: 10, background: "rgba(226,232,240,0.9)", borderRadius: 999, overflow: "hidden" }}>
+                      <div style={{ width: `${progress}%`, height: "100%", background: "#2563eb", transition: "width 200ms ease" }} />
+                    </div>
+                  </div>
+                )}
 
-                <div style={{ color: "#64748b", fontSize: 12, fontWeight: 900 }}>{fmtSize(r.size)}</div>
-
-                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <StatusPill status={r.status} />
-                </div>
-
-                <div style={{ display: "flex", justifyContent: "flex-end" }}>
-                  <button style={ui.btnGhost} onClick={() => removeRow(r.id)} disabled={uploading}>
-                    削除
-                  </button>
-                </div>
+                {!!globalError && <div style={ui.alertErr}>{globalError}</div>}
               </div>
-            );
-          })}
-
-          {!rows.length && (
-            <div style={{ padding: 16, color: "#64748b", fontSize: 13 }}>
-              まだファイルがありません。上の領域に .pptx / .pdf をドロップするか、ファイル選択してください。
             </div>
-          )}
-        </div>
 
-        {/* footer tips */}
+            {/* List header */}
+            <div style={ui.listHead}>
+              <div style={ui.listMeta}>
+                {rows.length} 件（event_id は必須）
+                {!validate.ok && rows.length > 0 ? (
+                  <span style={{ marginLeft: 10, color: "#991b1b", fontWeight: 900 }}>※ {validate.msg}</span>
+                ) : null}
+              </div>
+
+              <div style={{ display: "flex", gap: 10 }}>
+                <button style={ui.btnGhost} onClick={clearAll} disabled={!hasFiles || uploading}>
+                  クリア
+                </button>
+              </div>
+            </div>
+
+            {/* List card */}
+            <div style={{ ...ui.card, marginTop: 10 }}>
+              {/* header row */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "44px 1fr 240px 120px 120px 86px",
+                  gap: 10,
+                  background: "#f8fafc",
+                  borderBottom: "1px solid rgba(226,232,240,0.85)",
+                  fontSize: 12,
+                  color: "#64748b",
+                  padding: "10px 12px",
+                  fontWeight: 900,
+                }}
+              >
+                <div>#</div>
+                <div>ファイル</div>
+                <div>講演会ID</div>
+                <div>サイズ</div>
+                <div>状態</div>
+                <div></div>
+              </div>
+
+              {rows.map((r, idx) => {
+                const invalid = !normalizeEventId(r.eventId);
+                return (
+                  <div key={r.id} style={ui.item(r.status)}>
+                    <div style={{ color: "#64748b", fontWeight: 900 }}>{idx + 1}</div>
+
+                    <div style={{ minWidth: 0 }}>
+                      <div style={ui.fileTitle}>{r.filename}</div>
+                      {(r.jobId || r.previewUrl) && (
+                        <div style={ui.fileSub}>
+                          {r.jobId ? (
+                            <>
+                              jobId: <code>{String(r.jobId).slice(0, 8)}…</code>
+                            </>
+                          ) : null}
+                          {r.previewUrl ? (
+                            <>
+                              {" "}
+                              ・{" "}
+                              <a href={r.previewUrl} target="_blank" rel="noreferrer">
+                                preview
+                              </a>
+                            </>
+                          ) : null}
+                        </div>
+                      )}
+                      {r.message ? <div style={ui.msgErr}>{r.message}</div> : null}
+                    </div>
+
+                    <div>
+                      <input
+                        value={r.eventId}
+                        disabled={uploading || r.status === "ok"}
+                        onChange={(e) => setEventId(r.id, e.target.value)}
+                        placeholder="例: EM0000-00000000"
+                        style={ui.input(invalid, uploading)}
+                      />
+                    </div>
+
+                    <div style={{ color: "#64748b", fontSize: 12, fontWeight: 900 }}>{fmtSize(r.size)}</div>
+
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <StatusPill status={r.status} />
+                    </div>
+
+                    <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                      <button style={ui.btnGhost} onClick={() => removeRow(r.id)} disabled={uploading}>
+                        削除
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+
+              {!rows.length && (
+                <div style={{ padding: 16, color: "#64748b", fontSize: 13 }}>
+                  まだファイルがありません。上の領域に .pptx / .pdf をドロップするか、ファイル選択してください。
+                </div>
+              )}
+            </div>
+
+            {/* footer tips */}
             <div style={{ marginTop: 10, fontSize: 12, color: "#64748b", lineHeight: 1.6 }}>
-              ※スプレッドシートの読み込みには時間がかかることがあります。しばらく待っても反応がない場合は、ページをリロードして再度お試しください。<br/>
-              ※本ツールはAIによる自動解析を行っています。<br/>
-・PPTX → PDF の順で解析精度が低下する可能性があります。<br/>
-・画像化されたPDFや、他形式から変換されたPPTXファイルなどテキストデータが破損している場合、精度が著しく低下することがあります。<br/>
-生成結果の正確性は保証されません。<br/> 
-必ず内容を確認・編集のうえ出力してください。
-        </div>
-        </>
-        )}
-        
-        {tab === "restore" && (
-  <div style={{ marginTop: 12 }}>
-   <div style={ui.card}>
-  <div style={ui.cardInner}>
-    <div
-      onDragOver={(e) => {
-        e.preventDefault();
-        setRestoreDragOver(true);
-      }}
-      onDragLeave={() => setRestoreDragOver(false)}
-      onDrop={(e) => {
-        e.preventDefault();
-        setRestoreDragOver(false);
-        addRestoreFiles(e.dataTransfer.files);
-      }}
-      style={ui.drop(restoreDragOver)}
-    >
-      <div style={ui.row}>
-        <div style={{ fontWeight: 950 }}>
-          ここに <span style={{ color: "#2563eb" }}>.json</span> をドロップ
-        </div>
-
-        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          <input
-            ref={restoreInputRef}
-            type="file"
-            multiple
-            accept="application/json,.json"
-            disabled={restoring || uploading}
-            style={{ display: "none" }}
-            onChange={(e) => addRestoreFiles(e.target.files)}
-          />
-          <button
-            style={ui.btnGhost}
-            onClick={() => restoreInputRef.current?.click?.()}
-            disabled={restoring || uploading}
-          >
-            JSON選択
-          </button>
-
-          
-
-
-        </div>
-      </div>
-
-      <div style={ui.hint}>
-        選択中: <b>{restoreFiles.length}</b> 件
-        {restoreFiles.length ? (
-          <>
-            {" "}
-            ・例: <code>{restoreFiles[0].name}</code>
+              ※スプレッドシートの読み込みには時間がかかることがあります。しばらく待っても反応がない場合は、ページをリロードして再度お試しください。<br />
+              ※本ツールはAIによる自動解析を行っています。<br />
+              ・PPTX → PDF の順で解析精度が低下する可能性があります。<br />
+              ・画像化されたPDFや、他形式から変換されたPPTXファイルなどテキストデータが破損している場合、精度が著しく低下することがあります。<br />
+              生成結果の正確性は保証されません。<br />
+              必ず内容を確認・編集のうえ出力してください。
+            </div>
           </>
-        ) : null}
-      </div>
-    </div>
+        )}
+
+        {tab === "simple" && (
+          <>
+            {/* Dropzone card */}
+            <div style={ui.card}>
+              <div style={ui.cardInner}>
+                <div
+                  onDragOver={(e) => { e.preventDefault(); setSimpleDragOver(true); }}
+                  onDragLeave={() => setSimpleDragOver(false)}
+                  onDrop={(e) => { e.preventDefault(); setSimpleDragOver(false); addSimpleFiles(e.dataTransfer.files); }}
+                  style={ui.drop(simpleDragOver)}
+                >
+                  <div style={ui.row}>
+                    <div style={{ fontWeight: 950 }}>
+                      ここに <span style={{ color: "#2563eb" }}>.pptx / .pdf</span> をドロップ（スプレッドシート不使用）
+                    </div>
+                    <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                      <input
+                        ref={simpleInputRef}
+                        type="file"
+                        multiple
+                        accept=".pptx,.pdf"
+                        disabled={simpleUploading}
+                        style={{ display: "none" }}
+                        onChange={(e) => addSimpleFiles(e.target.files)}
+                      />
+                      <button style={ui.btnGhost} onClick={() => simpleInputRef.current?.click?.()} disabled={simpleUploading}>
+                        ファイル選択
+                      </button>
+                    </div>
+                  </div>
+                  <div style={ui.hint}>講演会IDなし・スプレッドシート参照なし。AIによるPPTX解析のみで生成します。</div>
+                </div>
+
+                {simpleUploading && (
+                  <div style={ui.progressCard}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#475569", fontWeight: 900 }}>
+                      <span>⏳ {simpleProgress || "処理中…"}</span>
+                      <span>{simpleProgressPercent}%</span>
+                    </div>
+                    <div style={{ marginTop: 8, height: 10, background: "rgba(226,232,240,0.9)", borderRadius: 999, overflow: "hidden" }}>
+                      <div style={{ width: `${simpleProgressPercent}%`, height: "100%", background: "#2563eb", transition: "width 200ms ease" }} />
+                    </div>
+                  </div>
+                )}
+
+                {!!simpleError && <div style={ui.alertErr}>{simpleError}</div>}
+              </div>
+            </div>
+
+            {/* List header */}
+            <div style={ui.listHead}>
+              <div style={ui.listMeta}>
+                {simpleRows.length} 件（領域は必須）
+                {!simpleValidate.ok && simpleRows.length > 0 ? (
+                  <span style={{ marginLeft: 10, color: "#991b1b", fontWeight: 900 }}>※ {simpleValidate.msg}</span>
+                ) : null}
+              </div>
+              <div style={{ display: "flex", gap: 10 }}>
+                <button style={ui.btnGhost} onClick={clearSimpleAll} disabled={!simpleRows.length || simpleUploading}>
+                  クリア
+                </button>
+              </div>
+            </div>
+
+            {/* List card */}
+            <div style={{ ...ui.card, marginTop: 10 }}>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "44px 1fr 140px 180px 100px 100px 86px",
+                  gap: 10,
+                  background: "#f8fafc",
+                  borderBottom: "1px solid rgba(226,232,240,0.85)",
+                  fontSize: 12,
+                  color: "#64748b",
+                  padding: "10px 12px",
+                  fontWeight: 900,
+                }}
+              >
+                <div>#</div>
+                <div>ファイル</div>
+                <div>領域（必須）</div>
+                <div>単位情報（任意）</div>
+                <div>サイズ</div>
+                <div>状態</div>
+                <div></div>
+              </div>
+
+              {simpleRows.map((r, idx) => {
+                const invalidRegion = !r.region;
+                return (
+                  <div key={r.id} style={{
+                    display: "grid",
+                    gridTemplateColumns: "44px 1fr 140px 180px 100px 100px 86px",
+                    gap: 10,
+                    alignItems: "center",
+                    padding: "12px 12px",
+                    borderTop: "1px solid rgba(226,232,240,0.75)",
+                    background: r.status === "error" ? "rgba(239,68,68,0.04)" : r.status === "ok" ? "rgba(34,197,94,0.04)" : "#fff",
+                  }}>
+                    <div style={{ color: "#64748b", fontWeight: 900 }}>{idx + 1}</div>
+
+                    <div style={{ minWidth: 0 }}>
+                      <div style={ui.fileTitle}>{r.filename}</div>
+                      {r.jobId && (
+                        <div style={ui.fileSub}>jobId: <code>{String(r.jobId).slice(0, 8)}…</code></div>
+                      )}
+                      {r.message ? <div style={ui.msgErr}>{r.message}</div> : null}
+                    </div>
+
+                    <div>
+                      <select
+                        value={r.region}
+                        disabled={simpleUploading || r.status === "ok"}
+                        onChange={(e) => setSimpleField(r.id, "region", e.target.value)}
+                        style={{
+                          ...ui.input(invalidRegion, simpleUploading),
+                          maxWidth: 130,
+                          cursor: "pointer",
+                        }}
+                      >
+                        {REGION_OPTIONS.map((o) => (
+                          <option key={o.value} value={o.value}>{o.label}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <input
+                        value={r.unit}
+                        disabled={simpleUploading || r.status === "ok"}
+                        onChange={(e) => setSimpleField(r.id, "unit", e.target.value)}
+                        placeholder="任意"
+                        style={{
+                          ...ui.input(invalidRegion, simpleUploading),
+                          maxWidth: 150,
+                        }}
+                      />
+                    </div>
+
+                    <div style={{ color: "#64748b", fontSize: 12, fontWeight: 900 }}>{fmtSize(r.size)}</div>
+
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <StatusPill status={r.status} />
+                    </div>
+
+                    <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                      <button style={ui.btnGhost} onClick={() => removeSimpleRow(r.id)} disabled={simpleUploading}>
+                        削除
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+
+              {!simpleRows.length && (
+                <div style={{ padding: 16, color: "#64748b", fontSize: 13 }}>
+                  まだファイルがありません。上の領域に .pptx / .pdf をドロップするか、ファイル選択してください。
+                </div>
+              )}
+            </div>
+
+            <div style={{ marginTop: 10, fontSize: 12, color: "#64748b", lineHeight: 1.6 }}>
+              ※スプレッドシートを参照しないため、講演会IDやVM情報による補完は行われません。<br />
+              ※本ツールはAIによる自動解析を行っています。生成結果の正確性は保証されません。<br />
+              必ず内容を確認・編集のうえ出力してください。
+            </div>
+          </>
+        )}
+
+        {tab === "restore" && (
+          <div style={{ marginTop: 12 }}>
+            <div style={ui.card}>
+              <div style={ui.cardInner}>
+                <div
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setRestoreDragOver(true);
+                  }}
+                  onDragLeave={() => setRestoreDragOver(false)}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setRestoreDragOver(false);
+                    addRestoreFiles(e.dataTransfer.files);
+                  }}
+                  style={ui.drop(restoreDragOver)}
+                >
+                  <div style={ui.row}>
+                    <div style={{ fontWeight: 950 }}>
+                      ここに <span style={{ color: "#2563eb" }}>.json</span> をドロップ
+                    </div>
+
+                    <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                      <input
+                        ref={restoreInputRef}
+                        type="file"
+                        multiple
+                        accept="application/json,.json"
+                        disabled={restoring || uploading}
+                        style={{ display: "none" }}
+                        onChange={(e) => addRestoreFiles(e.target.files)}
+                      />
+                      <button
+                        style={ui.btnGhost}
+                        onClick={() => restoreInputRef.current?.click?.()}
+                        disabled={restoring || uploading}
+                      >
+                        JSON選択
+                      </button>
+
+
+
+
+                    </div>
+                  </div>
+
+                  <div style={ui.hint}>
+                    選択中: <b>{restoreFiles.length}</b> 件
+                    {restoreFiles.length ? (
+                      <>
+                        {" "}
+                        ・例: <code>{restoreFiles[0].name}</code>
+                      </>
+                    ) : null}
+                  </div>
+                </div>
 
                 {!!restoreError && <div style={ui.alertErr}>{restoreError}</div>}
-                
-  {restoreFiles.length > 0 && (
-  <div style={{ ...ui.card, marginTop: 12 }}>
-    <div style={ui.restoreHead}>
-      <div>#</div>
-      <div>JSON</div>
-      <div>eventId</div>
-      <div>状態</div>
-      <div style={{ textAlign: "right" }}>操作</div>
-    </div>
 
-    {restoreItems.map((it, idx) => {
-      const r = it.result;
-      return (
-        <div key={it.key} style={ui.restoreRow(it.status === "pending" ? "pending" : it.status)}>
-          <div style={{ color: "#64748b", fontWeight: 900 }}>{idx + 1}</div>
+                {restoreFiles.length > 0 && (
+                  <div style={{ ...ui.card, marginTop: 12 }}>
+                    <div style={ui.restoreHead}>
+                      <div>#</div>
+                      <div>JSON</div>
+                      <div>eventId</div>
+                      <div>状態</div>
+                      <div style={{ textAlign: "right" }}>操作</div>
+                    </div>
 
-          <div style={{ minWidth: 0 }}>
-            <div style={{ fontWeight: 900, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {it.filename}
-            </div>
+                    {restoreItems.map((it, idx) => {
+                      const r = it.result;
+                      return (
+                        <div key={it.key} style={ui.restoreRow(it.status === "pending" ? "pending" : it.status)}>
+                          <div style={{ color: "#64748b", fontWeight: 900 }}>{idx + 1}</div>
 
-            <div style={ui.mini}>
-              {fmtSize(it.size)}
-              {r?.jobId ? (
-                <>
-                  {" "}
-                  ・ jobId: <span style={ui.codeChip}>{String(r.jobId).slice(0, 8)}…</span>
-                </>
-              ) : null}
-            </div>
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ fontWeight: 900, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {it.filename}
+                            </div>
 
-            {r?.error ? (
-              <div style={{ marginTop: 6, fontSize: 12, color: "#991b1b", whiteSpace: "pre-wrap" }}>
-                {String(r.error)}
+                            <div style={ui.mini}>
+                              {fmtSize(it.size)}
+                              {r?.jobId ? (
+                                <>
+                                  {" "}
+                                  ・ jobId: <span style={ui.codeChip}>{String(r.jobId).slice(0, 8)}…</span>
+                                </>
+                              ) : null}
+                            </div>
+
+                            {r?.error ? (
+                              <div style={{ marginTop: 6, fontSize: 12, color: "#991b1b", whiteSpace: "pre-wrap" }}>
+                                {String(r.error)}
+                              </div>
+                            ) : null}
+                          </div>
+
+                          <div style={ui.mini}>
+                            {r?.eventId ? <span style={ui.codeChip}>{String(r.eventId)}</span> : "-"}
+                          </div>
+
+                          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                            <StatusPill status={it.status} />
+                          </div>
+
+                          <div style={{ display: "none", justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
+                            {/* pendingでも消せる */}
+                            <button
+                              style={ui.btnSmall}
+                              disabled={restoring || uploading}
+                              onClick={() => {
+                                if (restoring || uploading) return;
+                                setRestoreFiles((prev) => prev.filter((x) => !(x.name === it.file.name && x.size === it.file.size)));
+                                // 行を消したら結果も掃除（任意）
+                                setRestoreRows((prev) => (prev || []).filter((x) => String(x.filename || "") !== it.file.name));
+                              }}
+                            >
+                              削除
+                            </button>
+
+                            {r?.ok && r?.previewUrl ? (
+                              <a
+                                href={`${(import.meta.env.VITE_API_BASE || "")}${r.previewUrl}?v=${Date.now()}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                style={{ textDecoration: "none" }}
+                              >
+                                <button style={ui.btnSmall}>preview</button>
+                              </a>
+                            ) : null}
+
+                            {r?.ok && r?.jobId ? (
+                              <button style={ui.btnSmall} onClick={() => nav(`/edit/${encodeURIComponent(r.jobId)}`)}>
+                                編集
+                              </button>
+                            ) : null}
+
+                            {r?.ok && r?.jobId ? (
+                              <a
+                                href={`${(import.meta.env.VITE_API_BASE || "")}/debug/${encodeURIComponent(r.jobId)}/latest.json`}
+                                target="_blank"
+                                rel="noreferrer"
+                                style={{ textDecoration: "none" }}
+                              >
+                                <button style={ui.btnSmall}>json</button>
+                              </a>
+                            ) : null}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+
               </div>
-            ) : null}
+            </div>
           </div>
+        )}
 
-          <div style={ui.mini}>
-            {r?.eventId ? <span style={ui.codeChip}>{String(r.eventId)}</span> : "-"}
-          </div>
-
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <StatusPill status={it.status} />
-          </div>
-
-          <div style={{ display: "none", justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
-            {/* pendingでも消せる */}
-            <button
-              style={ui.btnSmall}
-              disabled={restoring || uploading}
-              onClick={() => {
-                if (restoring || uploading) return;
-                setRestoreFiles((prev) => prev.filter((x) => !(x.name === it.file.name && x.size === it.file.size)));
-                // 行を消したら結果も掃除（任意）
-                setRestoreRows((prev) => (prev || []).filter((x) => String(x.filename || "") !== it.file.name));
-              }}
-            >
-              削除
-            </button>
-
-            {r?.ok && r?.previewUrl ? (
-              <a
-                href={`${(import.meta.env.VITE_API_BASE || "")}${r.previewUrl}?v=${Date.now()}`}
-                target="_blank"
-                rel="noreferrer"
-                style={{ textDecoration: "none" }}
-              >
-                <button style={ui.btnSmall}>preview</button>
-              </a>
-            ) : null}
-
-            {r?.ok && r?.jobId ? (
-              <button style={ui.btnSmall} onClick={() => nav(`/edit/${encodeURIComponent(r.jobId)}`)}>
-                編集
-              </button>
-            ) : null}
-
-            {r?.ok && r?.jobId ? (
-              <a
-                href={`${(import.meta.env.VITE_API_BASE || "")}/debug/${encodeURIComponent(r.jobId)}/latest.json`}
-                target="_blank"
-                rel="noreferrer"
-                style={{ textDecoration: "none" }}
-              >
-                <button style={ui.btnSmall}>json</button>
-              </a>
-            ) : null}
-          </div>
-        </div>
-      );
-    })}
-  </div>
-)}
-
-      
-      </div>
-    </div>
-  </div>
-)}
-        
       </div>
 
     </div>
 
 
-    
+
   );
 }

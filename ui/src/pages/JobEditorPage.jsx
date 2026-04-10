@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useNavigate } from "react-router-dom";
 
 /**
  * ✅ この編集画面は以下を満たします
@@ -614,6 +614,7 @@ const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath, error
 /** ---------- Page ---------- **/
 export default function JobEditorPage() {
   const { jobId } = useParams();
+  const nav = useNavigate();
   const [json, setJson] = useState(null);
   const [busy, setBusy] = useState(false);
   const [previewBuster, setPreviewBuster] = useState(Date.now());
@@ -879,12 +880,12 @@ export default function JobEditorPage() {
           title={
             <div style={{ display: "grid", gap: 6 }}>
               <div>
-                <Link to="/" style={{ textDecoration: "none" }}>
+                <a href="#" onClick={(e) => { e.preventDefault(); nav(-1); }} style={{ textDecoration: "none", cursor: "pointer" }}>
                   ← 一覧へ
-                </Link>
+                </a>
               </div>
               <div style={ui.h2}>
-                編集: {json.event_id || ""}_{(json.event_title_lines || []).join("")}
+                編集: {json.event_id ? `${json.event_id}_` : ""}{(json.event_title_lines || []).join("")}
               </div>
             </div>
           }
@@ -900,6 +901,14 @@ export default function JobEditorPage() {
         </Card>
 
         <Card title="基本">
+          <Field label="講演会ID">
+            <Control
+              placeholder="例: EM0000-00000000"
+              value={json.event_id || ""}
+              onChange={(e) => updateAtPath(["event_id"], e.target.value)}
+            />
+          </Field>
+
           <Field label="VP/PH/ONC">
             <Control
               as="select"

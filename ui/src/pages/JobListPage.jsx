@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState, useCallback } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 const API_BASE = import.meta.env.VITE_API_BASE || "";
 /** ---------- helpers ---------- */
 function toIsoStart(dateStr) {
@@ -329,14 +329,15 @@ const ui = {
 
 export default function JobListPage() {
   const nav = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const [items, setItems] = useState([]);
   const [selected, setSelected] = useState(new Set());
-  const [q, setQ] = useState("");
-  const [sort, setSort] = useState("created_desc"); // created_desc | filename_asc
-  const [fromDate, setFromDate] = useState(""); // "YYYY-MM-DD"
-  const [toDate, setToDate] = useState(""); // "YYYY-MM-DD"
-  const [page, setPage] = useState(1);
+  const [q, setQ] = useState(searchParams.get("q") || "");
+  const [sort, setSort] = useState("created_desc");
+  const [fromDate, setFromDate] = useState(searchParams.get("from") || "");
+  const [toDate, setToDate] = useState(searchParams.get("to") || "");
+  const [page, setPage] = useState(Number(searchParams.get("page")) || 1);
   const [pageSize] = useState(15);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -348,6 +349,16 @@ export default function JobListPage() {
   // jpg download cache buster (manual)
   const [previewBuster, setPreviewBuster] = useState(Date.now());
 
+
+  // sync state → URL search params
+  useEffect(() => {
+    const p = new URLSearchParams();
+    if (page > 1) p.set("page", String(page));
+    if (q.trim()) p.set("q", q.trim());
+    if (fromDate) p.set("from", fromDate);
+    if (toDate) p.set("to", toDate);
+    setSearchParams(p, { replace: true });
+  }, [page, q, fromDate, toDate, setSearchParams]);
 
   useEffect(() => {
     const run = async () => {

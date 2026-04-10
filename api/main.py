@@ -6902,12 +6902,20 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list) -> DesignJSO
         # ---- chair ----
         cc = correct.get("chair") or {}
         if cc and payload.chair:
-            if cc.get("name"):
+            cc_name = cc.get("name", "")
+            if cc_name:
                 # 見出しワードは名前として無効
                 _heading = {"PROGRAM", "P R O G R A M", "AGENDA", "SCHEDULE"}
-                if cc["name"].upper() not in _heading:
-                    payload.chair.name = cc["name"]
-            if cc.get("affiliation"):
+                if cc_name.upper() not in _heading:
+                    # blocks 内に座長名が実在する場合のみ上書き（別イベントの座長誤適用を防止）
+                    _cc_name_key = cc_name.replace(" ", "").replace("\u3000", "")
+                    _blocks_text = all_blocks_text.replace(" ", "").replace("\u3000", "")
+                    if _cc_name_key and _cc_name_key in _blocks_text:
+                        payload.chair.name = cc_name
+                    else:
+                        print(f"[correct-answer-overlay] chair name '{cc_name}' not found in blocks, skip")
+                        cc_name = ""  # affiliation も適用しない
+            if cc_name and cc.get("affiliation"):
                 # 明らかに不正な所属値は除外
                 _bad_aff = {"P R O G R A M", "PROGRAM", "AGENDA"}
                 if cc["affiliation"].upper().strip() not in _bad_aff:
@@ -11180,6 +11188,182 @@ async def shutdown():
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
+@app.post("/upload/simple/stream")
+async def upload_simple_stream(
+    files: List[UploadFile] = File(...),
+    regions: List[str] = Form(...),
+    units: List[str] = Form(None),
+):
+    """スプレッドシートを読み込まない簡易アップロード。region(必須) + unit(任意) のみ。"""
+    session_id = new_session_id()
+
+    if not files:
+        raise HTTPException(400, "files is empty")
+    if len(regions) != len(files):
+        raise HTTPException(400, f"regions length mismatch: {len(regions)} != {len(files)}")
+    if units is None:
+        units = [""] * len(files)
+    if len(units) != len(files):
+        raise HTTPException(400, f"units length mismatch: {len(units)} != {len(files)}")
+
+    VALID_REGIONS = {"VP", "PH", "ONC"}
+    total = len(files)
+
+    session_dir = Path("jobs") / f"session_{session_id}"
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    buffered: List[Dict[str, Any]] = []
+    for i, f in enumerate(files):
+        filename = f.filename or f"file_{i}"
+        suffix = Path(filename).suffix.lower()
+        region = (regions[i] or "").strip().upper()
+        unit = (units[i] or "").strip()
+
+        item = {"index": i, "filename": filename, "suffix": suffix, "region": region, "unit": unit}
+
+        if suffix not in [".pptx", ".pdf"]:
+            item["precheck"] = {"ok": False, "error": "not_supported_file"}
+            buffered.append(item)
+            continue
+        if region not in VALID_REGIONS:
+            item["precheck"] = {"ok": False, "error": f"invalid_region: {region}（VP/PH/ONC のいずれかを選択してください）"}
+            buffered.append(item)
+            continue
+
+        try:
+            data = await f.read()
+            in_path = session_dir / f"{i}_{uuid.uuid4().hex}{suffix}"
+            in_path.write_bytes(data)
+            item["precheck"] = {"ok": True}
+            item["in_path"] = str(in_path)
+        except Exception as e:
+            item["precheck"] = {"ok": False, "error": f"upload_read_failed: {e}"}
+        finally:
+            try:
+                await f.close()
+            except Exception:
+                pass
+
+        buffered.append(item)
+
+    async def gen():
+        yield _sse("start", {"sessionId": session_id, "total": total})
+
+        try:
+            yield _sse("phase", {"phase": "processing", "message": "生成を開始します…（スプレッドシート不使用）"})
+            out: List[Dict[str, Any]] = []
+
+            for it in buffered:
+                i = it["index"]
+                filename = it["filename"]
+                region = it["region"]
+                unit = it["unit"]
+
+                yield _sse("item_start", {"index": i, "filename": filename})
+
+                if not it["precheck"]["ok"]:
+                    err = it["precheck"]["error"]
+                    out.append({"filename": filename, "ok": False, "error": err})
+                    yield _sse("item_done", {"index": i, "filename": filename, "ok": False, "error": err})
+                    continue
+
+                in_path = Path(it["in_path"])
+                job_id = uuid.uuid4().hex
+                p = job_paths(job_id)
+
+                try:
+                    payload = await pptx_to_json_vm_hint(
+                        in_path,
+                        [],  # VM rows なし
+                        debug_blocks_path=p.get("debug_blocks"),
+                    )
+                    payload = normalize_for_render(payload)
+                    payload = post_format_design_initial(payload)
+                    payload = await apply_precise_typeset_initial(payload)
+                    payload = ensure_display_fields(payload)
+
+                    _blocks_for_overlay = []
+                    try:
+                        _dbp = p.get("debug_blocks")
+                        if _dbp and _dbp.exists():
+                            _raw = json.loads(_dbp.read_text(encoding="utf-8"))
+                            _blocks_for_overlay = _raw
+                    except Exception:
+                        pass
+                    payload = apply_correct_answer_overlay(payload, _blocks_for_overlay)
+                    dump_titles("after apply_correct_answer_overlay", payload)
+
+                    payload.region = region
+                    payload.unit = unit
+                    payload.event_id = ""
+
+                    payload.talks = sorted(
+                        payload.talks or [],
+                        key=lambda x: (
+                            getattr(x, "_talk_index", 10**9),
+                            _time_start_minutes(getattr(x, "time", "")),
+                        )
+                    )
+
+                    payload_dict = (
+                        payload.model_dump(exclude_none=True)
+                        if hasattr(payload, "model_dump")
+                        else json.loads(payload.json(ensure_ascii=False))
+                    )
+
+                    jpg_bytes, debug_html = await render_png_bytes(payload)
+
+                    upload_required_assets(
+                        job_id,
+                        payload_dict=payload_dict,
+                        jpg_bytes=jpg_bytes,
+                    )
+                    upload_optional_assets(
+                        job_id,
+                        debug_html=debug_html,
+                        debug_blocks_path=p.get("debug_blocks"),
+                    )
+
+                    if p.get("debug_blocks") and p["debug_blocks"].exists():
+                        p["debug_blocks"].unlink(missing_ok=True)
+
+                    upsert_job_ok(job_id, filename, payload, session_id, "")
+
+                    out.append({"filename": filename, "jobId": job_id, "ok": True})
+                    yield _sse("item_done", {"index": i, "filename": filename, "ok": True, "jobId": job_id})
+
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    print("[upload/simple error]", filename, job_id)
+                    print(tb)
+
+                    out.append({"filename": filename, "jobId": job_id, "ok": False, "error": str(e)})
+                    yield _sse("item_done", {"index": i, "filename": filename, "ok": False, "jobId": job_id, "error": str(e)})
+
+            ok_count = sum(1 for r in out if r.get("ok"))
+            yield _sse("done", {"sessionId": session_id, "count": ok_count, "results": out})
+
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(tb)
+            yield _sse("fatal", {"message": str(e)})
+        finally:
+            try:
+                shutil.rmtree(session_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/upload/batch/stream")
 async def upload_batch_stream(
     files: List[UploadFile] = File(...),
@@ -11447,6 +11631,9 @@ async def render(req: RenderReq):
     event_id = row.get("event_id") or ""
 
     payload = req.design
+    # payloadにevent_idが含まれていればそちらを優先（編集画面から変更可能）
+    if (getattr(payload, "event_id", "") or "").strip():
+        event_id = payload.event_id.strip()
     # /render はエディタからの手動保存でのみ呼ばれるので常に manual_override=True
     payload.manual_override = True
 
