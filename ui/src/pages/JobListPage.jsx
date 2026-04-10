@@ -62,9 +62,15 @@ function clamp(v, min, max) {
 
 /** Blob download with custom filename */
 async function downloadWithFilename(url, filename) {
-
   const r = await fetch(`${API_BASE}${url}`, { cache: "no-store" });
-  if (!r.ok) throw new Error(`download failed: ${r.status} ${await r.text()}`);
+  if (!r.ok) {
+    const body = await r.text().catch(() => "");
+    const msg = r.status === 404
+      ? "ファイルが見つかりません。再アップロードしてください。"
+      : `ダウンロードに失敗しました (${r.status})`;
+    alert(msg);
+    return;
+  }
   const blob = await r.blob();
   const a = document.createElement("a");
   const objectUrl = URL.createObjectURL(blob);

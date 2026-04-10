@@ -7947,10 +7947,11 @@ async def ai_refine_json(
             json_body=body,
             retries=3,
         )
-        try:
-            print("error json=", r.json())
-        except Exception:
-            print("error text=", r.text)
+        if r.status_code >= 400:
+            try:
+                print("error json=", r.json())
+            except Exception:
+                print("error text=", r.text)
         r.raise_for_status()
         data = r.json()
 
@@ -11180,11 +11181,20 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
     # NOTE: apply_correct_answer_overlay はバッチフロー側で
     # apply_precise_typeset_initial の「後」に呼ぶ（typeset が改行位置を上書きするため）
 
-    
-    # if refined.confidence < draft.confidence:
-    #     refined.warnings = list(set(refined.warnings + ["ai_lower_confidence"]))
-    #     return draft
-    
+    # --- warnings を実態に合わせて再計算 ---
+    _w = list(refined.warnings or [])
+    if refined.chair and refined.chair.name:
+        _w = [w for w in _w if w != "missing_chair"]
+    if refined.organizer:
+        _w = [w for w in _w if w != "missing_organizer"]
+    if refined.talks:
+        _w = [w for w in _w if w != "no_talks"]
+    if refined.event_title or refined.event_title_lines:
+        _w = [w for w in _w if w != "missing_event_title"]
+    if refined.datetime:
+        _w = [w for w in _w if w != "missing_datetime"]
+    refined.warnings = sorted(set(_w))
+
     return refined
 
 
@@ -11957,9 +11967,6 @@ async def upload_simple_stream(
                     except Exception:
                         pass
 
-                    if p.get("debug_blocks") and p["debug_blocks"].exists():
-                        p["debug_blocks"].unlink(missing_ok=True)
-
                     upsert_job_ok(job_id, filename, payload, session_id, "")
                     _t6 = _time_mod.monotonic()
                     print(f"[TIMING][simple] local_save+upsert: {_t6 - _t5:.2f}s")
@@ -11971,6 +11978,7 @@ async def upload_simple_stream(
                         payload_dict=payload_dict,
                         jpg_bytes=jpg_bytes,
                         debug_html=debug_html,
+                        debug_blocks_path=p.get("debug_blocks"),
                     ))
 
                     out.append({"filename": filename, "jobId": job_id, "ok": True})
@@ -12188,10 +12196,6 @@ async def upload_batch_stream(
                     except Exception:
                         pass
 
-                    # debug_blocks 一時ファイル削除
-                    if p.get("debug_blocks") and p["debug_blocks"].exists():
-                        p["debug_blocks"].unlink(missing_ok=True)
-
                     upsert_job_ok(job_id, filename, payload, session_id, event_id)
 
                     # Storage アップロードはバックグラウンドで実行（ローカル保存済みなので遅延OK）
@@ -12200,6 +12204,7 @@ async def upload_batch_stream(
                         payload_dict=payload_dict,
                         jpg_bytes=jpg_bytes,
                         debug_html=debug_html,
+                        debug_blocks_path=p.get("debug_blocks"),
                     ))
 
                     out.append({
