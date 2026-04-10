@@ -1327,9 +1327,13 @@ def _norm_time(s: str) -> str:
 
 def extract_time_cands_with_pos(blocks: list[TextBlock]) -> list[TimeCand]:
     """ブロックから時間範囲を抽出（位置情報付き）"""
+    _event_dt_re = re.compile(r"20\d{2}\s*年|\d{1,2}\s*月\s*\d{1,2}\s*日|日時")
     out = []
     seen_tops = set()
     for b in blocks:
+        # 日時ラベル・年月日を含むブロックはイベント日時なので除外
+        if _event_dt_re.search(b.text or ""):
+            continue
         t = _norm_time(b.text)
         
         # 時間範囲のパターンを探す
@@ -2476,7 +2480,7 @@ def extract_session_times_from_datetime(dt: str) -> list[str]:
             out.append(t)
     return out
 
-def should_hide_talk_times(payload) -> bool:
+def should_hide_talk_times(payload, blocks=None) -> bool:
     dt = str(_get_field(payload, "datetime", "") or "")
     parts = _get_field(payload, "datetime_parts", None)
 
@@ -2490,6 +2494,17 @@ def should_hide_talk_times(payload) -> bool:
 
     if has_session_label(time_str):
         return True
+
+    # イベント時間が blocks に1箇所しかない → 日時ブロック由来のみ → talk には不要
+    if time_str and blocks:
+        _time_ns = normalize_time_range(time_str).replace(":", "").replace("~", "")
+        if _time_ns:
+            _count = sum(
+                1 for b in blocks
+                if _time_ns in (b.text or "").replace(":", "").replace("~", "").replace("～", "").replace("〜", "")
+            )
+            if _count <= 1:
+                return True
 
     return False
 
@@ -2633,10 +2648,9 @@ def fill_datetime_parts(payload, blocks=None):
     pset(payload, "datetime_parts", parts)
     pset(payload, "datetime_time_newline", newline)
 
-    # 複数回表記の時だけ talk time を消す
-    if should_hide_talk_times(payload):
-        if "1回目" in time_joined or "2回目" in time_joined:
-            clear_talk_times(payload)
+    # 不要な talk time を消す（セッション複数回 or 時間blocks1個くだり=日時ブロック由来）
+    if should_hide_talk_times(payload, blocks):
+        clear_talk_times(payload)
 
     return payload
 
@@ -4584,6 +4598,9 @@ def extract_event_title_lines_from_blocks(blocks: List[TextBlock]) -> List[str]:
 
 
 DATE_RE = re.compile(r"(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日(?:\s*[（(]?\s*([月火水木金土日])\s*[）)]?)?")
+# 月・日の数字がテンプレートとは別テキストに分かれているケース:
+# 「３ 26 日時 2026年 月 日（木）12:30~13:10」→ month=3, day=26, year=2026
+SPLIT_DATE_RE = re.compile(r"(\d{1,2})\s+(\d{1,2})\s+[^\d]+?(20\d{2})\s*年\s*月\s*日(?:\s*[（(]\s*([月火水木金土日])\s*[）)])?")  
 TIME_RE2 = re.compile(r"(\d{1,2}[:：]\d{2})\s*[～〜\-ー~]\s*(\d{1,2}[:：]\d{2})")
 
 def _norm_time2(s: str) -> str:
@@ -4657,6 +4674,16 @@ def extract_datetime_from_blocks(blocks: List[TextBlock]) -> str:
             dow = (mm.group(4) or "").strip()
             date_line = l
             break
+
+    # 2b) split-date fallback: 数字が年月日のテンプレートと別テキストに分離しているケース
+    if not (y and m and d):
+        for l in lines:
+            mm = SPLIT_DATE_RE.search(l)
+            if mm:
+                m, d, y = mm.group(1), mm.group(2), mm.group(3)
+                dow = (mm.group(4) or "").strip()
+                date_line = l
+                break
 
     # 3) 時間を探す（別行のことが多いので全行から探す）
     # 「1回目：12:30～13:00  2回目：13:10～13:40」のような複数回パターンを優先
@@ -9464,11 +9491,18 @@ def sort_talks_by_layout(blocks: list[TextBlock], talks: list[Talk]) -> list[Tal
     return [t for _, t in items]
 
 def assign_talk_times_by_nearest_upper_time(blocks: list[TextBlock], talks: list[Talk]) -> list[Talk]:
-    """講演の上側にある最も近い時間を割り当て"""
+    """講演の上側にある最も近い時間を割り当て。
+    イベント日時ブロック（「日時」ラベル・年月日入り）は除外。"""
+    _event_dt_re = re.compile(r"20\d{2}\s*年|\d{1,2}\s*月\s*\d{1,2}\s*日|日時")
+
     time_blocks = []
     seen_tops = set()
     for b in blocks:
-        txt = _norm_time(b.text or "")
+        raw = b.text or ""
+        # 日時ラベル・年月日を含むブロックはイベント時間なので除外
+        if _event_dt_re.search(raw):
+            continue
+        txt = _norm_time(raw)
         m = TIME_RE.search(txt)
         if m:
             start_time = m.group(1).replace(" ", "")
@@ -9482,6 +9516,16 @@ def assign_talk_times_by_nearest_upper_time(blocks: list[TextBlock], talks: list
     for top, left, merged in _merge_blocks_to_rows(blocks):
         if top in seen_tops:
             continue
+        if _event_dt_re.search(merged):
+            continue
+        txt = _norm_time(merged)
+        m = TIME_RE.search(txt)
+        if m:
+            start_time = m.group(1).replace(" ", "")
+            end_time = m.group(2).replace(" ", "")
+            start_norm = re.sub(r"(\d{1,2}):(\d{2})", r"\1:\2", start_time)
+            end_norm = re.sub(r"(\d{1,2}):(\d{2})", r"\1:\2", end_time)
+            time_blocks.append((top, left, f"{start_norm}~{end_norm}"))
         txt = _norm_time(merged)
         m = TIME_RE.search(txt)
         if m:
