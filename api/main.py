@@ -10685,8 +10685,11 @@ def finalize_people_fields(payload: DesignJSON) -> DesignJSON:
         raw_aff = normalize_space(payload.chair.affiliation or "")
 
         # affiliation側に「名前（所属）」が残っていたら分解し直す
+        # ただし所属テキスト自体に括弧が含まれる場合（○○科（リウマチ）部長 等）は
+        # 誤分解しないよう、name部分が所属機関を含まないことを確認する
         n, a = split_person_and_affiliation(raw_aff)
-        if a:
+        _ORG_KEYWORDS = ("大学", "病院", "医院", "クリニック", "センター", "科", "厚生", "診療所")
+        if a and not any(kw in (n or "") for kw in _ORG_KEYWORDS):
             payload.chair.affiliation = strip_outer_parens_suffix(a)
             if not raw_name and n:
                 payload.chair.name = n
