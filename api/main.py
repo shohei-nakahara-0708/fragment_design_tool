@@ -12479,16 +12479,8 @@ async def list_jobs(
 
     items = [row_to_job_item(r) for r in rows]
 
-    # 一覧画像を CDN 直読みにするため署名付き URL を一括発行
-    preview_paths = [f"{it['jobId']}/preview.jpg" for it in items]
-    try:
-        signed_map = create_signed_urls_batch(preview_paths, expires_in=3600)
-    except Exception:
-        signed_map = {}
-    for it in items:
-        p = f"{it['jobId']}/preview.jpg"
-        if p in signed_map:
-            it["previewSignedUrl"] = signed_map[p]
+    # プレビュー画像は /preview/{jobId}.jpg 経由で取得するので
+    # ここでは署名付き URL を生成しない（1.6s → ~50ms に高速化）
 
     return {
         "page": page,
