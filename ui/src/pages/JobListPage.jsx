@@ -11,8 +11,13 @@ const WARNING_MAP = {
   vm_match_not_confident: { label: "VM照合 低信頼", tone: "yellow", icon: "?" },
   missing_chair: { label: "座長なし", tone: "yellow", icon: "!" },
   missing_organizer: { label: "主催/共催なし", tone: "yellow", icon: "!" },
+  missing_datetime: { label: "日時なし", tone: "yellow", icon: "!" },
+  missing_event_title: { label: "タイトルなし", tone: "red", icon: "✕" },
+  no_talks: { label: "講演なし", tone: "red", icon: "✕" },
   talks_pruned_by_vm_hint: { label: "VM絞り込み", tone: "gray", icon: "▾" },
   talks_pruned_heuristic_only: { label: "自動絞り込み", tone: "gray", icon: "▾" },
+  talk_count_mismatch: { label: "講演数不一致", tone: "yellow", icon: "!" },
+  low_confidence: { label: "低信頼度", tone: "red", icon: "⚠" },
 };
 const TONE_STYLES = {
   blue: { bg: "rgba(37,99,235,0.10)", bd: "rgba(37,99,235,0.25)", fg: "#1d4ed8" },

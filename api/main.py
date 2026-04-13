@@ -2579,7 +2579,7 @@ def extract_dow_from_blocks(blocks) -> str:
         if m:
             return m.group(1)
 
-    # 2) 曜日が独立ブロック "(金)" のケース: 日付ブロック近傍を探す
+    # 2) 曜日が独立ブロック "(金)" or "(水) 17:00~" のケース: 日付ブロック近傍を探す
     date_block = None
     for b in ordered:
         s = normalize_datetime_text(b.text or "")
@@ -2589,7 +2589,7 @@ def extract_dow_from_blocks(blocks) -> str:
     if date_block:
         for b in ordered:
             s = normalize_datetime_text(b.text or "").strip()
-            m = re.fullmatch(r"[（(]\s*([月火水木金土日])\s*[）)]", s)
+            m = re.match(r"[（(]\s*([月火水木金土日])\s*[）)]", s)
             if m:
                 # 日付ブロックとの距離が近い（縦方向±500000 emu）
                 if abs(b.top - date_block.top) <= 500000:
@@ -8115,11 +8115,11 @@ def fill_empty_fields_from_blocks_with_hints(
                     if t.affiliation:
                         break
 
-    # ---- expected_talk_count vs actual: 警告 ----
-    if hints.expected_talk_count > 0:
+    # ---- expected_talk_count vs actual: 警告 (類似度高い時のみ) ----
+    if hints.expected_talk_count > 0 and hints.similarity >= 0.90:
         actual = len(payload.talks or [])
         if actual != hints.expected_talk_count:
-            print(f"[hints-fill] talk count mismatch: expected={hints.expected_talk_count} actual={actual}")
+            print(f"[hints-fill] talk count mismatch: expected={hints.expected_talk_count} actual={actual} (sim={hints.similarity:.2f})")
             _w = list(payload.warnings or [])
             if "talk_count_mismatch" not in _w:
                 _w.append("talk_count_mismatch")
@@ -10255,17 +10255,7 @@ def parse_blocks_to_design_json(blocks: List[TextBlock], vm_rows: Optional[List[
         warnings.append("missing_chair"); confidence -= 0.1
     if len(talks) == 0:
         warnings.append("no_talks"); confidence -= 0.35
-    else:
-        # 学習済み講演数分布と比較し、大幅に外れる場合は軽く減点
-        _tcache = _get_talk_count_cache()
-        if _tcache.get("count", 0) >= 5:
-            _q25 = _tcache.get("q25", 1)
-            _q75 = _tcache.get("q75", 4)
-            _iqr = max(_q75 - _q25, 1)
-            if len(talks) < _q25 - _iqr or len(talks) > _q75 + _iqr:
-                warnings.append("unusual_talk_count")
-                confidence -= 0.08
-                print(f"[confidence] unusual_talk_count: {len(talks)} (expected q25={_q25}~q75={_q75})")
+
 
     confidence = float(min(max(confidence, 0.0), 1.0))
 
@@ -11265,6 +11255,9 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
                 return False
             if any(x in s for x in bad_words):
                 return False
+            # 講演ラベル（講演1, 講演2, 演題1 等）は名前ではない
+            if re.match(r'^(講演|演題)[0-9０-９①-⑩ⅠⅡⅢⅣⅤ]*$', s2):
+                return False
             return 2 <= len(s2) <= 8
 
         def _clean_name_candidate(s: str) -> str:
@@ -11336,12 +11329,20 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
                 block_key = normalize_key(block_text)
 
                 if "演者" in block_key:
-                    # 演者の後ろの名前
+                    # 演者の後ろの名前（日本語）
                     m = re.search(r"演者\s*([一-龥々]{1,4}\s*[一-龥々]{1,4})\s*先生?", block_text)
                     if m:
                         nm = norm_name(m.group(1))
                         if nm and not _same_as_chair_name(nm):
                             name_cands.append(((abs(abs_idx - i), 0, 0, 0), nm))
+
+                    # 演者の後ろにラテン文字名（Prof. Harm Jan Bogaard 等）
+                    if not m:
+                        m_lat = re.search(r"演者\s*(?:Prof\.?\s*)?([A-Za-z][A-Za-z .\-]+[A-Za-z])", block_text)
+                        if m_lat:
+                            lat_name = normalize_space(m_lat.group(1))
+                            if len(lat_name) >= 3 and not _same_as_chair_name(lat_name):
+                                name_cands.append(((abs(abs_idx - i), 0, 0, 0), lat_name))
 
                     # 演者の後ろに所属も続くケース
                     m2 = re.search(
@@ -11554,8 +11555,14 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         if s_ns in non_person_words:
             return True
 
-        # 長すぎる
-        if len(s_ns) > 10:
+        # 講演ラベル（講演1, 演題2 等）は人名ではない
+        if re.match(r'^(講演|演題)[0-9０-９①-⑩ⅠⅡⅢⅣⅤ]*$', s_ns):
+            return True
+
+        # 長すぎる（ラテン文字名は20文字まで許容）
+        is_latin = bool(re.search(r'[A-Za-z]', s))
+        max_len = 25 if is_latin else 10
+        if len(s_ns) > max_len:
             return True
 
         return False
@@ -11647,6 +11654,8 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         # フォールバック: "演者"ラベルが無い場合、"先生"ブロックから演者名を抽出
         if not speaker:
             chair_name_key = normalize_key(getattr(payload.chair, "name", "") or "").replace("先生", "")
+            chair_aff_key = normalize_key(getattr(payload.chair, "affiliation", "") or "")
+            speaker_block = None
             for b in sorted(seg, key=lambda x: (x.top, x.left)):
                 bt = normalize_space(b.text or "")
                 if "先生" not in bt:
@@ -11663,6 +11672,20 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
                     cand_key = normalize_key(cand).replace("先生", "")
                     if cand_key and cand_key != chair_name_key and is_valid_person_name(cand):
                         speaker = cand
+                        speaker_block = b
+                        break
+
+            # "先生"ブロックから演者を見つけた場合、近傍ブロックから所属を探す
+            if speaker_block and not affiliation:
+                for b in sorted(seg, key=lambda x: (x.top, x.left)):
+                    # 名前ブロックの近く（上下 300,000 EMU 以内）の所属候補
+                    if abs(b.top - speaker_block.top) > 300000:
+                        continue
+                    if b is speaker_block:
+                        continue
+                    bt = normalize_space(b.text or "").replace("\n", " ")
+                    if looks_like_affil_line(bt) and normalize_key(bt) != chair_aff_key:
+                        affiliation = bt
                         break
 
         if speaker and (not t.speaker or is_bad_speaker(t.speaker)):
@@ -11705,6 +11728,33 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         # 最後の保険: speaker だけ取れて affiliation がない場合は speaker_map 相当を使いたいならここで補完
         # if t.speaker and not t.affiliation:
         #     t.affiliation = aff_from_speaker_map(t.speaker)
+
+    # ── セカンドパス: アンカー順序と talk 順序のズレで拾い漏れた所属を補完 ──
+    chair_aff_key = normalize_key(getattr(payload.chair, "affiliation", "") or "")
+    for t in talks:
+        if not t.speaker or normalize_space(t.affiliation or ""):
+            continue
+        speaker_key = normalize_key(t.speaker).replace("先生", "")
+        # blocks 全体から speaker 名を含むブロックを探す
+        speaker_block = None
+        for b in ordered:
+            bt_flat = (b.text or "").replace("\n", "").replace(" ", "").replace("\u3000", "").replace("先生", "")
+            if speaker_key and speaker_key in normalize_key(bt_flat):
+                speaker_block = b
+                break
+        if not speaker_block:
+            continue
+        # speaker ブロックの近傍から所属候補を探す
+        for b in ordered:
+            if abs(b.top - speaker_block.top) > 400000:
+                continue
+            if b is speaker_block:
+                continue
+            bt = normalize_space(b.text or "").replace("\n", " ")
+            if looks_like_affil_line(bt) and normalize_key(bt) != chair_aff_key:
+                t.affiliation = bt
+                print(f"[repair-talks] second-pass affiliation for {t.speaker}: {bt}")
+                break
 
     payload.talks = talks
     return payload
