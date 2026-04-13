@@ -2579,7 +2579,7 @@ def extract_dow_from_blocks(blocks) -> str:
         if m:
             return m.group(1)
 
-    # 2) 曜日が独立ブロック "(金)" or "(水) 17:00~" のケース: 日付ブロック近傍を探す
+    # 2) 曜日が独立ブロック "(金)" or "(水) 17:00~" or 単独 "水" のケース: 日付ブロック近傍を探す
     date_block = None
     for b in ordered:
         s = normalize_datetime_text(b.text or "")
@@ -2589,7 +2589,11 @@ def extract_dow_from_blocks(blocks) -> str:
     if date_block:
         for b in ordered:
             s = normalize_datetime_text(b.text or "").strip()
+            # "(水)" or "(水) 17:00~" パターン
             m = re.match(r"[（(]\s*([月火水木金土日])\s*[）)]", s)
+            if not m:
+                # 単独 "水" のような括弧なしブロック
+                m = re.fullmatch(r"([月火水木金土日])", s)
             if m:
                 # 日付ブロックとの距離が近い（縦方向±500000 emu）
                 if abs(b.top - date_block.top) <= 500000:
