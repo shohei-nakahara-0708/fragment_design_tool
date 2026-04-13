@@ -4764,17 +4764,36 @@ def extract_datetime_from_blocks(blocks: List[TextBlock]) -> str:
     return date_str
 
 
+def _normalize_organizer(s: str) -> str:
+    """organizer テキストを正規化: ラベル内スペース除去 + コロン前後整形 + MSD追加"""
+    if not s:
+        return s
+    # "共 催" → "共催" 等: ラベル内のスペースを除去
+    s = re.sub(r"^(主)\s*(催)", r"\1\2", s)
+    s = re.sub(r"^(共)\s*(催)", r"\1\2", s)
+    s = re.sub(r"^(提)\s*(供)", r"\1\2", s)
+    s = re.sub(r"^(企)\s*(画)", r"\1\2", s)
+    s = re.sub(r"^(運)\s*(営)", r"\1\2", s)
+    # "：" 前後の無駄スペース除去 → "共催：XXX"
+    s = re.sub(r"\s*[:：]\s*", "：", s)
+    # MSD株式会社 が含まれていなければ末尾に追加
+    s_ns = re.sub(r'[\s\u3000]+', '', s)
+    if "MSD" not in s_ns and "MSD" not in s:
+        s = s.rstrip() + " MSD株式会社"
+    return s
+
+
 def extract_organizer_from_blocks(blocks: List[TextBlock]) -> str:
     lines = blocks_to_lines(blocks)
 
     # ラベル行をそのまま返す（主催/共催/提供/企画/運営）
-    pat = re.compile(r"^(主催|共催|提供|企画|運営)\s*[:：]\s*(.+)$")
+    # "共 催" のようにラベル内にスペースが入るケースに対応
+    pat = re.compile(r"^(主\s*催|共\s*催|提\s*供|企\s*画|運\s*営)\s*[:：]\s*(.+)$")
     for l in lines:
         s = normalize_space(l)
         m = pat.match(s)
         if m:
-            # 例: "共催：刈谷内科医会 MSD 株式会社"
-            return s
+            return _normalize_organizer(s)
 
     # ★ 正解DBの主催者辞書と照合（ラベルなし行でも検出）
     org_dict = _get_organizer_dict_cache()
@@ -4785,17 +4804,17 @@ def extract_organizer_from_blocks(blocks: List[TextBlock]) -> str:
             if len(s_ns) < 4:
                 continue
             if s_ns in org_dict:
-                return s
+                return _normalize_organizer(s)
             for known in org_dict:
                 if len(known) >= 6 and known in s_ns:
-                    return s
+                    return _normalize_organizer(s)
 
     # fallback（会社名っぽい行）
     corp_pat = re.compile(r"(株式会社|有限会社|合同会社|Inc\.|LLC|Ltd\.|Co\.,?\s*Ltd\.|GmbH)")
     for l in reversed(lines):
         s = normalize_space(l)
         if corp_pat.search(s):
-            return s
+            return _normalize_organizer(s)
     return ""
 
 
@@ -7866,6 +7885,7 @@ def find_similar_correct_answers(
 
     query_text = blocks_text + " " + event_title
     query_emb = _compute_embedding(query_text)
+    query_title_ns = (event_title or "").replace(" ", "").replace("\u3000", "").replace("\n", "").lower()
 
     scored = []
     for ans in answers:
@@ -7878,6 +7898,13 @@ def find_similar_correct_answers(
             query_kw = _extract_keywords(query_text)
             ans_kw = set(ans.get("keywords", []))
             sim = _compute_similarity(query_kw, ans_kw)
+
+        # event_title 完全一致なら最優先（同じイベントの正解DB）
+        ans_title = (ans.get("event_title") or "")
+        ans_title_ns = ans_title.replace(" ", "").replace("\u3000", "").replace("\n", "").lower()
+        if query_title_ns and ans_title_ns and query_title_ns == ans_title_ns:
+            sim = max(sim, 1.0)
+            print(f"[correct-answer-search] exact title match boost: '{ans_title[:50]}' sim→1.0")
 
         if sim >= min_similarity:
             ans["_similarity"] = sim
@@ -8115,11 +8142,12 @@ def fill_empty_fields_from_blocks_with_hints(
                     if t.affiliation:
                         break
 
-    # ---- expected_talk_count vs actual: 警告 (類似度高い時のみ) ----
-    if hints.expected_talk_count > 0 and hints.similarity >= 0.90:
+    # ---- expected_talk_count vs actual: 警告 (高類似度かつ差が大きい時のみ) ----
+    if hints.expected_talk_count > 0 and hints.similarity >= 0.95:
         actual = len(payload.talks or [])
-        if actual != hints.expected_talk_count:
-            print(f"[hints-fill] talk count mismatch: expected={hints.expected_talk_count} actual={actual} (sim={hints.similarity:.2f})")
+        diff = abs(actual - hints.expected_talk_count)
+        if diff >= 2:
+            print(f"[hints-fill] talk count mismatch: expected={hints.expected_talk_count} actual={actual} diff={diff} (sim={hints.similarity:.2f})")
             _w = list(payload.warnings or [])
             if "talk_count_mismatch" not in _w:
                 _w.append("talk_count_mismatch")
@@ -11324,6 +11352,19 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
                     if looks_like_affil_line(ln) and not _same_as_chair_aff(ln):
                         aff_cands.append((_score_aff(abs_idx, li, i, ln), ln))
 
+                # 複数行ブロック: 1行目が所属なら後続の科名・役職行を結合
+                if len(lines) > 1 and looks_like_affil_line(lines[0]) and not _same_as_chair_aff(lines[0]):
+                    role_dept_kw = ["科", "内科", "外科", "教授", "准教授", "講師", "部長",
+                                    "医長", "院長", "部", "室", "課", "主任"]
+                    joined = [lines[0]]
+                    for sub_ln in lines[1:]:
+                        sub_ln_s = sub_ln.strip()
+                        if sub_ln_s and any(k in sub_ln_s for k in role_dept_kw) and len(sub_ln_s) <= 20:
+                            joined.append(sub_ln_s)
+                    if len(joined) > 1:
+                        joined_aff = " ".join(joined)
+                        aff_cands.append((_score_aff(abs_idx, 0, i, joined_aff), joined_aff))
+
                 # ブロック全体が「演者 石井 康隆先生 ...」型のときの補助
                 block_text = _norm(cb.text)
                 block_key = normalize_key(block_text)
@@ -11575,6 +11616,9 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
 
         # ラベル削除
         s = re.sub(r"(演者|座長)\s*", "", s)
+
+        # 「先生」を先に除去してから人名パターンを取る
+        s = re.sub(r"\s*先生\s*$", "", s).strip()
 
         # 最後の人名だけ取る
         m = re.search(r"([一-龥々]{1,4}\s*[一-龥々]{1,4})$", s)
