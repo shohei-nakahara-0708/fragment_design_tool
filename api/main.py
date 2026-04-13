@@ -6,7 +6,7 @@ import json
 import os, subprocess
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Literal, Tuple
 
@@ -1428,13 +1428,20 @@ def extract_talk_number_and_time_from_text(text: str) -> tuple[int | None, str]:
     talk_no = None
 
     # 1) 講演1 / 講演１ / 講演① / 講 演 1 / 演題1 / 演題①
-    m = re.search(r"(?:講演|演題)([0-9０-９]+|[①②③④⑤⑥⑦⑧⑨⑩])", s)
+    #    rawで先にマッチ（スペースが自然な境界になり時間の数字を食わない）
+    m = re.search(r"(?:講演|演題)\s*([0-9０-９]+|[①②③④⑤⑥⑦⑧⑨⑩])", raw)
+    if not m:
+        # フォールバック: normalize_key版（"講 演 1" のようにスペース入りラベル対応）
+        m = re.search(r"(?:講演|演題)([0-9０-９]+|[①②③④⑤⑥⑦⑧⑨⑩])", s)
     if m:
         raw_no = m.group(1)
         if raw_no in CIRCLED_NUM_MAP:
             talk_no = CIRCLED_NUM_MAP[raw_no]
         else:
             talk_no = int(z2h_digits(raw_no))
+        # 妥当性チェック: 演題番号が大きすぎる場合は時間数字を食った可能性
+        if talk_no is not None and talk_no > 20:
+            talk_no = None
 
     # 2) 一般講演Ⅰ / 一般 講 演 Ⅱ / III
     if talk_no is None:
@@ -1580,6 +1587,29 @@ def assign_talk_times_by_anchor(blocks: list[TextBlock], payload: DesignJSON) ->
     talk_time_map = extract_talk_time_map_by_anchor(blocks)
     if not talk_time_map:
         return payload
+
+    # --- talks を blocks 内のスピーカー位置に基づいて正しい順序に並び替え ---
+    # 各 talk のスピーカーが blocks 内のどの位置にいるかを特定
+    if len(talks) >= 2 and len(talk_time_map) >= 2:
+        def _speaker_top_in_blocks(t) -> int:
+            """talk のスピーカー名が blocks 内で最初に出現する top 位置"""
+            sp = (getattr(t, "speaker", "") or "").replace(" ", "").replace("\u3000", "")
+            if not sp:
+                return 10**9
+            for b in sorted(blocks, key=lambda b: (b.top, b.left)):
+                bt = (b.text or "").replace(" ", "").replace("\u3000", "").replace("\n", "")
+                if sp in bt:
+                    return b.top
+            return 10**9
+
+        speaker_tops = [(i, _speaker_top_in_blocks(t)) for i, t in enumerate(talks)]
+        # 全員の位置が取れた場合のみ並び替え
+        if all(top < 10**9 for _, top in speaker_tops):
+            sorted_indices = [i for i, _ in sorted(speaker_tops, key=lambda x: x[1])]
+            # 現在の順番と異なる場合のみ並び替え
+            if sorted_indices != list(range(len(talks))):
+                talks = [talks[i] for i in sorted_indices]
+                print(f"[assign-talk-times] reordered talks by blocks position: {sorted_indices}")
 
     # アンカーで特定できた講演のみ時間を設定（他はリセットしない）
     for idx, t in enumerate(talks, start=1):
@@ -2504,6 +2534,12 @@ def should_hide_talk_times(payload, blocks=None) -> bool:
                 if _time_ns in (b.text or "").replace(":", "").replace("~", "").replace("～", "").replace("〜", "")
             )
             if _count <= 1:
+                # ただし、イベント全体時間とは異なる個別演題時間がブロックに存在する場合は非表示にしない
+                full_time_norm = normalize_time_range(time_str)
+                all_times = extract_talk_times_in_order(blocks)
+                individual_times = [t for t in all_times if normalize_time_range(t) != full_time_norm]
+                if individual_times:
+                    return False
                 return True
 
     return False
@@ -5524,11 +5560,29 @@ def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                 name_part = line.split("先生")[0].strip()
                 # スペース・記号で分割
                 words = re.split(r'[\s　,、，・/／（）\(\)\[\]【】]+', name_part)
+                words = [w for w in words if w]
                 affiliation_words = []
                 # 所属ワードリスト
                 aff_words = {"大学", "病院", "センター", "外科", "内科", "教授", "医長", "診療科", "部", "科", "クリニック", "Department", "Hospital", "Center", "Clinic", "Professor"}
-                # 2語目が所属ワードなら1語目だけを人名候補に
-                if len(words) >= 2 and (words[1] in aff_words or any(w in words[1] for w in aff_words)):
+                # 役職ワードリスト（名前ではなく肩書き）
+                role_words = {"院長", "副院長", "会長", "副会長", "部長", "副部長", "課長", "理事長", "所長", "室長", "准教授", "講師", "助教", "助手", "名誉院長"}
+                # 多語（>3語）のとき: 末尾2語を名前候補として優先（"...所属... 姓 名 先生" パターン）
+                if len(words) > 3:
+                    last_two = " ".join(words[-2:])
+                    last_two_has_aff = any(w in last_two for w in aff_words) or any(w in last_two for w in role_words)
+                    if not last_two_has_aff and is_valid_person_name(last_two):
+                        name_candidate = last_two
+                        affiliation_words = words[:-2]
+                    else:
+                        # 末尾2語が名前でなければ先頭2語で試行
+                        if len(words) >= 2 and (words[1] in aff_words or words[1] in role_words or any(w in words[1] for w in aff_words)):
+                            name_candidate = words[0]
+                            affiliation_words = words[1:]
+                        else:
+                            name_candidate = " ".join(words[:2])
+                            affiliation_words = words[2:]
+                # 2語目が所属/役職ワードなら1語目だけを人名候補に
+                elif len(words) >= 2 and (words[1] in aff_words or words[1] in role_words or any(w in words[1] for w in aff_words)):
                     name_candidate = words[0]
                     affiliation_words = words[1:]
                 else:
@@ -7890,19 +7944,210 @@ def _build_dynamic_few_shot(similar_answers: list[dict]) -> list[dict]:
     return messages
 
 
+@dataclass
+class CorrectAnswerHints:
+    """正解DBから抽出した構造的ヒント（テキスト内容ではなく構造情報）"""
+    expected_talk_count: int = 0
+    talk_speaker_hints: list = dataclass_field(default_factory=list)  # normalized speaker names
+    chair_name_hint: str = ""       # normalized chair name
+    organizer_hint: str = ""        # normalized organizer
+    similarity: float = 0.0
+    _correct_json: dict = dataclass_field(default_factory=dict)
+    _job_id: str = ""
+
+
+def compute_correct_answer_hints(blocks: list, event_title: str) -> CorrectAnswerHints:
+    """正解DBから構造的ヒントを抽出する（テキスト内容は含めない、構造情報のみ）。
+    パイプライン序盤で呼び出して抽出精度を向上させる。"""
+    try:
+        all_blocks_text = " ".join(
+            (b.get("text", "") if isinstance(b, dict) else getattr(b, "text", ""))
+            for b in blocks
+        )
+        similar = find_similar_correct_answers(all_blocks_text, event_title, top_k=1)
+        if not similar:
+            return CorrectAnswerHints()
+
+        best = similar[0]
+        sim = best.get("_similarity", 0.0)
+        if sim < 0.80:
+            return CorrectAnswerHints()
+
+        correct = best.get("correct_json") or {}
+        def _ns(s): return (s or "").replace(" ", "").replace("\u3000", "")
+
+        talks = correct.get("talks") or []
+        chair = correct.get("chair") or {}
+
+        hints = CorrectAnswerHints(
+            expected_talk_count=len(talks),
+            talk_speaker_hints=[_ns(t.get("speaker", "")) for t in talks if t.get("speaker")],
+            chair_name_hint=_ns(chair.get("name", "")),
+            organizer_hint=_ns(correct.get("organizer", "")),
+            similarity=sim,
+            _correct_json=correct,
+            _job_id=best.get("job_id", ""),
+        )
+        print(f"[correct-answer-hints] sim={sim:.2f} job={hints._job_id} "
+              f"talks={hints.expected_talk_count} chair='{hints.chair_name_hint}' "
+              f"speakers={hints.talk_speaker_hints}")
+        return hints
+    except Exception as e:
+        print(f"[correct-answer-hints] error: {e}")
+        return CorrectAnswerHints()
+
+
+def fill_empty_fields_from_blocks_with_hints(
+    payload: DesignJSON, blocks: list, hints: CorrectAnswerHints
+) -> DesignJSON:
+    """正解DBヒントを使って、空フィールドを blocks 内のテキストで補完する。
+    DBのテキスト自体は使わない（blocks に実在するテキストのみ採用）。
+    パイプライン中盤（repair_talks_from_blocks 後）で呼び出す。"""
+    if hints.similarity < 0.80:
+        return payload
+
+    def _bt(b):
+        return b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")
+
+    all_text_ns = "".join(_bt(b) for b in blocks).replace(" ", "").replace("\u3000", "")
+
+    # ---- organizer: 空なら blocks から探す ----
+    if not (payload.organizer or "").strip() and hints.organizer_hint:
+        if hints.organizer_hint in all_text_ns:
+            for b in blocks:
+                bt = _bt(b)
+                bt_ns = bt.replace(" ", "").replace("\u3000", "")
+                if hints.organizer_hint in bt_ns:
+                    # blocksのテキストから organizer 行を抽出
+                    for line in bt.split("\n"):
+                        line_ns = line.replace(" ", "").replace("\u3000", "")
+                        if hints.organizer_hint in line_ns:
+                            payload.organizer = normalize_space(line)
+                            print(f"[hints-fill] organizer from blocks: '{payload.organizer}'")
+                            break
+                    if payload.organizer:
+                        break
+
+    # ---- chair.name: 空なら blocks から探す ----
+    if payload.chair and not (payload.chair.name or "").strip() and hints.chair_name_hint:
+        if hints.chair_name_hint in all_text_ns:
+            for b in blocks:
+                bt = _bt(b)
+                bt_joined = normalize_space(bt.replace("\n", " "))
+                m = re.search(
+                    r"([一-龥々ぁ-んァ-ヶ]{1,5})\s*([一-龥々ぁ-んァ-ヶ]{1,5})\s*先生",
+                    bt_joined,
+                )
+                if m:
+                    cand = norm_name(m.group(1) + m.group(2))
+                    cand_ns = cand.replace(" ", "").replace("\u3000", "")
+                    if cand_ns == hints.chair_name_hint and is_valid_person_name(cand):
+                        payload.chair.name = cand
+                        payload.chair.name_display = cand
+                        print(f"[hints-fill] chair.name from blocks: '{cand}'")
+                        break
+
+    # ---- talks speaker: 空なら blocks から探す ----
+    if payload.talks and hints.talk_speaker_hints:
+        # 既にマッチ済みの speaker を集計
+        matched_hints = set()
+        for t in payload.talks:
+            sp_ns = (getattr(t, "speaker", "") or "").replace(" ", "").replace("\u3000", "")
+            if sp_ns:
+                matched_hints.add(sp_ns)
+
+        for t in payload.talks:
+            sp_ns = (getattr(t, "speaker", "") or "").replace(" ", "").replace("\u3000", "")
+            if sp_ns:
+                continue  # 既に speaker がある
+
+            # 未マッチのヒントから blocks 内に存在するものを探す
+            for hint_sp in hints.talk_speaker_hints:
+                if hint_sp in matched_hints:
+                    continue
+                if hint_sp not in all_text_ns:
+                    continue
+                # blocks から該当名前を抽出
+                found = False
+                for b in blocks:
+                    bt = _bt(b)
+                    bt_joined = normalize_space(bt.replace("\n", " "))
+                    m = re.search(
+                        r"([一-龥々ぁ-んァ-ヶ]{1,5})\s*([一-龥々ぁ-んァ-ヶ]{1,5})\s*先生",
+                        bt_joined,
+                    )
+                    if m:
+                        cand = norm_name(m.group(1) + m.group(2))
+                        cand_ns = cand.replace(" ", "").replace("\u3000", "")
+                        if cand_ns == hint_sp and is_valid_person_name(cand):
+                            t.speaker = cand
+                            t.speaker_display = build_speaker_display(cand) or cand
+                            matched_hints.add(hint_sp)
+                            print(f"[hints-fill] talk speaker from blocks: '{cand}'")
+                            found = True
+                            break
+                if found:
+                    break
+
+    # ---- talk affiliation: speaker は埋まっているが affiliation が空 ----
+    if payload.talks and hints._correct_json:
+        def _ns(s): return (s or "").replace(" ", "").replace("\u3000", "")
+        ct_list = hints._correct_json.get("talks") or []
+        ct_by_sp = {_ns(ct.get("speaker", "")): ct for ct in ct_list if ct.get("speaker")}
+        for t in payload.talks:
+            if getattr(t, "affiliation", ""):
+                continue
+            sp_ns = _ns(getattr(t, "speaker", ""))
+            ct = ct_by_sp.get(sp_ns)
+            if not ct or not ct.get("affiliation"):
+                continue
+            ct_aff_ns = _ns(ct["affiliation"])
+            if ct_aff_ns and ct_aff_ns in all_text_ns:
+                # blocks に実在 → blocks のテキストから抽出
+                for b in blocks:
+                    bt = _bt(b)
+                    for line in bt.split("\n"):
+                        line_ns = line.replace(" ", "").replace("\u3000", "")
+                        if ct_aff_ns in line_ns:
+                            t.affiliation = normalize_space(line)
+                            print(f"[hints-fill] talk affiliation from blocks: '{t.affiliation}'")
+                            break
+                    if t.affiliation:
+                        break
+
+    # ---- expected_talk_count vs actual: 警告 ----
+    if hints.expected_talk_count > 0:
+        actual = len(payload.talks or [])
+        if actual != hints.expected_talk_count:
+            print(f"[hints-fill] talk count mismatch: expected={hints.expected_talk_count} actual={actual}")
+            _w = list(payload.warnings or [])
+            if "talk_count_mismatch" not in _w:
+                _w.append("talk_count_mismatch")
+            payload.warnings = _w
+
+    return payload
+
+
 def apply_correct_answer_overlay(payload: DesignJSON, blocks: list, vm_rows: list | None = None) -> DesignJSON:
     """
-    後処理で上書きされたフィールドを正解DBから復元する。
-    - 類似度 >= 0.80 : organizer, chair を復元
-    - 類似度 >= 0.85 : event_title も復元（類似だが別イベントの誤上書きを防止）
-    - 類似度 >= 0.90 : talks の speaker / affiliation / title も復元（同一書類の可能性が高い）
-    vm_rows が指定されていてスピーカーが VM で確認済みの場合はタイトル上書きを行わない。
+    正解DBを参照して「フォーマットの精度向上」と「信頼度スコアリング」を行う。
+    テキスト内容の上書きは一切行わない（blocks に存在しないテキストを導入しない）。
+    空フィールドで DB 値が blocks 内に存在する場合のみ補完する。
+
+    適用対象:
+    - 名前の正規化（スペース位置の復元: 髙田慶応 → 髙田 慶応）
+    - name_display の復元（同一人物の場合のみ）
+    - 改行位置の復元（event_title_lines, title_lines）
+    - 所属のフォーマット復元（内容同一の場合のみスペース位置を復元）
+    - 空フィールドの補完（DB値が blocks 内に実在する場合のみ）
+    - 信頼度スコアリング（DB との一致度に基づく confidence 値の算出）
     """
     try:
         all_blocks_text = " ".join(
             (b.get("text", "") if isinstance(b, dict) else getattr(b, "text", ""))
             for b in blocks
         )
+        all_blocks_ns = all_blocks_text.replace(" ", "").replace("\u3000", "")
         event_title = payload.event_title or ""
 
         similar = find_similar_correct_answers(all_blocks_text, event_title, top_k=1)
@@ -7918,252 +8163,270 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list, vm_rows: lis
         correct = best.get("correct_json") or {}
         print(f"[correct-answer-overlay] sim={sim:.2f} job_id={best.get('job_id','')}")
 
-        def _pick_better_affiliation_simple(cur: str, ct: str) -> str:
-            """現在値と正解DB値を比較し、より詳細な方を返す。
-            Layer-3: 内容が同じならフォーマット復元、包含なら詳細な方、異なるなら現在値を優先。"""
-            if not cur:
-                return ct
-            if not ct:
+        def _ns(s: str) -> str:
+            """正規化: スペース全除去"""
+            return (s or "").replace(" ", "").replace("\u3000", "")
+
+        def _format_if_same(cur: str, db: str) -> str:
+            """内容が同一ならDBのフォーマット（スペース位置）を採用、異なるなら現在値を維持"""
+            if not cur or not db:
                 return cur
-            cur_ns = cur.replace(" ", "").replace("\u3000", "")
-            ct_ns = ct.replace(" ", "").replace("\u3000", "")
-            if cur_ns == ct_ns:
-                # 内容同一 → DBのフォーマット（スペース位置）を採用
-                return ct
-            if cur_ns.startswith(ct_ns) or ct_ns in cur_ns:
-                print(f"[correct-answer-overlay] keep current affiliation (superset): '{cur[:50]}'")
-                return cur
-            if ct_ns.startswith(cur_ns) or cur_ns in ct_ns:
-                print(f"[correct-answer-overlay] use DB affiliation (superset): '{ct[:50]}'")
-                return ct
-            # 包含関係なし → 現在の抽出結果を優先（完全上書き廃止）
+            if _ns(cur) == _ns(db):
+                return db
             return cur
 
-        # event_title 完全一致なら同一イベントの確度が非常に高い → talks 閾値を緩和
-        correct_title = normalize_key(correct.get("event_title", ""))
-        current_title = normalize_key(payload.event_title or "")
-        title_exact_match = (correct_title and current_title and correct_title == current_title)
-        _should_apply_title = title_exact_match  # デフォルト: 完全一致時のみ True (0.85 判定で更新)
-        if title_exact_match:
-            print(f"[correct-answer-overlay] event_title exact match → talks threshold lowered")
+        def _find_text_in_blocks(target_ns: str) -> str | None:
+            """blocks 内に target_ns (normalized) が存在すれば元テキスト行を返す"""
+            if not target_ns or target_ns not in all_blocks_ns:
+                return None
+            for b in blocks:
+                bt = b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")
+                for line in bt.split("\n"):
+                    if target_ns in line.replace(" ", "").replace("\u3000", ""):
+                        return normalize_space(line)
+            return None
 
-        # ---- organizer ----
-        if correct.get("organizer"):
-            payload.organizer = correct["organizer"]
-
-        # ---- chair ----
+        # ---- chair: 同一人物ならスペース位置 / name_display を復元 ----
         cc = correct.get("chair") or {}
         if cc and payload.chair:
             cc_name = cc.get("name", "")
-            if cc_name:
-                # 見出しワードは名前として無効
-                _heading = {"PROGRAM", "P R O G R A M", "AGENDA", "SCHEDULE"}
-                if cc_name.upper() not in _heading:
-                    # blocks 内に座長名が実在する場合のみ上書き（別イベントの座長誤適用を防止）
-                    _cc_name_key = cc_name.replace(" ", "").replace("\u3000", "")
-                    _blocks_text = all_blocks_text.replace(" ", "").replace("\u3000", "")
-                    if _cc_name_key and _cc_name_key in _blocks_text:
-                        # Layer 3: 同一人物ならスペース位置のみ復元、別人なら上書きしない
-                        _cur_chair_ns = (payload.chair.name or "").replace(" ", "").replace("\u3000", "")
-                        if not _cur_chair_ns or _cur_chair_ns == _cc_name_key:
-                            # 現在未設定 or 同一人物 → name/display を復元
-                            payload.chair.name = cc_name
-                            _cc_disp = cc.get("name_display") or ""
-                            if _cc_disp:
-                                # name_display がこの chair 名と対応しているか検証（corrupt DBエントリ対策）
-                                _disp_ns = _cc_disp.replace(" ", "").replace("\u3000", "")
-                                if _disp_ns == _cc_name_key:
-                                    payload.chair.name_display = _cc_disp
-                                else:
-                                    print(f"[correct-answer-overlay] skip name_display: mismatch '{_cc_disp}' for chair '{cc_name}'")
-                        else:
-                            print(f"[correct-answer-overlay] chair name differs, skip: cur='{_cur_chair_ns[:20]}' db='{_cc_name_key[:20]}'")
-                            cc_name = ""  # affiliation も適用しない
-                    else:
-                        print(f"[correct-answer-overlay] chair name '{cc_name}' not found in blocks, skip")
-                        cc_name = ""  # affiliation も適用しない
-            if cc_name and cc.get("affiliation"):
-                # 明らかに不正な所属値は除外
-                _bad_aff = {"P R O G R A M", "PROGRAM", "AGENDA"}
-                if cc["affiliation"].upper().strip() not in _bad_aff:
-                    payload.chair.affiliation = _pick_better_affiliation_simple(
+            cur_name = getattr(payload.chair, "name", "") or ""
+            if cc_name and cur_name and _ns(cur_name) == _ns(cc_name):
+                # 同一人物 → スペース位置を復元
+                payload.chair.name = cc_name
+                cc_disp = cc.get("name_display") or ""
+                if cc_disp and _ns(cc_disp) == _ns(cc_name):
+                    payload.chair.name_display = cc_disp
+                # 所属: 内容同一ならフォーマット復元
+                if cc.get("affiliation"):
+                    payload.chair.affiliation = _format_if_same(
                         getattr(payload.chair, "affiliation", "") or "",
                         cc["affiliation"],
                     )
+            elif cc_name and not cur_name:
+                # 座長名が空 → DB値が blocks 内に存在すれば補完
+                found = _find_text_in_blocks(_ns(cc_name))
+                if found:
+                    # blocks のテキストから人名を抽出
+                    m = re.search(r"([一-龥々ぁ-んァ-ヶ]{1,5})\s*([一-龥々ぁ-んァ-ヶ]{1,5})\s*先生?", found)
+                    if m:
+                        cand = norm_name(m.group(1) + m.group(2))
+                        if _ns(cand) == _ns(cc_name):
+                            payload.chair.name = cand
+                            payload.chair.name_display = cand
+                            print(f"[correct-answer-overlay] chair.name filled from blocks: '{cand}'")
 
-        # ---- event_title ---- (sim >= 0.85: 同一/ほぼ同一イベントの可能性が高い)
-        if sim >= 0.85:
-            # 正解タイトルが現在タイトルと大きく異なる場合は上書きしない
-            # （類似ブロックテキストだがイベント名が違う別イベントへの誤適用を防ぐ）
-            _correct_etl = correct.get("event_title_lines") or ([correct["event_title"]] if correct.get("event_title") else [])
-            _correct_et = normalize_key("".join(_correct_etl))
-            _should_apply_title = True
+            # chair affiliation: 空 + DB値がblocksにある場合のみ補完
+            if cc.get("affiliation") and not (getattr(payload.chair, "affiliation", "") or "").strip():
+                found_aff = _find_text_in_blocks(_ns(cc["affiliation"]))
+                if found_aff:
+                    payload.chair.affiliation = found_aff
+                    print(f"[correct-answer-overlay] chair.affiliation filled from blocks: '{found_aff}'")
 
-            # 現在のタイトルが blocks 内に実在する → 正しく取れているので上書きしない
-            if current_title and not title_exact_match:
-                _current_et_ns = current_title.replace(" ", "").replace("\u3000", "").lower()
-                _blocks_text_lower = all_blocks_text.replace(" ", "").replace("\u3000", "").lower()
-                if _current_et_ns and _current_et_ns in _blocks_text_lower:
-                    _should_apply_title = False
-                    # VM 講演会名 と 正解DBタイトルがほぼ一致 → 同一イベントと確認済みなので上書き許可
-                    # （画像タイトルを誤抽出して別テキストが selected されているケースへの対応）
-                    if vm_rows and _correct_et:
-                        _vm_title_ns = ""
-                        for _r in vm_rows:
-                            _d = _r if isinstance(_r, dict) and "data" not in _r else (_r.get("data") or {})
-                            _vt = normalize_space(_d.get("講演会名") or "")
-                            if _vt:
-                                _vm_title_ns = _vt.replace(" ", "").replace("\u3000", "")
-                                break
-                        if _vm_title_ns:
-                            _vm_db_sim = SequenceMatcher(None, _vm_title_ns.lower(), _correct_et.replace(" ", "").replace("\u3000", "").lower()).ratio()
-                            if _vm_db_sim >= 0.7:
-                                _should_apply_title = True
-                                print(f"[correct-answer-overlay] VM 講演会名≈DB title (vm_db_sim={_vm_db_sim:.2f}), allow title overlay")
-                    _reason = "VM title match" if _should_apply_title else ""
-                    print(f"[correct-answer-overlay] {_reason + ' + ' if _reason else ''}current event_title found in blocks, {'allow' if _should_apply_title else 'skip'} title overlay ('{current_title[:40]}')")
+        # ---- event_title: 内容同一なら改行位置のみ復元 ----
+        _ct_etl = correct.get("event_title_lines") or ([correct["event_title"]] if correct.get("event_title") else [])
+        if _ct_etl:
+            _ct_et_ns = _ns("".join(_ct_etl))
+            _cur_et_ns = _ns((payload.event_title or "").replace("\n", ""))
+            if _ct_et_ns and _cur_et_ns and _ct_et_ns == _cur_et_ns:
+                payload.event_title_lines = _ct_etl
+                payload.event_title = "\n".join(_ct_etl)
+                print(f"[correct-answer-overlay] event_title_lines linebreak restored: {_ct_etl}")
 
-            if _should_apply_title and _correct_et and current_title and not title_exact_match:
-                # Jaccard係数でタイトル単体の類似度をチェック
-                _ct_chars = set(_correct_et)
-                _cur_chars = set(current_title)
-                _title_jaccard = len(_ct_chars & _cur_chars) / max(len(_ct_chars | _cur_chars), 1)
-                # さらにblocks内に正解タイトルの主要部分が存在するか確認
-                _blocks_text_ns = all_blocks_text.replace(" ", "").replace("\u3000", "")
-                _correct_et_ns = _correct_et.replace(" ", "").replace("\u3000", "")
-                _title_in_blocks = _correct_et_ns and _correct_et_ns in _blocks_text_ns
-                if _title_jaccard < 0.5 and not _title_in_blocks:
-                    _should_apply_title = False
-                    print(f"[correct-answer-overlay] event_title mismatch: jaccard={_title_jaccard:.2f}, skip title overlay ('{current_title[:30]}' vs '{_correct_et[:30]}')")
+        # ---- organizer: 内容同一ならフォーマット復元、空なら blocks から補完 ----
+        if correct.get("organizer"):
+            cur_org = getattr(payload, "organizer", "") or ""
+            if cur_org:
+                payload.organizer = _format_if_same(cur_org, correct["organizer"])
+            else:
+                # 空 → DB値が blocks にあれば補完
+                found_org = _find_text_in_blocks(_ns(correct["organizer"]))
+                if found_org:
+                    payload.organizer = found_org
+                    print(f"[correct-answer-overlay] organizer filled from blocks: '{found_org}'")
 
-            if _should_apply_title:
-                _ct_etl = correct.get("event_title_lines") or ([correct["event_title"]] if correct.get("event_title") else [])
-                if _ct_etl:
-                    # Layer 2: 内容が同一なら改行位置のみ復元（テキスト内容は変更しない）
-                    _ct_et_ns = "".join(_ct_etl).replace(" ", "").replace("\u3000", "")
-                    _cur_et_ns = (payload.event_title or "").replace("\n", "").replace(" ", "").replace("\u3000", "")
-                    if _ct_et_ns and _cur_et_ns and _ct_et_ns == _cur_et_ns:
-                        # 内容同一 → title_lines の改行位置だけ復元
-                        payload.event_title_lines = _ct_etl
-                        payload.event_title = "\n".join(_ct_etl)
-                        print(f"[correct-answer-overlay] event_title_lines linebreak restored: {_ct_etl}")
-                    else:
-                        # 内容が異なる → 完全上書き廃止（Layer 2: テキスト変更なし）
-                        print(f"[correct-answer-overlay] event_title content differs, skip overwrite: cur='{_cur_et_ns[:30]}' db='{_ct_et_ns[:30]}'")
+        # ---- talks: 同一演者の場合のみフォーマット復元 + 空フィールド補完 ----
+        ct_list = correct.get("talks") or []
+        if ct_list and payload.talks:
+            # speaker名ベースでマッチング
+            ct_by_speaker = {}
+            for ct in ct_list:
+                sp = _ns(ct.get("speaker", ""))
+                if sp:
+                    ct_by_speaker[sp] = ct
 
-        # ---- talks (高類似度 or event_title完全一致: 同一ドキュメントの可能性が高い) ----
-        # ただしタイトルが別イベントと判定された場合はtalksも適用しない
-        talks_threshold = 0.80 if title_exact_match else 0.90
-        if sim >= talks_threshold and _should_apply_title:
-            ct_list = correct.get("talks") or []
-            if ct_list and payload.talks:
-                def _sp_key(s):
-                    return (s or "").replace(" ", "").replace("\u3000", "")
+            for t in payload.talks:
+                sp = _ns(getattr(t, "speaker", ""))
 
-                def _title_key(s):
-                    """改行・空白を除去した演題テキスト"""
-                    return (s or "").replace("\n", "").replace(" ", "").replace("\u3000", "")
+                if sp and sp in ct_by_speaker:
+                    ct = ct_by_speaker[sp]
 
-                def _title_similar(ct_title, cur_title):
-                    """演題の内容がほぼ同じか（改行位置だけ違うケース）"""
-                    k1 = _title_key(ct_title)
-                    k2 = _title_key(cur_title)
-                    if not k1 or not k2:
-                        return False
-                    return k1 == k2
-
-                def _pick_better_affiliation(cur: str, ct: str) -> str:
-                    """現在値と正解DB値を比較し、より詳細・正確な方を返す。
-                    判定基準:
-                      1. 片方が空 → 非空の方
-                      2. 正規化後に同一 → 正解DB値（フォーマットが正確）
-                      3. 一方が他方を包含 → 長い方（より詳細）
-                      4. どちらも包含しない → 正解DB値（学習済み正解を優先）
-                    """
-                    if not cur:
-                        return ct
-                    if not ct:
-                        return cur
-                    cur_ns = cur.replace(" ", "").replace("\u3000", "")
-                    ct_ns = ct.replace(" ", "").replace("\u3000", "")
-                    if cur_ns == ct_ns:
-                        # 内容同一 → 正解DB値を採用（ユーザー確定済みフォーマット）
-                        return ct
-                    if cur_ns.startswith(ct_ns) or ct_ns in cur_ns:
-                        # 現在値がDB値を包含 → 現在値を維持（より詳細）
-                        print(f"[correct-answer-overlay] keep current affiliation (superset): '{cur[:50]}'")
-                        return cur
-                    if ct_ns.startswith(cur_ns) or cur_ns in ct_ns:
-                        # DB値が現在値を包含 → DB値で上書き（より詳細）
-                        print(f"[correct-answer-overlay] use DB affiliation (superset): '{ct[:50]}'")
-                        return ct
-                    # 包含関係なし → 現在の抽出結果を優先（完全上書き廃止）
-                    return cur
-
-                def _apply_talk_overlay(ct, t):
-                    """1 talk分のoverlayを適用"""
-                    # Layer 3: speaker は内容が同じ場合のみスペース位置を復元（テキスト変更なし）
+                    # speaker: スペース位置を復元
                     ct_sp = ct.get("speaker") or ""
-                    if ct_sp:
-                        cur_sp = getattr(t, "speaker", "") or ""
-                        ct_sp_ns = ct_sp.replace(" ", "").replace("\u3000", "")
-                        cur_sp_ns = cur_sp.replace(" ", "").replace("\u3000", "")
-                        if ct_sp_ns and ct_sp_ns == cur_sp_ns:
-                            # 同一人物: スペース位置を復元
-                            t.speaker = ct_sp
-                            ct_disp = ct.get("speaker_display") or ""
-                            if ct_disp:
-                                t.speaker_display = ct_disp
-                        # 異なる場合は上書きしない（現在の抽出結果を信頼）
-                    # affiliation: Layer 3 — 内容同一ならフォーマット復元、包含なら詳細な方、異なるなら現在値を優先
+                    if ct_sp and _ns(ct_sp) == sp:
+                        t.speaker = ct_sp
+                        ct_disp = ct.get("speaker_display") or ""
+                        if ct_disp:
+                            t.speaker_display = ct_disp
+
+                    # affiliation: 内容同一ならフォーマット復元、空なら blocks から補完
                     if ct.get("affiliation"):
-                        t.affiliation = _pick_better_affiliation(
-                            getattr(t, "affiliation", "") or "",
-                            ct["affiliation"] or "",
-                        )
-                    # title: 内容が同じ場合のみ改行位置を復元（演題変更時は上書きしない）
-                    ct_title = "\n".join(ct.get("title_lines", [])) or ct.get("title", "")
+                        cur_aff = getattr(t, "affiliation", "") or ""
+                        if cur_aff:
+                            t.affiliation = _format_if_same(cur_aff, ct["affiliation"])
+                        else:
+                            found_aff = _find_text_in_blocks(_ns(ct["affiliation"]))
+                            if found_aff:
+                                t.affiliation = found_aff
+                                print(f"[correct-answer-overlay] talk affiliation filled from blocks: '{found_aff}'")
+
+                    # title: 内容同一なら改行位置を復元
+                    ct_title_lines = ct.get("title_lines") or []
+                    ct_title = "\n".join(ct_title_lines) or ct.get("title", "")
                     cur_title = getattr(t, "title", "") or ""
-                    if ct.get("title_lines") and _title_similar(ct_title, cur_title):
-                        t.title_lines = fix_title_lines_jp(ct["title_lines"])
+                    if ct_title_lines and _ns(ct_title.replace("\n", "")) == _ns(cur_title.replace("\n", "")):
+                        t.title_lines = fix_title_lines_jp(ct_title_lines)
                         t.title = "\n".join(t.title_lines)
 
-                # 件数一致なら index ベースで復元（ただし演者名が一致する場合のみ）
-                if len(ct_list) == len(payload.talks):
-                    all_matched = True
-                    for i, ct in enumerate(ct_list):
-                        ct_sp = _sp_key(ct.get("speaker", ""))
-                        cur_sp = _sp_key(getattr(payload.talks[i], "speaker", ""))
-                        if ct_sp and cur_sp and ct_sp != cur_sp:
-                            all_matched = False
-                            break
+                elif not sp:
+                    # speaker が空 → DB のいずれかのスピーカーが blocks に存在すれば補完
+                    matched_speakers = {_ns(getattr(tt, "speaker", "")) for tt in payload.talks if getattr(tt, "speaker", "")}
+                    for hint_sp, ct in ct_by_speaker.items():
+                        if hint_sp in matched_speakers:
+                            continue
+                        found_sp = _find_text_in_blocks(hint_sp)
+                        if found_sp:
+                            m = re.search(r"([一-龥々ぁ-んァ-ヶ]{1,5})\s*([一-龥々ぁ-んァ-ヶ]{1,5})", found_sp)
+                            if m:
+                                cand = norm_name(m.group(1) + m.group(2))
+                                if _ns(cand) == hint_sp:
+                                    t.speaker = cand
+                                    t.speaker_display = build_speaker_display(cand) or cand
+                                    print(f"[correct-answer-overlay] talk speaker filled from blocks: '{cand}'")
+                                    break
 
-                    if all_matched:
-                        for i, ct in enumerate(ct_list):
-                            _apply_talk_overlay(ct, payload.talks[i])
-                    else:
-                        # 演者不一致 → speaker名ベースマッチにフォールバック
-                        print(f"[correct-answer-overlay] index-based skipped: speaker mismatch, falling back to name-based")
-                        ct_by_speaker = {}
-                        for ct in ct_list:
-                            sp = _sp_key(ct.get("speaker", ""))
-                            if sp:
-                                ct_by_speaker[sp] = ct
-                        for t in payload.talks:
-                            sp = _sp_key(getattr(t, "speaker", ""))
-                            if sp and sp in ct_by_speaker:
-                                _apply_talk_overlay(ct_by_speaker[sp], t)
+        # ---- 信頼度スコアリング（正解DB + VM） ----
+        _conf_scores = []
+
+        def _field_conf(cur: str, db: str) -> float:
+            """フィールドレベルの信頼度: 1.0=完全一致, 0.8=包含, 0.3=不一致, 0.0=欠損"""
+            cur_n = _ns(cur or "")
+            db_n = _ns(db or "")
+            if not db_n:
+                return 1.0  # DB に期待値なし → 常に OK
+            if not cur_n:
+                return 0.0  # 欠損
+            if cur_n == db_n:
+                return 1.0  # 完全一致
+            if cur_n in db_n or db_n in cur_n:
+                return 0.8  # 包含関係
+            return 0.3      # 不一致
+
+        # --- 正解DBとの照合 ---
+        # chair
+        if cc.get("name"):
+            _conf_scores.append(("db:chair.name", _field_conf(
+                getattr(payload.chair, "name", ""), cc["name"])))
+        # organizer
+        if correct.get("organizer"):
+            _conf_scores.append(("db:organizer", _field_conf(
+                payload.organizer, correct["organizer"])))
+        # event_title
+        if correct.get("event_title"):
+            _conf_scores.append(("db:event_title", _field_conf(
+                payload.event_title, correct["event_title"])))
+        # talks
+        for i, ct in enumerate(ct_list):
+            if ct.get("speaker"):
+                sp_val = ""
+                if i < len(payload.talks):
+                    sp_val = getattr(payload.talks[i], "speaker", "")
+                _conf_scores.append((f"db:talk[{i}].speaker", _field_conf(sp_val, ct["speaker"])))
+            if ct.get("title"):
+                t_val = ""
+                if i < len(payload.talks):
+                    t_val = getattr(payload.talks[i], "title", "")
+                _conf_scores.append((f"db:talk[{i}].title", _field_conf(t_val, ct["title"])))
+
+        # --- VMとの照合 ---
+        if vm_rows:
+            _vm_speakers = []
+            _vm_titles = []
+            _vm_event_title = ""
+            _vm_affs = []
+            for _r in vm_rows:
+                _d = _r if isinstance(_r, dict) and "data" not in _r else (_r.get("data") or {})
+                _sp = _norm_person_name(_d.get("案内状掲載 医師名") or "")
+                _vt = normalize_space(_d.get("演題") or "")
+                _role = (_d.get("役職") or "").strip()
+                _fac = normalize_space(_d.get("案内状掲載 施設名") or "")
+                if not _vm_event_title:
+                    _vm_event_title = normalize_space(_d.get("講演会名") or "")
+                if _role == "演者" and _sp:
+                    _vm_speakers.append(_sp)
+                    _vm_titles.append(_vt)
+                    _vm_affs.append(_fac)
+
+            # VM event_title
+            if _vm_event_title:
+                _conf_scores.append(("vm:event_title", _field_conf(
+                    payload.event_title, _vm_event_title)))
+
+            # VM talks: speaker / title / affiliation
+            _payload_sp_map = {}
+            for t in (payload.talks or []):
+                sp_key = _ns(_norm_person_name(getattr(t, "speaker", "") or ""))
+                if sp_key:
+                    _payload_sp_map[sp_key] = t
+
+            for vi, vm_sp in enumerate(_vm_speakers):
+                vm_sp_ns = _ns(vm_sp)
+                if vm_sp_ns and vm_sp_ns in _payload_sp_map:
+                    _conf_scores.append((f"vm:talk.speaker[{vi}]", 1.0))
+                    # title
+                    if vi < len(_vm_titles) and _vm_titles[vi]:
+                        t_obj = _payload_sp_map[vm_sp_ns]
+                        _conf_scores.append((f"vm:talk.title[{vi}]", _field_conf(
+                            getattr(t_obj, "title", ""), _vm_titles[vi])))
+                    # affiliation (施設名)
+                    if vi < len(_vm_affs) and _vm_affs[vi]:
+                        t_obj = _payload_sp_map[vm_sp_ns]
+                        _conf_scores.append((f"vm:talk.affil[{vi}]", _field_conf(
+                            getattr(t_obj, "affiliation", ""), _vm_affs[vi])))
+                elif vm_sp_ns:
+                    _conf_scores.append((f"vm:talk.speaker[{vi}]", 0.0))
+                    print(f"[confidence] vm speaker not found: '{vm_sp}'")
+
+            # VM talk_count
+            if _vm_speakers:
+                actual_count = len(payload.talks or [])
+                expected_count = len(_vm_speakers)
+                if actual_count == expected_count:
+                    _conf_scores.append(("vm:talk_count", 1.0))
+                elif abs(actual_count - expected_count) == 1:
+                    _conf_scores.append(("vm:talk_count", 0.6))
                 else:
-                    # 件数不一致: speaker名でマッチングして復元
-                    ct_by_speaker = {}
-                    for ct in ct_list:
-                        sp = _sp_key(ct.get("speaker", ""))
-                        if sp:
-                            ct_by_speaker[sp] = ct
-                    for t in payload.talks:
-                        sp = _sp_key(getattr(t, "speaker", ""))
-                        if sp and sp in ct_by_speaker:
-                            _apply_talk_overlay(ct_by_speaker[sp], t)
+                    _conf_scores.append(("vm:talk_count", 0.2))
+
+        if _conf_scores:
+            vals = [v for _, v in _conf_scores]
+            avg_conf = sum(vals) / len(vals)
+            payload.confidence = round(avg_conf, 2)
+
+            # 低信頼フィールドをログ出力
+            low_fields = [(name, v) for name, v in _conf_scores if v < 0.8]
+            if low_fields:
+                for name, v in low_fields:
+                    print(f"[confidence] low: {name}={v:.1f}")
+
+            print(f"[confidence] overall={payload.confidence:.2f} ({len(_conf_scores)} fields)")
+
+            # 低信頼警告
+            if avg_conf < 0.7:
+                _w = list(payload.warnings or [])
+                if "low_confidence" not in _w:
+                    _w.append("low_confidence")
+                payload.warnings = _w
 
     except Exception as e:
         print(f"[correct-answer-overlay] error: {e}")
@@ -10940,13 +11203,14 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
 
     def _find_talk_anchor(no: int) -> Optional[TextBlock]:
         labels_by_no = {
-            1: ["講演1", "講演１", "講演①", "講演Ⅰ", "教育講演"],
-            2: ["講演2", "講演２", "講演②", "講演Ⅱ"],
-            3: ["講演3", "講演３", "講演③", "講演Ⅲ", "特別講演"],
-            4: ["講演4", "講演４", "講演④", "講演Ⅳ"],
+            1: ["講演1", "講演１", "講演①", "講演Ⅰ", "教育講演", "演題1", "演題１", "演題①"],
+            2: ["講演2", "講演２", "講演②", "講演Ⅱ", "演題2", "演題２", "演題②"],
+            3: ["講演3", "講演３", "講演③", "講演Ⅲ", "特別講演", "演題3", "演題３", "演題③"],
+            4: ["講演4", "講演４", "講演④", "講演Ⅳ", "演題4", "演題４", "演題④"],
         }
 
-        labels = labels_by_no.get(no, [f"講演{no}", f"講演{str(no).translate(str.maketrans('1234567890', '１２３４５６７８９０'))}"])
+        no_zen = str(no).translate(str.maketrans('1234567890', '１２３４５６７８９０'))
+        labels = labels_by_no.get(no, [f"講演{no}", f"講演{no_zen}", f"演題{no}", f"演題{no_zen}"])
 
         for b in ordered:
             # 改行で分割してから各行を検索（時間が連結されて誤マッチを防ぐ）
@@ -11280,9 +11544,18 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         if any(x in s for x in bad):
             return True
 
+        # 明らかに人名ではない一般語
+        s_ns = s.replace(" ", "").replace("　", "")
+        non_person_words = {
+            "遠慮", "参加", "視聴", "登録", "配信", "質問", "回答",
+            "講演", "演題", "座長", "司会", "開催", "案内", "申請",
+            "治療", "診断", "手術", "検査", "予防", "感染",
+        }
+        if s_ns in non_person_words:
+            return True
+
         # 長すぎる
-        s2 = s.replace(" ", "").replace("　", "")
-        if len(s2) > 10:
+        if len(s_ns) > 10:
             return True
 
         return False
@@ -11370,6 +11643,27 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
 
         # speaker / affiliation
         speaker, affiliation = _extract_person_near_enja(seg,chair_name=getattr(payload.chair, "name", "") or "",chair_aff=getattr(payload.chair, "affiliation", "") or "",)
+
+        # フォールバック: "演者"ラベルが無い場合、"先生"ブロックから演者名を抽出
+        if not speaker:
+            chair_name_key = normalize_key(getattr(payload.chair, "name", "") or "").replace("先生", "")
+            for b in sorted(seg, key=lambda x: (x.top, x.left)):
+                bt = normalize_space(b.text or "")
+                if "先生" not in bt:
+                    continue
+                # 所属っぽいブロックは除外（大学/病院等が先頭にある）
+                bt_key = normalize_key(bt)
+                if any(bt_key.startswith(normalize_key(w)) for w in ["大学", "病院", "センター", "クリニック"]):
+                    continue
+                # "姓\n名先生" or "姓 名 先生" パターンから名前を抽出
+                bt_joined = bt.replace("\n", " ")
+                m_name = re.search(r"([一-龥々ぁ-んァ-ヶ]{1,5})\s*([一-龥々ぁ-んァ-ヶ]{1,5})\s*先生", bt_joined)
+                if m_name:
+                    cand = norm_name(m_name.group(1) + m_name.group(2))
+                    cand_key = normalize_key(cand).replace("先生", "")
+                    if cand_key and cand_key != chair_name_key and is_valid_person_name(cand):
+                        speaker = cand
+                        break
 
         if speaker and (not t.speaker or is_bad_speaker(t.speaker)):
             sp = clean_speaker_text(speaker)
@@ -11843,11 +12137,11 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
             _vm_post_norm = _vm_title_post.replace(" ", "").replace("\u3000", "")
             _post_jaccard = len(set(_ai_et_norm) & set(_vm_post_norm)) / max(len(set(_ai_et_norm) | set(_vm_post_norm)), 1)
             if _post_jaccard < 0.5:
-                print(f"[vm-event-title] restore VM 講演会名 after AI: '{_vm_title_post}' (was: '{refined.event_title[:40]}', jaccard={_post_jaccard:.2f})")
-                refined.event_title_lines = [_vm_title_post]
-                refined.event_title = _vm_title_post
+                # blocks に存在しないテキストは導入しない（ログのみ）
+                print(f"[vm-event-title] mismatch: vm='{_vm_title_post[:40]}' ai='{refined.event_title[:40]}' jaccard={_post_jaccard:.2f} (skip overwrite)")
 
-    # AI が VM 演題を上書きした場合に再適用（スピーカー名で照合）
+    # AI が VM 演題を上書きした場合 → blocks に存在しないテキストは導入しない
+    # VM 演題は参考情報としてのみ使用（上書き廃止）
     if vm_rows and refined.talks:
         _vm_by_speaker: dict[str, str] = {}
         for _r in vm_rows:
@@ -11865,9 +12159,7 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
             _vm_enden_norm = _vm_enden.replace(" ", "").replace("\u3000", "")
             _t_jaccard = len(set(_ai_title_norm) & set(_vm_enden_norm)) / max(len(set(_ai_title_norm) | set(_vm_enden_norm)), 1)
             if _t_jaccard < 0.4:
-                print(f"[vm-talk-title] restore VM 演題 for '{_sp_key}': '{_vm_enden[:40]}' (was: '{_ai_title_norm[:40]}', jaccard={_t_jaccard:.2f})")
-                _t.title = _vm_enden
-                _t.title_lines = [ln for ln in _vm_enden.split("\n") if normalize_space(ln)]
+                print(f"[vm-talk-title] mismatch for '{_sp_key}': vm='{_vm_enden[:40]}' ai='{_ai_title_norm[:40]}' jaccard={_t_jaccard:.2f} (skip overwrite)")
 
     def has_chair_shift_pattern(payload: DesignJSON) -> bool:
         talks = list(payload.talks or [])
@@ -11896,6 +12188,12 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
 
     refined = repair_talks_from_blocks(refined, blocks)
     dump_titles("after repair_talks_from_blocks", refined)
+
+    # 正解DBヒントによる空フィールド補完（blocks 内に実在するテキストのみ）
+    _ca_hints = compute_correct_answer_hints(blocks, refined.event_title or "")
+    refined = fill_empty_fields_from_blocks_with_hints(refined, blocks, _ca_hints)
+    dump_titles("after fill_empty_fields_from_blocks_with_hints", refined)
+
     refined = assign_talk_times_by_anchor(blocks, refined)
     dump_titles("after assign_talk_times_by_anchor", refined)
 
@@ -11906,6 +12204,24 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
     # 最終手段：上位の時間による割り当て
     refined.talks = assign_talk_times_by_nearest_upper_time(blocks, refined.talks)
     dump_titles("after assign_talk_times_by_nearest_upper_time", refined)
+
+    # 時間が割り当てられた talks を時間順にソート（演題番号順に整列）
+    def _sort_talks_by_time(talks):
+        if not talks or len(talks) <= 1:
+            return talks
+        # 全 talk に時間が設定されている場合のみソート
+        if all(normalize_space(getattr(t, "time", "") or "") for t in talks):
+            def _time_sort_key(t):
+                tm = normalize_space(getattr(t, "time", "") or "")
+                m = re.match(r"(\d{1,2}):(\d{2})", tm)
+                if m:
+                    return int(m.group(1)) * 60 + int(m.group(2))
+                return 9999
+            return sorted(talks, key=_time_sort_key)
+        return talks
+
+    refined.talks = _sort_talks_by_time(list(refined.talks or []))
+    dump_titles("after sort_talks_by_time", refined)
 
     def _same_person(a: str, b: str) -> bool:
         return normalize_key(a or "").replace("先生", "") == normalize_key(b or "").replace("先生", "")
