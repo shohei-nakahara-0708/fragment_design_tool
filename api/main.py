@@ -11643,6 +11643,14 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
     # talks[0], talks[1]... を各「講演N」アンカーから拾い直す
     talks = list(payload.talks or [])
 
+    # ラベル語が所属に入っていたらクリア（"演者", "座長" 等）
+    _label_aff_pat = re.compile(r'^(演者|座長|講演\d*|演題\d*)$')
+    for t in talks:
+        aff_ns = re.sub(r'[\s\u3000]+', '', getattr(t, 'affiliation', '') or '')
+        if aff_ns and _label_aff_pat.match(aff_ns):
+            print(f"[repair-talks] clearing label-like affiliation: '{t.affiliation}'")
+            t.affiliation = ''
+
     for idx, t in enumerate(talks, start=1):
         anchor = _find_talk_anchor(idx)
         if not anchor:
@@ -11654,7 +11662,7 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         x0 = anchor.left - 2500000
         x1 = anchor.left + 4500000
         y0 = anchor.top - 100000
-        y1 = (next_anchor.top - 150000) if next_anchor else (anchor.top + 2200000)
+        y1 = (next_anchor.top - 150000) if next_anchor else (anchor.top + 3500000)
 
         seg = [b for b in ordered if in_region(b, x0, y0, x1, y1)]
         seg = sorted(seg, key=lambda b: (b.top, b.left))
@@ -11775,8 +11783,17 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
 
     # ── セカンドパス: アンカー順序と talk 順序のズレで拾い漏れた所属を補完 ──
     chair_aff_key = normalize_key(getattr(payload.chair, "affiliation", "") or "")
+    def _is_bad_affiliation(s: str) -> bool:
+        """ラベル語だけ・明らかに不正な所属"""
+        s_ns = re.sub(r'[\s\u3000]+', '', s or '')
+        if not s_ns:
+            return True
+        if _label_aff_pat.match(s_ns):
+            return True
+        return False
+
     for t in talks:
-        if not t.speaker or normalize_space(t.affiliation or ""):
+        if not t.speaker or (normalize_space(t.affiliation or "") and not _is_bad_affiliation(t.affiliation)):
             continue
         speaker_key = normalize_key(t.speaker).replace("先生", "")
         # blocks 全体から speaker 名を含むブロックを探す
