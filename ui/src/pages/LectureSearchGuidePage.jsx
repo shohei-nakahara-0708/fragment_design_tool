@@ -183,7 +183,7 @@ function RowCellPreview({ row }) {
           <small>区分</small>
           <span className="lecture-tool-candidate__value">{row.category || "-"}</span>
         </span>
-        <span className="lecture-tool-candidate__cell">
+        <span className="lecture-tool-candidate__cell lecture-tool-candidate__cell--wide">
           <small>開催日</small>
           <span className="lecture-tool-candidate__value">{row.eventDate || "-"}</span>
         </span>
@@ -1001,9 +1001,7 @@ export default function LectureSearchGuidePage() {
 
 
 
-                          {selectedRow ? (
-                            <SelectedRowInfo row={selectedRow} />
-                          ) : <SelectedRowInfo row={selectedRow} />}
+                          <SelectedRowInfo row={selectedRow} showCellPreview={item.rowNumberMode} />
                         </div>
                       </div>
                     );

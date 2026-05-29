@@ -868,6 +868,48 @@ body {
   font-weight: 900;
 }
 
+.lecture-tool-selected-cells-wrap {
+  display: grid;
+  gap: 6px;
+  max-width: 100%;
+  margin-bottom: 10px;
+  overflow-x: auto;
+  padding: 1px 1px 8px;
+}
+
+.lecture-tool-selected-cells__head {
+  color: #334155;
+  font-size: 12px;
+  font-weight: 950;
+  line-height: 1.35;
+}
+
+.lecture-tool-candidate.lecture-tool-selected-cells {
+  border-color: rgba(148, 163, 184, 0.55);
+  background: #ffffff;
+  cursor: default;
+}
+
+.lecture-tool-candidate.lecture-tool-selected-cells:hover {
+  border-color: rgba(148, 163, 184, 0.55);
+  box-shadow: none;
+}
+
+.lecture-tool-selected-cells .lecture-tool-candidate__cell--strong {
+  background: #f8fafc;
+  color: #0f172a;
+}
+
+.lecture-tool-selected-cells .lecture-tool-candidate__cell {
+  overflow: visible;
+}
+
+.lecture-tool-selected-cells .lecture-tool-candidate__value {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
 .lecture-tool-rowinfo {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
