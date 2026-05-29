@@ -829,7 +829,7 @@ export default function LectureSearchGuidePage() {
                 <div>
                   <strong>行数</strong>
                   <br />
-                  {loadingRows ? "読み込み中" : `${rows.length + 4} 件`}
+                  {loadingRows ? "読み込み中" : `${rows.length > 0 ? rows.length + 4 : 0} 件`}
                 </div>
                 {/* <div>
                   <strong>columns</strong>
