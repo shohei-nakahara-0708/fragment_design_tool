@@ -16,6 +16,7 @@ const WARNING_MAP = {
   no_talks: { label: "講演なし", tone: "red", icon: "✕" },
   talks_pruned_by_vm_hint: { label: "VM絞り込み", tone: "gray", icon: "▾" },
   talks_pruned_heuristic_only: { label: "自動絞り込み", tone: "gray", icon: "▾" },
+  inline_chair_extracted: { label: "途中座長", tone: "green", icon: "✓" },
   talk_count_mismatch: { label: "講演数不一致", tone: "yellow", icon: "!" },
   low_confidence: { label: "低信頼度", tone: "red", icon: "⚠" },
 };

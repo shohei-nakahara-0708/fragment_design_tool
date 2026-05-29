@@ -334,6 +334,10 @@ function ensureBaseDefaults(j) {
   if (!Array.isArray(next.title_overrides)) next.title_overrides = [];
 
   next.talks = next.talks.map((t) => ({
+    item_type: t?.item_type === "chair" ? "chair" : "talk",
+    program_index: Number.isFinite(Number(t?.program_index)) ? Number(t.program_index) : 0,
+    role: t?.role ?? "座長",
+    name_display: t?.name_display ?? "",
     time: t?.time ?? "",
     title: t?.title ?? "",
     title_lines: Array.isArray(t?.title_lines) ? t.title_lines : [],
@@ -378,10 +382,15 @@ function validateJob(json) {
   // if (isBlank(json.chair?.name_display)) e.chair_name_display = "名前は必須です";
   // if (isBlank(json.chair?.affiliation)) e.chair_affiliation = "所属は必須です";
 
-  if (!Array.isArray(json.talks) || json.talks.length === 0) {
+  if (!Array.isArray(json.talks) || !json.talks.some((t) => t?.item_type !== "chair")) {
     e.talks = "講演を1件以上入力してください";
   } else {
     json.talks.forEach((t, i) => {
+      if (t?.item_type === "chair") {
+        if (isBlank(t?.name_display)) e[`talk_${i}_name_display`] = "名前は必須です";
+        if (isBlank(t?.affiliation)) e[`talk_${i}_affiliation`] = "所属は必須です";
+        return;
+      }
       // if (isBlank(t?.time)) e[`talk_${i}_time`] = "時間は必須です";
       if (!hasAnyLine(t?.title_lines)) e[`talk_${i}_title_lines`] = "タイトルは必須です";
       if (isBlank(t?.speaker_display)) e[`talk_${i}_speaker_display`] = "演者は必須です";
@@ -542,25 +551,52 @@ const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath, error
   const arr = Array.isArray(talks) ? talks : [];
   const setTalkField = (idx, key, value) => updateAtPath(["talks", idx, key], value);
 
+  const makeTalk = () => ({
+    item_type: "talk",
+    program_index: arr.length,
+    role: "演者",
+    name_display: "",
+    time: "",
+    title: "",
+    title_lines: [],
+    speaker: "",
+    speaker_display: "",
+    affiliation: "",
+    title_overrides: [],
+    honorific_title: "先生",
+  });
+
+  const makeChair = () => ({
+    item_type: "chair",
+    program_index: arr.length,
+    role: "座長",
+    name_display: "",
+    time: "",
+    title: "",
+    title_lines: [],
+    speaker: "",
+    speaker_display: "",
+    affiliation: "",
+    title_overrides: [],
+    honorific_title: "先生",
+  });
+
+  const reindex = (items) => items.map((item, index) => ({ ...item, program_index: index }));
+
   const addTalk = () => {
-    const next = [
-      ...arr,
-      {
-        time: "",
-        title: "",
-        title_lines: [],
-        speaker: "",
-        speaker_display: "",
-        affiliation: "",
-        title_overrides: [],
-        honorific_title: "先生",
-      },
-    ];
+    const next = reindex([...arr, makeTalk()]);
     updateAtPath(["talks"], next);
   };
 
+  const addChair = (afterIdx = arr.length - 1) => {
+    const insertAt = Math.max(0, afterIdx + 1);
+    const next = arr.slice();
+    next.splice(insertAt, 0, makeChair());
+    updateAtPath(["talks"], reindex(next));
+  };
+
   const removeTalk = (idx) => {
-    const next = arr.filter((_, i) => i !== idx);
+    const next = reindex(arr.filter((_, i) => i !== idx));
     updateAtPath(["talks"], next);
   };
 
@@ -590,9 +626,14 @@ const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath, error
     <Card
       title="講演"
       right={
-        <button type="button" onClick={addTalk} style={ui.btn("secondary")}>
-          + 講演追加
-        </button>
+        <div style={ui.row}>
+          <button type="button" onClick={addTalk} style={ui.btn("secondary")}>
+            + 講演追加
+          </button>
+          <button type="button" onClick={() => addChair()} style={ui.btn("secondary")}>
+            + 座長追加
+          </button>
+        </div>
       }
     >
       {arr.length === 0 ? <div style={ui.muted}>講演がありません。右上から追加できます。</div> : null}
@@ -602,12 +643,75 @@ const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath, error
         <div key={idx} style={{ marginTop: 12 }}>
           <div style={ui.softBox}>
             <div style={ui.headerRow}>
-              <div style={{ fontWeight: 800 }}>講演 #{idx + 1}</div>
-              <button type="button" onClick={() => removeTalk(idx)} style={ui.btn("danger")}>
-                削除
-              </button>
+              <div style={{ fontWeight: 800 }}>
+                {t.item_type === "chair" ? `座長 #${idx + 1}` : `講演 #${idx + 1}`}
+              </div>
+              <div style={ui.row}>
+                {t.item_type !== "chair" ? (
+                  <button type="button" onClick={() => addChair(idx)} style={ui.btn("secondary")}>
+                    下に座長追加
+                  </button>
+                ) : null}
+                <button type="button" onClick={() => removeTalk(idx)} style={ui.btn("danger")}>
+                  削除
+                </button>
+              </div>
             </div>
 
+            {t.item_type === "chair" ? (
+              <>
+                <Field label="役職">
+                  <Control
+                    as="select"
+                    value={t.role || "座長"}
+                    onChange={(e) => setTalkField(idx, "role", e.target.value)}
+                  >
+                    <option value="座長">座長</option>
+                    <option value="総合司会">総合司会</option>
+                    <option value="司会">司会</option>
+                  </Control>
+                </Field>
+
+                <Field label="名前">
+                  <Control
+                    invalid={!!errors[`talk_${idx}_name_display`]}
+                    value={t.name_display || ""}
+                    onChange={(e) => setTalkField(idx, "name_display", e.target.value)}
+                  />
+                  {errors[`talk_${idx}_name_display`] ? (
+                    <div style={ui.errorText}>{errors[`talk_${idx}_name_display`]}</div>
+                  ) : null}
+                </Field>
+
+                <Field label="敬称">
+                  <Control
+                    as="select"
+                    value={t.honorific_title || ""}
+                    onChange={(e) => setTalkField(idx, "honorific_title", e.target.value)}
+                  >
+                    <option value="">-- 選択してください --</option>
+                    <option value="先生">先生</option>
+                    <option value="様">様</option>
+                    <option value="さん">さん</option>
+                    <option value=""></option>
+                  </Control>
+                </Field>
+
+                <Field label="所属">
+                  <Control
+                    as="textarea"
+                    rows={2}
+                    invalid={!!errors[`talk_${idx}_affiliation`]}
+                    value={t.affiliation || ""}
+                    onChange={(e) => setTalkField(idx, "affiliation", e.target.value)}
+                  />
+                  {errors[`talk_${idx}_affiliation`] ? (
+                    <div style={ui.errorText}>{errors[`talk_${idx}_affiliation`]}</div>
+                  ) : null}
+                </Field>
+              </>
+            ) : (
+              <>
             <Field label="時間" help="例: 19:00〜19:20">
               <Control
 
@@ -690,6 +794,8 @@ const TalksEditor = React.memo(function TalksEditor({ talks, updateAtPath, error
                 />
               ))}
             </div>
+              </>
+            )}
           </div>
         </div>
       ))}

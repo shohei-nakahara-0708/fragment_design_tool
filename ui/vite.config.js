@@ -13,6 +13,7 @@ export default defineConfig({
       "/download": "http://127.0.0.1:8000",
       "/debug": "http://127.0.0.1:8000",
       "/jobs/export.zip": "http://127.0.0.1:8000",
+      "/lecture-tool": "http://127.0.0.1:8000",
     },
   },
 });

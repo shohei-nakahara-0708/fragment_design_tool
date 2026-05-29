@@ -342,6 +342,10 @@ color: #57a745;
         align-items: flex-start;
     }
 
+    .talk-row-chair {
+      gap: 0;
+    }
+
    
     .role-pill {
        display: inline-flex;
@@ -361,10 +365,23 @@ color: #57a745;
       flex-shrink: 0;
     }
 
-        .role-pill::after {
+    .role-pill::after {
   content: "";
   margin-left: -0.8em;
 }
+
+    .role-pill-chair {
+      background: #57a745;
+    }
+
+    .role-pill-wide {
+      letter-spacing: 0.02em;
+      font-size: 14px;
+    }
+
+    .role-pill-wide::after {
+      margin-left: -0.02em;
+    }
 
 
     .talk-main {
@@ -460,6 +477,7 @@ white-space: pre-line;
 
 .hero-title { color: var(--theme-text); }
 .pill, .role-pill { background: var(--theme-pill); }
+.role-pill.role-pill-chair { background: var(--theme-pill); }
 .talk-title { color: var(--theme-talk); }
 .footer { background-color: var(--theme-footer); }
 svg {
@@ -896,6 +914,27 @@ svg {
       talksEl.innerHTML = "";
 
       (Array.isArray(d.talks) ? d.talks : []).slice(0, 6).forEach((t) => {
+        if (t.item_type === "chair") {
+          const chairRole = (t.role || "座長").trim();
+          const chairName = (t.name_display || t.speaker_display || "").trim();
+          const chairAff = (t.affiliation || "").trim();
+
+          const roleClass = chairRole.length > 2 ? " role-pill-wide" : "";
+          const row = document.createElement("div");
+          row.className = "talk-row talk-row-chair";
+          row.innerHTML = `
+           <div class="talk-info">
+             <div class="role-pill role-pill-chair${roleClass}">${esc(chairRole)}</div>
+             <div>
+              <div class="talk-speaker"><span class="talk-speaker-main">${esc(chairName)}</span>${esc(t.honorific_title || "")}</div>
+              <div class="talk-aff">${esc(chairAff)}</div>
+             </div>
+            </div>
+          `;
+          talksEl.appendChild(row);
+          return;
+        }
+
         const timeText = t.time ? String(t.time) : "";
         // const titleHtml = (Array.isArray(t.title_lines) && t.title_lines.length)
         //   ? t.title_lines.map(x => esc(x)).join("<br>")

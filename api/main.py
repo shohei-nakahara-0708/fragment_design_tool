@@ -5,10 +5,13 @@ import base64
 import json
 import os, subprocess
 import re
+import signal
+import shlex
 import uuid
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Literal, Tuple
+from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
@@ -30,6 +33,7 @@ from datetime import datetime, timezone, date
 import traceback
 
 import gspread
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.service_account import Credentials
 from collections import Counter
 
@@ -47,13 +51,15 @@ import shutil
 
 import math
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 import mimetypes
 import requests
 
 import io
 import asyncio
+import queue
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import logging
@@ -1142,6 +1148,15 @@ if (Array.isArray(data.talks)) {
   const talkAffMax = contentMax; // 所属は pill(74) + gap(24) の右側
 
   data.talks = data.talks.map((t, index) => {
+    if (t?.item_type === "chair") {
+      const rawChairAff = normalizeAffiliation(String(t?.affiliation ?? ""));
+      return {
+        ...t,
+        role: t?.role || "座長",
+        affiliation: wrapAffiliation(rawChairAff, talkAffMax, affStyle),
+      };
+    }
+
     const rawTitleLines =
       Array.isArray(t?.title_lines) && t.title_lines.length
         ? t.title_lines.map(x => oneLine(x)).filter(Boolean)
@@ -1211,6 +1226,10 @@ class TextOverride(BaseModel):
 
     
 class Talk(BaseModel):
+    item_type: str = "talk"
+    program_index: int = 0
+    role: str = "演者"
+    name_display: str = ""
     time: str = ""
     title: str = "" 
     title_lines: List[str] = Field(default_factory=list)  # 改行保持 + ~...~ は別行
@@ -1515,7 +1534,7 @@ def assign_talk_times_by_order_fallback(
     if not time_list:
         return payload
 
-    targets = [t for t in payload.talks if not getattr(t, "time", "")]
+    targets = [t for t in payload.talks if _is_program_talk_item(t) and not getattr(t, "time", "")]
     if not targets:
         return payload
 
@@ -1586,6 +1605,16 @@ def assign_talk_times_by_anchor(blocks: list[TextBlock], payload: DesignJSON) ->
 
     talk_time_map = extract_talk_time_map_by_anchor(blocks)
     if not talk_time_map:
+        return payload
+
+    if any(_is_program_chair_item(t) for t in talks):
+        talk_only = [t for t in talks if _is_program_talk_item(t)]
+        for idx, t in enumerate(talk_only, start=1):
+            tm = talk_time_map.get(idx)
+            if tm:
+                t.time = tm
+                setattr(t, "_talk_index", idx)
+        payload.talks = talks
         return payload
 
     # --- talks を blocks 内のスピーカー位置に基づいて正しい順序に並び替え ---
@@ -1692,6 +1721,8 @@ def assign_talk_times_by_proximity(blocks: list[TextBlock], payload: DesignJSON)
     talks = list(payload.talks or [])
     talk_infos = []
     for idx, t in enumerate(talks):
+        if _is_program_chair_item(t):
+            continue
         talk_infos.append((idx, find_precise_anchor_top(t)))
     
     # 上→下に並べる
@@ -3213,6 +3244,18 @@ def get_gsa_credentials(scopes):
         )
 
     raise RuntimeError("GSA_JSON (or GOOGLE_SA_PATH) is not set")
+
+
+def get_gsa_client_email() -> str:
+    gsa_json = (os.getenv("GSA_JSON") or "").strip()
+    if gsa_json:
+        return json.loads(gsa_json).get("client_email", "")
+
+    sa_path = (os.getenv("GOOGLE_SA_PATH") or str(APP_DIR / "_master" / "client_secret.json")).strip()
+    if Path(sa_path).exists():
+        return json.loads(Path(sa_path).read_text(encoding="utf-8")).get("client_email", "")
+
+    return ""
 
 
 
@@ -6661,6 +6704,391 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
     return talks[:4]
 
 
+def _json_item_type(item: Any) -> str:
+    if isinstance(item, dict):
+        v = normalize_space(str(item.get("item_type") or "talk")).lower()
+        return "chair" if v == "chair" else "talk"
+    v = normalize_space(str(getattr(item, "item_type", "talk") or "talk")).lower()
+    return "chair" if v == "chair" else "talk"
+
+
+def _json_is_chair_item(item: Any) -> bool:
+    return _json_item_type(item) == "chair"
+
+
+def _json_is_talk_item(item: Any) -> bool:
+    return not _json_is_chair_item(item)
+
+
+def _json_get(item: Any, field: str, default: str = "") -> Any:
+    if isinstance(item, dict):
+        return item.get(field, default)
+    return getattr(item, field, default)
+
+
+def _json_person_name_value(item: Any) -> str:
+    if _json_is_chair_item(item):
+        fields = ("name", "name_display", "speaker_display", "speaker")
+    else:
+        fields = ("speaker", "speaker_display", "name", "name_display")
+    for field in fields:
+        val = normalize_space(str(_json_get(item, field, "") or ""))
+        val = re.sub(r"\s*先生\s*$", "", val).strip()
+        if val:
+            return val
+    return ""
+
+
+def _json_person_display_value(item: Any) -> str:
+    if _json_is_chair_item(item):
+        fields = ("name_display", "speaker_display", "name", "speaker")
+    else:
+        fields = ("speaker_display", "name_display", "speaker", "name")
+    for field in fields:
+        val = normalize_space(str(_json_get(item, field, "") or ""))
+        if val:
+            return val
+    return ""
+
+
+def _json_person_name_key(item: Any) -> str:
+    return re.sub(r"[\s\u3000]+", "", _json_person_name_value(item) or "")
+
+
+def _is_program_chair_item(t: Any) -> bool:
+    return _json_is_chair_item(t)
+
+
+def _is_program_talk_item(t: Any) -> bool:
+    return _json_is_talk_item(t)
+
+
+def _looks_like_program_affiliation(s: str) -> bool:
+    s = normalize_space(s or "").replace("\n", " ")
+    if not s:
+        return False
+    k = normalize_key(s)
+    if TIME_RANGE_RE.search(normalize_time_colon(s)):
+        return False
+    if looks_like_datetime_text(s):
+        return False
+    if looks_like_talk_anchor(s):
+        return False
+    if any(x in k for x in ["日時", "開催形式", "形式", "演者", "座長", "講演", "演題", "主催", "共催", "提供", "登録", "視聴"]):
+        return False
+    return any(x in s for x in [
+        "大学", "病院", "センター", "クリニック", "医院", "診療所", "医療センター",
+        "内科", "外科", "科", "部", "講師", "教授", "准教授", "部長", "医長", "院長",
+    ])
+
+
+def _strip_program_role_prefix(s: str) -> str:
+    s = normalize_space(s or "").replace("\n", " ")
+    return re.sub(r"^(座\s*長|演\s*者|総\s*合\s*司\s*会|司\s*会)\s*[:：]?\s*", "", s).strip()
+
+
+def _split_program_person_text(text: str) -> tuple[str, str]:
+    one = normalize_space(str(text or "").replace("\n", " "))
+    one = _strip_program_role_prefix(one)
+    if not one:
+        return "", ""
+
+    name_src = one
+    aff = ""
+    if "先生" in one:
+        name_src, aff = one.split("先生", 1)
+        aff = normalize_affiliation(aff)
+        if not _looks_like_program_affiliation(aff):
+            aff = ""
+
+    name = _extract_name_anywhere(name_src) or norm_name(name_src)
+    name = norm_name(name)
+    return name, aff
+
+
+def _affiliation_after_block(blocks: list[TextBlock], start: TextBlock, *, y_limit: int = 850000, x_limit: int = 2800000) -> str:
+    candidates: list[tuple[int, str]] = []
+    for b in blocks:
+        if b is start:
+            continue
+        if b.top < start.top:
+            continue
+        dy = b.top - start.top
+        if dy > y_limit:
+            continue
+        if abs(b.left - start.left) > x_limit and b.left < start.left:
+            continue
+        s = normalize_space((b.text or "").replace("\n", " "))
+        if not _looks_like_program_affiliation(s):
+            continue
+        candidates.append((dy + abs(b.left - start.left) // 4, normalize_affiliation(s)))
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
+def _parse_program_person_block(
+    block: TextBlock,
+    *,
+    role: str,
+    ordered: list[TextBlock],
+    segment_bottom: int | None = None,
+) -> tuple[str, str, str]:
+    text = normalize_space((block.text or "").replace("\n", " "))
+    role_label = role
+    if role == "chair":
+        role_label = "総合司会" if "総合司会" in normalize_key(text) else "司会" if normalize_key(text).startswith("司会") else "座長"
+    elif role == "speaker":
+        role_label = "演者"
+
+    name, aff = _split_program_person_text(text)
+    if name and not aff:
+        y_limit = 700000
+        if segment_bottom is not None:
+            y_limit = max(250000, min(900000, segment_bottom - block.top))
+        aff = _affiliation_after_block(ordered, block, y_limit=y_limit)
+
+    return role_label, name, aff
+
+
+def _extract_inline_program_from_blocks(
+    blocks: list[TextBlock],
+    *,
+    chair: Chair | None = None,
+) -> tuple[Chair | None, list[Talk]]:
+    """講演番号/時間/座長/演者ラベルの縦順が明確な案内状から program items を作る。
+
+    `talks` に item_type="chair" を混ぜるための補助抽出。通常の抽出が苦手な
+    PDF（座長が講演の途中に入るレイアウト）だけで採用する。
+    """
+    ordered = sorted(blocks or [], key=lambda b: (b.top, b.left))
+    if not ordered:
+        return None, []
+
+    anchors = [b for b in ordered if looks_like_talk_anchor(b.text or "")]
+    anchors = sorted(anchors, key=lambda b: (b.top, b.left))
+    if not anchors:
+        return None, []
+
+    def is_time_line_local(s: str) -> str:
+        s2 = normalize_time_colon(normalize_space(s or ""))
+        m = TIME_RANGE_RE.search(s2)
+        if not m:
+            return ""
+        return f"{m.group(1)}~{m.group(2)}"
+
+    def is_speaker_label(b: TextBlock) -> bool:
+        return "演者" in normalize_key(b.text or "")
+
+    def is_chair_label(b: TextBlock) -> bool:
+        return "座長" in normalize_key(b.text or "") or "総合司会" in normalize_key(b.text or "")
+
+    def person_blocks_in_segment(y0: int, y1: int, *, speaker_only: bool = False) -> list[TextBlock]:
+        out = []
+        for b in ordered:
+            if b.top < y0 or b.top >= y1:
+                continue
+            s = normalize_space(b.text or "")
+            if "先生" not in s:
+                continue
+            if speaker_only and is_chair_label(b):
+                continue
+            out.append(b)
+        return sorted(out, key=lambda b: (b.top, b.left))
+
+    def speaker_block_for_segment(seg: list[TextBlock], y0: int, y1: int) -> TextBlock | None:
+        labels = [b for b in seg if is_speaker_label(b)]
+        for label in labels:
+            if "先生" in (label.text or ""):
+                return label
+            people = person_blocks_in_segment(max(y0, label.top - 550000), min(y1, label.top + 650000), speaker_only=True)
+            if people:
+                people.sort(key=lambda b: (abs(b.top - label.top), abs(b.left - label.left)))
+                return people[0]
+
+        people = person_blocks_in_segment(y0, y1, speaker_only=True)
+        if people:
+            return people[-1]
+        return None
+
+    def title_lines_for_segment(seg: list[TextBlock], *, after_top: int, before_top: int | None) -> list[str]:
+        lines: list[str] = []
+        seen: set[str] = set()
+        for b in seg:
+            if b.top <= after_top:
+                continue
+            if before_top is not None and b.top >= before_top:
+                continue
+            raw = normalize_space(b.text or "")
+            if not raw:
+                continue
+            if is_time_line_local(raw) or looks_like_talk_anchor(raw) or looks_like_datetime_text(raw):
+                continue
+            if is_chair_label(b) or is_speaker_label(b):
+                continue
+            if "先生" in raw or _looks_like_program_affiliation(raw):
+                continue
+            if (b.max_font_pt or 0) < 18 and not looks_like_title_text(raw):
+                continue
+            for line in str(b.text or "").split("\n"):
+                s = normalize_space(line)
+                if not s or s in seen:
+                    continue
+                lines.append(s)
+                seen.add(s)
+        return lines[:4]
+
+    talk_items: list[tuple[int, Talk]] = []
+    first_title_top: int | None = None
+
+    for i, anchor in enumerate(anchors[:6]):
+        next_anchor = anchors[i + 1] if i + 1 < len(anchors) else None
+        seg_bottom = next_anchor.top if next_anchor else anchor.top + 3600000
+        seg = [b for b in ordered if anchor.top - 250000 <= b.top < seg_bottom]
+
+        time_text = ""
+        time_top = anchor.top
+        for b in seg:
+            if looks_like_datetime_text(b.text or ""):
+                continue
+            tm = is_time_line_local(b.text or "")
+            if tm:
+                time_text = tm
+                time_top = b.top
+                break
+
+        sp_block = speaker_block_for_segment(seg, anchor.top, seg_bottom)
+        speaker_top = sp_block.top if sp_block else None
+        title_lines = title_lines_for_segment(seg, after_top=time_top, before_top=speaker_top)
+        if title_lines and first_title_top is None:
+            first_title_top = min(b.top for b in seg if any(normalize_space(x) in normalize_space(b.text or "") for x in title_lines))
+
+        speaker = ""
+        speaker_aff = ""
+        if sp_block:
+            _, speaker, speaker_aff = _parse_program_person_block(
+                sp_block,
+                role="speaker",
+                ordered=ordered,
+                segment_bottom=seg_bottom,
+            )
+
+        if not (time_text or title_lines or speaker or speaker_aff):
+            continue
+
+        talk = Talk(
+            item_type="talk",
+            role="演者",
+            program_index=len(talk_items),
+            time=time_text,
+            title="\n".join(title_lines),
+            title_lines=title_lines,
+            speaker=speaker,
+            speaker_display=build_speaker_display(speaker) if speaker else "",
+            affiliation=speaker_aff,
+            honorific_title="先生",
+        )
+        setattr(talk, "_talk_index", i + 1)
+        talk_items.append((anchor.top, talk))
+
+    if not talk_items:
+        return None, []
+
+    first_anchor_top = anchors[0].top
+    top_chair: Chair | None = None
+    inline_chairs: list[tuple[int, Talk]] = []
+    seen_chairs: set[tuple[str, int]] = set()
+
+    for b in ordered:
+        if not is_chair_label(b):
+            continue
+        role, name, aff = _parse_program_person_block(
+            b,
+            role="chair",
+            ordered=ordered,
+            segment_bottom=first_title_top if b.top < first_anchor_top and first_title_top else None,
+        )
+        if not name:
+            continue
+        key = (normalize_key(name), b.top)
+        if key in seen_chairs:
+            continue
+        seen_chairs.add(key)
+
+        if b.top < first_anchor_top:
+            top_chair = Chair(
+                role=role or "座長",
+                name=name,
+                name_display=build_speaker_display(name),
+                affiliation=aff,
+                honorific_title="先生",
+            )
+            continue
+
+        item = Talk(
+            item_type="chair",
+            role=role or "座長",
+            program_index=0,
+            name_display=build_speaker_display(name),
+            speaker="",
+            speaker_display="",
+            affiliation=aff,
+            honorific_title="先生",
+        )
+        inline_chairs.append((b.top, item))
+
+    combined = sorted([*talk_items, *inline_chairs], key=lambda x: x[0])
+    out: list[Talk] = []
+    for idx, (_, item) in enumerate(combined):
+        item.program_index = idx
+        setattr(item, "_talk_index", idx)
+        out.append(item)
+
+    # 途中座長が無く、既存抽出のほうが十分なら採用しないため、呼び出し側で判定する。
+    return top_chair, out[:6]
+
+
+def apply_inline_program_extraction(payload: DesignJSON, blocks: list[TextBlock]) -> DesignJSON:
+    top_chair, items = _extract_inline_program_from_blocks(blocks, chair=getattr(payload, "chair", None))
+    if not items:
+        return payload
+
+    extracted_talk_count = sum(1 for t in items if _is_program_talk_item(t))
+    extracted_chair_count = sum(1 for t in items if _is_program_chair_item(t))
+    current_talk_count = sum(1 for t in (payload.talks or []) if _is_program_talk_item(t))
+
+    strong_program = extracted_talk_count >= 2 and (
+        extracted_chair_count > 0
+        or current_talk_count < extracted_talk_count
+        or any(not _talk_title_text(t) or not getattr(t, "speaker", "") for t in (payload.talks or []) if _is_program_talk_item(t))
+    )
+    if not strong_program:
+        return payload
+
+    if top_chair:
+        if not getattr(payload, "chair", None):
+            payload.chair = top_chair
+        else:
+            current_name = normalize_key(getattr(payload.chair, "name", "") or "")
+            top_name = normalize_key(top_chair.name or "")
+            if (not current_name) or current_name == top_name:
+                payload.chair.role = top_chair.role or payload.chair.role or "座長"
+                payload.chair.name = top_chair.name or payload.chair.name
+                payload.chair.name_display = top_chair.name_display or payload.chair.name_display
+                if top_chair.affiliation:
+                    payload.chair.affiliation = top_chair.affiliation
+                payload.chair.honorific_title = top_chair.honorific_title or payload.chair.honorific_title or "先生"
+
+    payload.talks = items
+    warnings = set(payload.warnings or [])
+    warnings.discard("talks_pruned_by_vm_hint")
+    warnings.discard("talks_pruned_heuristic_only")
+    warnings.add("inline_chair_extracted")
+    payload.warnings = sorted(warnings)
+    return payload
+
+
 
 def find_sponsor_logo_blobs(pptx_path: Path) -> list[bytes]:
     prs = Presentation(str(pptx_path))
@@ -6819,14 +7247,14 @@ def _build_speaker_display_cache() -> dict[str, str]:
             cj = ans.get("correct_json") or {}
             # talks
             for t in (cj.get("talks") or []):
-                sp = (t.get("speaker") or "").replace(" ", "").replace("\u3000", "")
-                disp = (t.get("speaker_display") or "").strip()
+                sp = _json_person_name_key(t)
+                disp = _json_person_display_value(t).strip()
                 if sp and disp and " " in disp and sp not in cache:
                     cache[sp] = disp
             # chair
             ch = cj.get("chair") or {}
-            cn = (ch.get("name") or "").replace(" ", "").replace("\u3000", "")
-            cd = (ch.get("name_display") or "").strip()
+            cn = _json_person_name_key(ch)
+            cd = _json_person_display_value(ch).strip()
             if cn and cd and " " in cd and cn not in cache:
                 cache[cn] = cd
     except Exception as e:
@@ -6868,7 +7296,7 @@ def _build_affiliation_format_cache() -> dict[str, str]:
             # talks
             for t in (cj.get("talks") or []):
                 raw = (t.get("affiliation") or "").strip()
-                sp = (t.get("speaker") or "").strip()
+                sp = _json_person_name_value(t).strip()
                 if not raw:
                     continue
                 # 通常キー
@@ -6884,7 +7312,7 @@ def _build_affiliation_format_cache() -> dict[str, str]:
             # chair
             ch = cj.get("chair") or {}
             raw = (ch.get("affiliation") or "").strip()
-            name = (ch.get("name") or "").strip()
+            name = _json_person_name_value(ch).strip()
             if raw:
                 key = _aff_cache_key(raw)
                 if key and len(key) >= 4 and key not in cache:
@@ -6965,8 +7393,11 @@ def _build_text_role_cache() -> dict[str, dict]:
 
             # talks
             for t in (cj.get("talks") or []):
-                for field, role in [("speaker", "person_name"), ("affiliation", "affiliation")]:
-                    val = (t.get(field) or "").strip()
+                person = _json_person_name_value(t).strip()
+                for val, role in [
+                    (person, "person_name"),
+                    ((t.get("affiliation") or "").strip(), "affiliation"),
+                ]:
                     if not val:
                         continue
                     key = _text_role_key(val)
@@ -6975,6 +7406,10 @@ def _build_text_role_cache() -> dict[str, dict]:
                         role_counts.setdefault(key, Counter())[role] += 1
                         if key not in formatted:
                             formatted[key] = re.sub(r'[\n\r]+', ' ', val).strip()
+
+                if _json_is_chair_item(t):
+                    continue
+
                 # talk title
                 title_lines = t.get("title_lines") or []
                 title = " ".join(title_lines).strip() if title_lines else (t.get("title") or "").strip()
@@ -7045,6 +7480,14 @@ def apply_learned_text_roles(payload) -> object:
 
     # ─────────── talks ───────────
     for t in getattr(payload, "talks", []) or []:
+        if _is_program_chair_item(t):
+            aff = getattr(t, "affiliation", "") or ""
+            if aff:
+                fmt = lookup_text_formatted(aff)
+                if fmt and fmt != aff.replace("\n", " ").strip():
+                    t.affiliation = fmt
+            continue
+
         title_lines = list(getattr(t, "title_lines", []) or [])
         current_aff = normalize_space(getattr(t, "affiliation", "") or "")
 
@@ -7182,18 +7625,24 @@ def _compute_layout_hints(blocks_json: list, correct_json: dict) -> dict:
     if not blocks_json or not correct_json:
         return {}
 
-    def _find_block(text_query: str) -> dict | None:
-        """テキストを含むブロックを検索（スペース除去で比較）"""
+    def _find_blocks(text_query: str) -> list[dict]:
+        """テキストを含むブロック候補を検索（スペース除去で比較）"""
         if not text_query:
-            return None
+            return []
         q = text_query.replace(" ", "").replace("\u3000", "").replace("先生", "")
         if len(q) < 2:
-            return None
+            return []
+        out = []
         for b in blocks_json:
             bt = (b.get("text", "") if isinstance(b, dict) else "").replace(" ", "").replace("\u3000", "").replace("先生", "")
             if q in bt:
-                return b
-        return None
+                out.append(b)
+        return out
+
+    def _find_block(text_query: str) -> dict | None:
+        """テキストを含む最初のブロックを検索（スペース除去で比較）"""
+        blocks = _find_blocks(text_query)
+        return blocks[0] if blocks else None
 
     def _find_anchor(label: str) -> dict | None:
         """座長/演者/講演/PROGRAM等のラベルブロックを検索"""
@@ -7204,7 +7653,34 @@ def _compute_layout_hints(blocks_json: list, correct_json: dict) -> dict:
                 return b
         return None
 
-    hints: dict = {"talks": []}
+    def _find_near_anchor(labels: list[str], near_top: int | None = None) -> dict | None:
+        candidates = []
+        for b in blocks_json:
+            if not isinstance(b, dict):
+                continue
+            bt = (b.get("text", "") or "").replace(" ", "").replace("\u3000", "")
+            if not any(label.replace(" ", "") in bt for label in labels):
+                continue
+            top = b.get("top", 0)
+            if near_top is not None and abs(top - near_top) > 1500000:
+                continue
+            score = abs(top - near_top) if near_top is not None else top
+            candidates.append((score, b))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
+
+    all_items = correct_json.get("talks") or []
+    regular_talks = [t for t in all_items if _json_is_talk_item(t)]
+    inline_chair_items = [t for t in all_items if _json_is_chair_item(t)]
+
+    hints: dict = {
+        "talks": [],
+        "talk_count": len(regular_talks),
+        "program_item_count": len(all_items),
+        "inline_chair_count": len(inline_chair_items),
+    }
 
     # PROGRAM アンカー
     prog_block = _find_anchor("PROGRAM") or _find_anchor("プログラム")
@@ -7241,8 +7717,10 @@ def _compute_layout_hints(blocks_json: list, correct_json: dict) -> dict:
         hints["chair"] = ch_hint
 
     # 講演（talks）
-    talks = correct_json.get("talks") or []
-    for idx, t in enumerate(talks):
+    talk_idx = 0
+    for idx, t in enumerate(all_items):
+        if _json_is_chair_item(t):
+            continue
         speaker = (t.get("speaker") or "").replace(" ", "").replace("\u3000", "")
         affiliation = t.get("affiliation") or ""
         if not speaker:
@@ -7253,7 +7731,12 @@ def _compute_layout_hints(blocks_json: list, correct_json: dict) -> dict:
             continue
 
         sp_top = speaker_block.get("top", 0)
-        t_hint: dict = {"speaker_top": sp_top, "talk_index": idx}
+        t_hint: dict = {
+            "speaker_top": sp_top,
+            "talk_index": talk_idx,
+            "program_index": t.get("program_index", idx),
+        }
+        talk_idx += 1
         # 演者ブロックのフォントサイズを記録
         _sp_pt = float(speaker_block.get("max_font_pt") or 0)
         if _sp_pt > 0:
@@ -7294,7 +7777,70 @@ def _compute_layout_hints(blocks_json: list, correct_json: dict) -> dict:
 
         hints["talks"].append(t_hint)
 
-    if not hints.get("talks") and not hints.get("chair"):
+    # talks 内に混ぜる途中座長
+    chair_like_anchors = []
+    for b in blocks_json:
+        if not isinstance(b, dict):
+            continue
+        bt = (b.get("text", "") or "").replace(" ", "").replace("\u3000", "")
+        if any(label in bt for label in ["座長", "総合司会", "司会"]):
+            chair_like_anchors.append(b)
+    chair_like_anchors.sort(key=lambda b: (b.get("top", 0), b.get("left", 0)))
+    top_chair_offset = 1 if (correct_json.get("chair") or {}).get("name") else 0
+
+    inline_chair_hints = []
+    inline_idx = 0
+    for idx, t in enumerate(all_items):
+        if not _json_is_chair_item(t):
+            continue
+        name = _json_person_name_value(t)
+        affiliation = t.get("affiliation") or ""
+        role = normalize_space(t.get("role") or "座長")
+        anchor = None
+        anchor_pos = inline_idx + top_chair_offset
+        if chair_like_anchors and anchor_pos < len(chair_like_anchors):
+            anchor = chair_like_anchors[anchor_pos]
+        inline_idx += 1
+
+        name_candidates = _find_blocks(name)
+        affil_candidates = _find_blocks(affiliation)
+        anchor_top_guess = anchor.get("top", 0) if anchor else None
+        if not anchor:
+            near_top_guess = name_candidates[0].get("top", 0) if name_candidates else (affil_candidates[0].get("top", 0) if affil_candidates else None)
+            anchor = _find_near_anchor([role, "座長", "総合司会", "司会"], near_top_guess)
+            anchor_top_guess = anchor.get("top", 0) if anchor else near_top_guess
+
+        def _nearest(candidates: list[dict], near_top: int | None) -> dict | None:
+            if not candidates:
+                return None
+            if near_top is None:
+                return candidates[0]
+            return sorted(candidates, key=lambda b: abs((b.get("top", 0) or 0) - near_top))[0]
+
+        name_block = _nearest(name_candidates, anchor_top_guess)
+        affil_block = _nearest(affil_candidates, name_block.get("top", 0) if name_block else anchor_top_guess)
+        near_top = name_block.get("top", 0) if name_block else (affil_block.get("top", 0) if affil_block else None)
+        anchor_top = anchor.get("top", 0) if anchor else (near_top or 0)
+        ch_hint: dict = {
+            "role": role,
+            "program_index": t.get("program_index", idx),
+            "anchor_top": anchor_top,
+        }
+        if name_block:
+            ch_hint["name_top"] = name_block.get("top", 0)
+            ch_hint["name_rel_y"] = name_block.get("top", 0) - anchor_top
+        if affil_block:
+            ch_hint["affil_top"] = affil_block.get("top", 0)
+            ch_hint["affil_rel_y"] = affil_block.get("top", 0) - anchor_top
+        if name_block and affil_block:
+            ch_hint["affil_rel_to_name_y"] = affil_block.get("top", 0) - name_block.get("top", 0)
+        if name_block or affil_block:
+            inline_chair_hints.append(ch_hint)
+
+    if inline_chair_hints:
+        hints["inline_chairs"] = inline_chair_hints
+
+    if not hints.get("talks") and not hints.get("chair") and not hints.get("inline_chairs"):
         return {}
 
     return hints
@@ -7336,6 +7882,9 @@ def _build_layout_pattern_cache() -> dict:
             ch = hints.get("chair") or {}
             if "affil_rel_to_name_y" in ch:
                 chair_affil_rels.append(ch["affil_rel_to_name_y"])
+            for ich in (hints.get("inline_chairs") or []):
+                if "affil_rel_to_name_y" in ich:
+                    chair_affil_rels.append(ich["affil_rel_to_name_y"])
             # event title font
             if "event_title_font_pt" in hints:
                 event_title_font_pts.append(float(hints["event_title_font_pt"]))
@@ -7439,12 +7988,12 @@ def _build_person_name_dict_cache() -> set[str]:
             cj = ans.get("correct_json") or {}
             # talks
             for t in (cj.get("talks") or []):
-                sp = (t.get("speaker") or "").replace(" ", "").replace("\u3000", "")
+                sp = _json_person_name_key(t)
                 if sp and len(sp) >= 2:
                     names.add(sp)
             # chair
             ch = cj.get("chair") or {}
-            cn = (ch.get("name") or "").replace(" ", "").replace("\u3000", "")
+            cn = _json_person_name_key(ch)
             if cn and len(cn) >= 2:
                 names.add(cn)
     except Exception as e:
@@ -7566,6 +8115,8 @@ def _build_title_line_len_cache() -> dict:
                     event_lens.append(ln)
             # トーク演題各行
             for t in (cj.get("talks") or []):
+                if _json_is_chair_item(t):
+                    continue
                 for line in (t.get("title_lines") or []):
                     ln = len(re.sub(r'[\s\u3000]+', '', normalize_space(line)))
                     if ln >= 3:
@@ -7661,6 +8212,12 @@ def _build_chair_label_cache() -> dict:
             role = role.strip()
             if role:
                 counts[role] = counts.get(role, 0) + 1
+            for t in (cj.get("talks") or []):
+                if not _json_is_chair_item(t):
+                    continue
+                role = (t.get("role") or "").strip()
+                if role:
+                    counts[role] = counts.get(role, 0) + 1
     except Exception as e:
         print(f"[chair-label-cache] build error: {e}")
     # デフォルト語を必ず含める
@@ -7700,7 +8257,7 @@ def _build_talk_count_cache() -> dict:
         answers = _load_correct_answers()
         for ans in answers:
             cj = ans.get("correct_json") or {}
-            n = len(cj.get("talks") or [])
+            n = sum(1 for t in (cj.get("talks") or []) if _json_is_talk_item(t))
             if n > 0:
                 counts.append(n)
     except Exception as e:
@@ -7811,6 +8368,18 @@ def save_correct_answer(
     if "talks" in correct_json:
         for t in correct_json.get("talks", []):
             aff = t.get("affiliation", "") or ""
+            if _json_is_chair_item(t):
+                if aff.upper() in _INVALID_NAMES:
+                    print(f"[correct-answer] WARNING: clearing invalid inline chair affiliation before save: '{aff}'")
+                    t["affiliation"] = ""
+                name_key = _json_person_name_key(t)
+                if name_key.upper() in _INVALID_NAMES:
+                    print(f"[correct-answer] WARNING: clearing invalid inline chair name before save: '{name_key}'")
+                    t["name_display"] = ""
+                    t["speaker"] = ""
+                    t["speaker_display"] = ""
+                t["role"] = normalize_space(t.get("role") or "座長")
+                continue
             if "座長" in aff:
                 print(f"[correct-answer] WARNING: clearing chair-contaminated affiliation in talk before save: '{aff[:60]}'")
                 t["affiliation"] = ""
@@ -7943,12 +8512,24 @@ def _build_dynamic_few_shot(similar_answers: list[dict]) -> list[dict]:
             "event_title": cj.get("event_title", ""),
             "talks": [],
         }
-        for t in (cj.get("talks") or [])[:4]:
-            summary["talks"].append({
-                "title_lines": t.get("title_lines", []),
-                "speaker": t.get("speaker", ""),
-                "affiliation": t.get("affiliation", ""),
-            })
+        for t in (cj.get("talks") or [])[:6]:
+            if _json_is_chair_item(t):
+                summary["talks"].append({
+                    "item_type": "chair",
+                    "role": t.get("role", "座長"),
+                    "name_display": t.get("name_display", ""),
+                    "affiliation": t.get("affiliation", ""),
+                    "program_index": t.get("program_index", len(summary["talks"])),
+                })
+            else:
+                summary["talks"].append({
+                    "item_type": "talk",
+                    "time": t.get("time", ""),
+                    "title_lines": t.get("title_lines", []),
+                    "speaker": t.get("speaker", ""),
+                    "affiliation": t.get("affiliation", ""),
+                    "program_index": t.get("program_index", len(summary["talks"])),
+                })
         if cj.get("chair"):
             chair = cj["chair"]
             if chair.get("name"):
@@ -8007,7 +8588,7 @@ def compute_correct_answer_hints(blocks: list, event_title: str) -> CorrectAnswe
         correct = best.get("correct_json") or {}
         def _ns(s): return (s or "").replace(" ", "").replace("\u3000", "")
 
-        talks = correct.get("talks") or []
+        talks = [t for t in (correct.get("talks") or []) if _json_is_talk_item(t)]
         chair = correct.get("chair") or {}
 
         hints = CorrectAnswerHints(
@@ -8083,11 +8664,15 @@ def fill_empty_fields_from_blocks_with_hints(
         # 既にマッチ済みの speaker を集計
         matched_hints = set()
         for t in payload.talks:
+            if _is_program_chair_item(t):
+                continue
             sp_ns = (getattr(t, "speaker", "") or "").replace(" ", "").replace("\u3000", "")
             if sp_ns:
                 matched_hints.add(sp_ns)
 
         for t in payload.talks:
+            if _is_program_chair_item(t):
+                continue
             sp_ns = (getattr(t, "speaker", "") or "").replace(" ", "").replace("\u3000", "")
             if sp_ns:
                 continue  # 既に speaker がある
@@ -8123,9 +8708,11 @@ def fill_empty_fields_from_blocks_with_hints(
     # ---- talk affiliation: speaker は埋まっているが affiliation が空 ----
     if payload.talks and hints._correct_json:
         def _ns(s): return (s or "").replace(" ", "").replace("\u3000", "")
-        ct_list = hints._correct_json.get("talks") or []
+        ct_list = [ct for ct in (hints._correct_json.get("talks") or []) if _json_is_talk_item(ct)]
         ct_by_sp = {_ns(ct.get("speaker", "")): ct for ct in ct_list if ct.get("speaker")}
         for t in payload.talks:
+            if _is_program_chair_item(t):
+                continue
             if getattr(t, "affiliation", ""):
                 continue
             sp_ns = _ns(getattr(t, "speaker", ""))
@@ -8148,7 +8735,7 @@ def fill_empty_fields_from_blocks_with_hints(
 
     # ---- expected_talk_count vs actual: 警告 (高類似度かつ差が大きい時のみ) ----
     if hints.expected_talk_count > 0 and hints.similarity >= 0.95:
-        actual = len(payload.talks or [])
+        actual = sum(1 for t in (payload.talks or []) if _is_program_talk_item(t))
         diff = abs(actual - hints.expected_talk_count)
         if diff >= 2:
             print(f"[hints-fill] talk count mismatch: expected={hints.expected_talk_count} actual={actual} diff={diff} (sim={hints.similarity:.2f})")
@@ -8278,7 +8865,8 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list, vm_rows: lis
                     print(f"[correct-answer-overlay] organizer filled from blocks: '{found_org}'")
 
         # ---- talks: 同一演者の場合のみフォーマット復元 + 空フィールド補完 ----
-        ct_list = correct.get("talks") or []
+        correct_program_items = correct.get("talks") or []
+        ct_list = [ct for ct in correct_program_items if _json_is_talk_item(ct)]
         if ct_list and payload.talks:
             # speaker名ベースでマッチング
             ct_by_speaker = {}
@@ -8288,6 +8876,8 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list, vm_rows: lis
                     ct_by_speaker[sp] = ct
 
             for t in payload.talks:
+                if _is_program_chair_item(t):
+                    continue
                 sp = _ns(getattr(t, "speaker", ""))
 
                 if sp and sp in ct_by_speaker:
@@ -8322,7 +8912,11 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list, vm_rows: lis
 
                 elif not sp:
                     # speaker が空 → DB のいずれかのスピーカーが blocks に存在すれば補完
-                    matched_speakers = {_ns(getattr(tt, "speaker", "")) for tt in payload.talks if getattr(tt, "speaker", "")}
+                    matched_speakers = {
+                        _ns(getattr(tt, "speaker", ""))
+                        for tt in payload.talks
+                        if (not _is_program_chair_item(tt)) and getattr(tt, "speaker", "")
+                    }
                     for hint_sp, ct in ct_by_speaker.items():
                         if hint_sp in matched_speakers:
                             continue
@@ -8336,6 +8930,33 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list, vm_rows: lis
                                     t.speaker_display = build_speaker_display(cand) or cand
                                     print(f"[correct-answer-overlay] talk speaker filled from blocks: '{cand}'")
                                     break
+
+        inline_chair_refs = {
+            _ns(_json_person_name_value(ct)): ct
+            for ct in correct_program_items
+            if _json_is_chair_item(ct) and _json_person_name_value(ct)
+        }
+        if inline_chair_refs and payload.talks:
+            for t in payload.talks:
+                if not _is_program_chair_item(t):
+                    continue
+                name_key = _ns(getattr(t, "name_display", "") or getattr(t, "speaker_display", "") or "")
+                ct = inline_chair_refs.get(name_key)
+                if not ct:
+                    continue
+                if ct.get("role"):
+                    t.role = ct["role"]
+                ref_name = _json_person_display_value(ct)
+                if ref_name and _ns(ref_name) == name_key:
+                    t.name_display = ref_name
+                if ct.get("affiliation"):
+                    cur_aff = getattr(t, "affiliation", "") or ""
+                    if cur_aff:
+                        t.affiliation = _format_if_same(cur_aff, ct["affiliation"])
+                    else:
+                        found_aff = _find_text_in_blocks(_ns(ct["affiliation"]))
+                        if found_aff:
+                            t.affiliation = found_aff
 
         # ---- 信頼度スコアリング（正解DB + VM） ----
         _conf_scores = []
@@ -8368,16 +8989,17 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list, vm_rows: lis
             _conf_scores.append(("db:event_title", _field_conf(
                 payload.event_title, correct["event_title"])))
         # talks
+        payload_talks_only = [t for t in (payload.talks or []) if _is_program_talk_item(t)]
         for i, ct in enumerate(ct_list):
             if ct.get("speaker"):
                 sp_val = ""
-                if i < len(payload.talks):
-                    sp_val = getattr(payload.talks[i], "speaker", "")
+                if i < len(payload_talks_only):
+                    sp_val = getattr(payload_talks_only[i], "speaker", "")
                 _conf_scores.append((f"db:talk[{i}].speaker", _field_conf(sp_val, ct["speaker"])))
             if ct.get("title"):
                 t_val = ""
-                if i < len(payload.talks):
-                    t_val = getattr(payload.talks[i], "title", "")
+                if i < len(payload_talks_only):
+                    t_val = getattr(payload_talks_only[i], "title", "")
                 _conf_scores.append((f"db:talk[{i}].title", _field_conf(t_val, ct["title"])))
 
         # --- VMとの照合 ---
@@ -8407,6 +9029,8 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list, vm_rows: lis
             # VM talks: speaker / title / affiliation
             _payload_sp_map = {}
             for t in (payload.talks or []):
+                if _is_program_chair_item(t):
+                    continue
                 sp_key = _ns(_norm_person_name(getattr(t, "speaker", "") or ""))
                 if sp_key:
                     _payload_sp_map[sp_key] = t
@@ -8431,7 +9055,7 @@ def apply_correct_answer_overlay(payload: DesignJSON, blocks: list, vm_rows: lis
 
             # VM talk_count
             if _vm_speakers:
-                actual_count = len(payload.talks or [])
+                actual_count = sum(1 for t in (payload.talks or []) if _is_program_talk_item(t))
                 expected_count = len(_vm_speakers)
                 if actual_count == expected_count:
                     _conf_scores.append(("vm:talk_count", 1.0))
@@ -8530,7 +9154,10 @@ def build_ai_prompt(
 
 # 配列・構造の調整ルール
 - talks から不適切な内容（挨拶、休憩等）は除外すること
-- 実際の講演のみを talks に含めること
+- talks は基本的に実際の講演のみを含めること
+- ただしプログラム途中に「座長/司会」行が明示されている場合は、通常講演とは別に item_type="chair" の行として talks 内の該当位置に残すこと
+- item_type="chair" の行は title_lines / speaker を空にし、role / name_display / affiliation / program_index を使うこと
+- item_type="talk" の行は title_lines / speaker / affiliation を使うこと
 - talks の順序は時系列に従って調整可
 - event_title_lines の要素数は必要に応じて調整可
 
@@ -8584,6 +9211,7 @@ def build_ai_prompt(
 # 出力形式
 - 実際の講演のみを talks に含めること（挨拶、休憩等は除外）
 - 各 talks[i] は少なくとも以下を含めること:
+  - item_type ("talk" または "chair")
   - time
   - title_lines
   - speaker
@@ -8781,6 +9409,9 @@ def clean_ai_talk_titles(payload: DesignJSON) -> DesignJSON:
         # フィルタリング: 講演として適切でない内容を除去
         filtered_talks = []
         for talk in payload.talks:
+            if _is_program_chair_item(talk):
+                filtered_talks.append(talk)
+                continue
             talk_title = (talk.title or "").lower().strip()
             
             # 講演タイトルが除外キーワードに完全一致または実質全体がキーワードかチェック
@@ -8916,21 +9547,26 @@ async def ai_refine_json(
         "max_tokens": 4000,  # 十分な応答長を確保
     }
 
-    async with httpx.AsyncClient(timeout=AI_TIMEOUT) as client:
-        r = await post_with_retry(
-            client,
-            f"{OPENAI_BASE_URL}/chat/completions",
-            headers=headers,
-            json_body=body,
-            retries=3,
-        )
-        if r.status_code >= 400:
-            try:
-                print("error json=", r.json())
-            except Exception:
-                print("error text=", r.text)
-        r.raise_for_status()
-        data = r.json()
+    try:
+        async with httpx.AsyncClient(timeout=AI_TIMEOUT) as client:
+            r = await post_with_retry(
+                client,
+                f"{OPENAI_BASE_URL}/chat/completions",
+                headers=headers,
+                json_body=body,
+                retries=3,
+            )
+            if r.status_code >= 400:
+                try:
+                    print("error json=", r.json())
+                except Exception:
+                    print("error text=", r.text)
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        print(f"[ai_refine_json] request failed: {type(e).__name__}: {e}")
+        draft.warnings = sorted(set((draft.warnings or []) + ["ai_request_failed"]))
+        return draft
 
     content = (data["choices"][0]["message"]["content"] or "").strip()
 
@@ -8962,6 +9598,8 @@ async def ai_refine_json(
 
     def _looks_bad_talk_seed_strong(t) -> bool:
         """強化された講演データ品質チェック"""
+        if _is_program_chair_item(t):
+            return False
         title_lines = getattr(t, "title_lines", None) or []
         title = normalize_space(getattr(t, "title", "") or "")
         speaker = normalize_space(getattr(t, "speaker", "") or "")
@@ -9019,8 +9657,39 @@ async def ai_refine_json(
     def _build_talks_from_parsed(parsed_talks: list[dict]) -> list[Talk]:
         out = []
 
-        for pt in parsed_talks[:4]:
+        for pt in parsed_talks[:6]:
             if not isinstance(pt, dict):
+                continue
+
+            item_type = _json_item_type(pt)
+            try:
+                program_index = int(pt.get("program_index", len(out)) or len(out))
+            except Exception:
+                program_index = len(out)
+
+            if item_type == "chair":
+                name_display = normalize_person_display(
+                    pt.get("name_display")
+                    or pt.get("name")
+                    or pt.get("speaker_display")
+                    or pt.get("speaker")
+                    or ""
+                )
+                affiliation = normalize_space(pt.get("affiliation", "") or "")
+                if not (name_display or affiliation):
+                    continue
+                out.append(
+                    Talk(
+                        item_type="chair",
+                        role=normalize_chair_role(pt.get("role", "") or "座長"),
+                        program_index=program_index,
+                        name_display=name_display,
+                        speaker="",
+                        speaker_display="",
+                        affiliation=affiliation,
+                        honorific_title=normalize_space(pt.get("honorific_title", "") or "先生"),
+                    )
+                )
                 continue
 
             title_lines = normalize_lines_keep_order(_safe_list_str(pt.get("title_lines")))
@@ -9031,6 +9700,9 @@ async def ai_refine_json(
 
             out.append(
                 Talk(
+                    item_type="talk",
+                    role=normalize_space(pt.get("role", "") or "演者") or "演者",
+                    program_index=program_index,
                     time=time,
                     title=title,
                     title_lines=title_lines if title_lines else ([title] if title else []),
@@ -9173,6 +9845,8 @@ async def ai_refine_json(
         return isinstance(parsed_talks, list) and len(parsed_talks) == len(draft_talks)
 
     def _looks_bad_talk_seed(t) -> bool:
+        if _is_program_chair_item(t):
+            return False
         title_lines = getattr(t, "title_lines", None) or []
         title = normalize_space(getattr(t, "title", "") or "")
         speaker = normalize_space(getattr(t, "speaker", "") or "")
@@ -9210,23 +9884,31 @@ async def ai_refine_json(
             if not isinstance(parsed_talks, list):
                 return False
 
-            if draft.talks and len(parsed_talks) != len(draft.talks):
+            parsed_has_chairs = any(_json_is_chair_item(pt) for pt in parsed_talks if isinstance(pt, dict))
+            draft_talk_items = [t for t in (draft.talks or []) if _is_program_talk_item(t)]
+            expected_len = len(draft.talks or []) if parsed_has_chairs else len(draft_talk_items)
+            parsed_len = len(parsed_talks)
+
+            if draft.talks and parsed_len != expected_len:
                 # draft側が壊れている場合はAI側の講演数を信頼する
-                if any(_looks_bad_talk_seed(t) for t in (draft.talks or [])):
+                if any(_looks_bad_talk_seed(t) for t in draft_talk_items):
                     pass  # 壊れたseedがあるので数の不一致を許容
                 # AIが講演数を減らした場合（挨拶・休憩等の除外）は許容
-                elif len(parsed_talks) < len(draft.talks):
+                elif parsed_len < expected_len:
                     pass  # non-lecture除外による減少は正当
                 else:
                     return False
 
+            draft_compare_items = list(draft.talks or []) if parsed_has_chairs else draft_talk_items
             for i, pt in enumerate(parsed_talks):
                 if not isinstance(pt, dict):
                     return False
+                if _json_is_chair_item(pt):
+                    continue
 
                 # draft が壊れてる talk は厳格チェックしない
-                if draft.talks and i < len(draft.talks):
-                    seed = draft.talks[i]
+                if draft_compare_items and i < len(draft_compare_items):
+                    seed = draft_compare_items[i]
                     if _looks_bad_talk_seed(seed):
                         continue
 
@@ -9341,9 +10023,10 @@ async def ai_refine_json(
             if draft_name_ns != ai_name_ns:
                 # ドラフトのspeakerが全て不正なら、座長抽出自体が間違っている可能性が高い
                 # → AI変更を受け入れる
-                draft_speakers_all_bad = bool(refined.talks) and all(
+                _speaker_items = [t for t in (refined.talks or []) if _is_program_talk_item(t)]
+                draft_speakers_all_bad = bool(_speaker_items) and all(
                     not _is_plausible_speaker_name(getattr(t, "speaker", "") or "")
-                    for t in refined.talks
+                    for t in _speaker_items
                 )
                 if draft_speakers_all_bad:
                     # ドラフトの座長抽出が誤り → AI結果を採用
@@ -9380,29 +10063,76 @@ async def ai_refine_json(
     # talks: 件数・順序固定で index ごとにパッチ
     parsed_talks = parsed.get("talks")
 
-    draft_is_bad = bool(refined.talks) and any(_looks_bad_talk_seed_strong(t) for t in refined.talks)
+    draft_regular_talks = [t for t in (refined.talks or []) if _is_program_talk_item(t)]
+    parsed_regular_talks = [
+        pt for pt in (parsed_talks or [])
+        if isinstance(pt, dict) and _json_is_talk_item(pt)
+    ] if isinstance(parsed_talks, list) else []
+    parsed_has_chairs = any(
+        _json_is_chair_item(pt) for pt in (parsed_talks or []) if isinstance(pt, dict)
+    ) if isinstance(parsed_talks, list) else False
+    draft_has_chairs = any(_is_program_chair_item(t) for t in (refined.talks or []))
+
+    draft_is_bad = bool(draft_regular_talks) and any(_looks_bad_talk_seed_strong(t) for t in draft_regular_talks)
 
     # 1) draft が空、または draft が壊れてるなら AI talks を丸ごと採用
     if isinstance(parsed_talks, list) and (not refined.talks or draft_is_bad):
         # AIが座長演者を逆転させた場合、draftに有効なspeaker/affiliationがあればそれを保持
         if _ai_swapped_chair_speaker and refined.talks:
-            draft_people = [(t.speaker, t.affiliation) for t in refined.talks if t.speaker]
+            draft_people = [(t.speaker, t.affiliation) for t in draft_regular_talks if t.speaker]
             refined.talks = _build_talks_from_parsed(parsed_talks)
             # draft側のspeaker/affiliationで上書き復元（人名として妥当な場合のみ）
+            j = 0
             for i, t in enumerate(refined.talks):
-                if i < len(draft_people) and draft_people[i][0] and _is_plausible_speaker_name(draft_people[i][0]):
-                    t.speaker = draft_people[i][0]
-                    t.speaker_display = build_speaker_display(draft_people[i][0]) or draft_people[i][0]
-                    if draft_people[i][1]:
-                        t.affiliation = draft_people[i][1]
+                if _is_program_chair_item(t):
+                    continue
+                if j < len(draft_people) and draft_people[j][0] and _is_plausible_speaker_name(draft_people[j][0]):
+                    t.speaker = draft_people[j][0]
+                    t.speaker_display = build_speaker_display(draft_people[j][0]) or draft_people[j][0]
+                    if draft_people[j][1]:
+                        t.affiliation = draft_people[j][1]
                     print(f"[AI REFINE DEBUG] AI座長演者逆転: talk[{i}] speaker/affiliation復元 ({t.speaker})")
-                elif i < len(draft_people) and draft_people[i][0]:
-                    print(f"[AI REFINE DEBUG] AI座長演者逆転: talk[{i}] draft speaker不正のためAI値を維持 ({draft_people[i][0]})")
+                elif j < len(draft_people) and draft_people[j][0]:
+                    print(f"[AI REFINE DEBUG] AI座長演者逆転: talk[{i}] draft speaker不正のためAI値を維持 ({draft_people[j][0]})")
+                j += 1
         else:
             refined.talks = _build_talks_from_parsed(parsed_talks)
 
+    # 1.5) draft に途中座長があり、AI が通常講演だけを返した場合は座長行を保持して通常講演だけパッチ
+    elif (
+        isinstance(parsed_talks, list)
+        and draft_has_chairs
+        and not parsed_has_chairs
+        and len(parsed_regular_talks) == len(draft_regular_talks)
+    ):
+        for i, (t, pt) in enumerate(zip(draft_regular_talks, parsed_regular_talks)):
+            pt_time = normalize_time_range_talks(pt.get("time", "") or "")
+            if pt_time:
+                t.time = pt_time
+
+            title_lines = normalize_lines_keep_order(_safe_list_str(pt.get("title_lines")))
+            if title_lines:
+                t.title_lines = title_lines
+                t.title = "\n".join(title_lines).strip()
+
+            if _ai_swapped_chair_speaker and t.speaker and t.affiliation and _is_plausible_speaker_name(t.speaker):
+                print(f"[AI REFINE DEBUG] AI座長演者逆転検出: talk[{i}] speaker/affiliation保持 ({t.speaker})")
+            else:
+                sp = _norm_speaker_candidate(pt.get("speaker", "") or "")
+                if sp:
+                    t.speaker = sp
+                    t.speaker_display = build_speaker_display(sp) or sp
+
+                aff = normalize_space(pt.get("affiliation", "") or "")
+                if aff:
+                    t.affiliation = aff
+
     # 2) AI が講演数を減らした場合（挨拶・休憩等の除外）→ AI talks を採用
-    elif isinstance(parsed_talks, list) and len(parsed_talks) < len(refined.talks):
+    elif (
+        isinstance(parsed_talks, list)
+        and len(parsed_talks) < len(refined.talks)
+        and not (draft_has_chairs and not parsed_has_chairs)
+    ):
         # AIが除外した分が妥当かチェック: AI側の全talkが有効であれば採用
         ai_talks = _build_talks_from_parsed(parsed_talks)
         if ai_talks and not any(_looks_bad_talk_seed_strong(t) for t in ai_talks):
@@ -9415,6 +10145,25 @@ async def ai_refine_json(
                 continue
 
             t = refined.talks[i]
+
+            if _is_program_chair_item(t) or _json_is_chair_item(pt):
+                if _json_is_chair_item(pt):
+                    t.item_type = "chair"
+                    t.role = normalize_chair_role(pt.get("role", "") or getattr(t, "role", "") or "座長")
+                    name_display = normalize_person_display(
+                        pt.get("name_display")
+                        or pt.get("name")
+                        or getattr(t, "name_display", "")
+                        or ""
+                    )
+                    if name_display:
+                        t.name_display = name_display
+                    aff = normalize_space(pt.get("affiliation", "") or "")
+                    if aff:
+                        t.affiliation = aff
+                    t.speaker = ""
+                    t.speaker_display = ""
+                continue
 
             # time は AI を採用
             pt_time = normalize_time_range_talks(pt.get("time", "") or "")
@@ -9831,6 +10580,8 @@ def assign_talk_times_by_nearest_upper_time(blocks: list[TextBlock], talks: list
             time_blocks.append((top, left, f"{start_norm}~{end_norm}"))
 
     for t in talks:
+        if _is_program_chair_item(t):
+            continue
         # 既に時間が設定されている場合はスキップ
         if normalize_space(t.time):
             continue
@@ -9908,6 +10659,19 @@ def postprocess_refined(refined: DesignJSON, speaker_map: Dict[str, str], time_c
     
     cleaned: List[Talk] = []
     for t in refined.talks:
+        if _is_program_chair_item(t):
+            t.role = normalize_space(getattr(t, "role", "") or "") or "座長"
+            if not normalize_space(getattr(t, "name_display", "") or ""):
+                base_name = normalize_space(getattr(t, "speaker_display", "") or getattr(t, "speaker", "") or "")
+                if base_name:
+                    t.name_display = build_speaker_display(base_name) or base_name
+            t.speaker = ""
+            t.speaker_display = ""
+            t.affiliation = normalize_space(getattr(t, "affiliation", "") or "")
+            if t.name_display or t.affiliation:
+                cleaned.append(t)
+            continue
+
         if not (t.title_lines or t.speaker or t.affiliation or t.time):
             continue
 
@@ -9943,7 +10707,8 @@ def postprocess_refined(refined: DesignJSON, speaker_map: Dict[str, str], time_c
         
         
 
-    refined.talks = cleaned[:4]
+    max_items = 6 if any(_is_program_chair_item(t) for t in cleaned) else 4
+    refined.talks = cleaned[:max_items]
 
     if refined.chair.name and not refined.chair.name_display:
         refined.chair.name_display = build_speaker_display(refined.chair.name)
@@ -10291,16 +11056,17 @@ def parse_blocks_to_design_json(blocks: List[TextBlock], vm_rows: Optional[List[
 
     confidence = float(min(max(confidence, 0.0), 1.0))
 
-    return DesignJSON(
+    payload = DesignJSON(
         event_title_lines=event_title_lines,
         event_title=event_title,
         datetime=normalize_space(dt),
         organizer=normalize_organizer(org),
         chair=Chair(role=chair.role, name=chair.name, name_display=chair.name_display, affiliation=chair.affiliation),
-        talks=talks[:4],
+        talks=talks[:6],
         warnings=sorted(set(warnings)),
         confidence=confidence,
     )
+    return apply_inline_program_extraction(payload, blocks)
 
 
 
@@ -10448,6 +11214,8 @@ def clean_speaker_text(s: str) -> str:
 
 def normalize_talk_speakers(payload: DesignJSON) -> DesignJSON:
     for t in (payload.talks or []):
+        if _is_program_chair_item(t):
+            continue
         base = (t.speaker_display or "").strip() or (t.speaker or "").strip()
         cleaned = clean_speaker_text(base)
 
@@ -10473,6 +11241,9 @@ def _has_any_talk_signal(t) -> bool:
     ])
 
 def _is_obviously_bad_talk(t, chair_name: str = "") -> bool:
+    if _is_program_chair_item(t):
+        return False
+
     title = _talk_title_text(t)
     speaker = normalize_space(getattr(t, "speaker", "") or "")
     affiliation = normalize_space(getattr(t, "affiliation", "") or "")
@@ -10512,6 +11283,9 @@ def prune_talks_using_vm_titles(payload: DesignJSON, vm_rows: list[dict]) -> Des
     # 1) 明らかな不要物だけ落とす
     filtered = []
     for t in talks:
+        if _is_program_chair_item(t):
+            filtered.append(t)
+            continue
         tt = normalize_space("\n".join(t.title_lines or []).strip() or (t.title or ""))
         if _is_unwanted_talk(tt):
             continue
@@ -10521,6 +11295,9 @@ def prune_talks_using_vm_titles(payload: DesignJSON, vm_rows: list[dict]) -> Des
     seen = set()
     dedup = []
     for t in filtered:
+        if _is_program_chair_item(t):
+            dedup.append(t)
+            continue
         key = _norm_title_key("\n".join(t.title_lines or []).strip() or (t.title or ""))
         if not key:
             dedup.append(t)
@@ -10873,6 +11650,8 @@ def apply_vm_hints_from_blocks(blocks: List[TextBlock], payload: DesignJSON, vm_
     facilities = [ (vm.get("案内状掲載 施設名") or "").strip() for vm in vm_rows if (vm.get("案内状掲載 施設名") or "").strip() ]
 
     for t in payload.talks:
+        if _is_program_chair_item(t):
+            continue
         # sp = _norm_person_name(getattr(t, "speaker_display", "") or getattr(t, "speaker", ""))
         # vm = vm_by_name.get(sp)
         vm = _pick_vm_row_by_talk(vm_by_name, t)
@@ -10916,6 +11695,8 @@ def fill_missing_from_vm(payload: DesignJSON, vm_rows: List[dict]) -> DesignJSON
     }
 
     for t in payload.talks:
+        if _is_program_chair_item(t):
+            continue
         sp = _norm_person_name(t.speaker or t.speaker_display or "")
         vm = vm_by_name.get(sp)
         if not vm:
@@ -10980,6 +11761,10 @@ def normalize_speaker_display(payload: DesignJSON) -> DesignJSON:
         payload.chair.name_display = build_speaker_display(name)
 
     for t in getattr(payload, "talks", []) or []:
+        if _is_program_chair_item(t):
+            if getattr(t, "name_display", ""):
+                t.name_display = build_speaker_display(t.name_display)
+            continue
         name = normalize_space(t.speaker or "")
         t.speaker_display = build_speaker_display(name)
 
@@ -11016,12 +11801,18 @@ def prune_talks_heuristic_only(payload: DesignJSON) -> DesignJSON:
 
     filtered = []
     for t in talks:
+        if _is_program_chair_item(t):
+            filtered.append(t)
+            continue
         if _is_obviously_bad_talk(t, chair_name=chair_name):
             continue
         filtered.append(t)
 
     grouped = {}
     for t in filtered:
+        if _is_program_chair_item(t):
+            grouped.setdefault(f"__chair__{len(grouped)}", []).append(t)
+            continue
         key = _norm_title_key(_talk_title_text(t))
         if not key:
             key = f"__idx__{len(grouped)}"
@@ -11101,6 +11892,8 @@ def append_vm_role_to_talk_affiliation(payload, vm_rows: list[dict]) -> None:
             vm_by_name[doctor] = d
 
     for t in payload.talks:
+        if _is_program_chair_item(t):
+            continue
         sp = norm_key(getattr(t, "speaker", ""))
         if not sp:
             continue
@@ -11641,6 +12434,9 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
         # 演者とか混ざってたら除去
         s = re.sub(r"(演者|座長)\s*", "", s)
 
+        # 「ご所属：」プレフィックスを除去
+        s = re.sub(r'^ご?所属\s*[:：]\s*', '', s)
+
         return s.strip()
 
 
@@ -11657,13 +12453,25 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
 
     for idx, t in enumerate(talks, start=1):
         anchor = _find_talk_anchor(idx)
+
+        # フォールバック: 番号なし「演題」「演者」ブロックをアンカーにする（1講演のみ）
+        if not anchor and len(talks) == 1:
+            for _b in ordered:
+                for _line in (_b.text or "").split("\n"):
+                    _k = normalize_key(_line).rstrip("：:")
+                    if _k in ("演題", "演者"):
+                        anchor = _b
+                        break
+                if anchor:
+                    break
+
         if not anchor:
             continue
 
         # 次の講演アンカーまでをこの講演の範囲にする
         next_anchor = _find_talk_anchor(idx + 1)
 
-        x0 = anchor.left - 2500000
+        x0 = anchor.left - 3000000
         x1 = anchor.left + 4500000
         y0 = anchor.top - 100000
         y1 = (next_anchor.top - 150000) if next_anchor else (anchor.top + 3500000)
@@ -11744,7 +12552,12 @@ def repair_talks_from_blocks(payload: DesignJSON, blocks: list[TextBlock]) -> De
                         affiliation = bt
                         break
 
-        if speaker and (not t.speaker or is_bad_speaker(t.speaker)):
+        # 演者が座長と同一なら再抽出対象にする
+        _chair_nm_key = normalize_key(getattr(payload.chair, "name", "") or "").replace("先生", "")
+        _t_sp_key = normalize_key(t.speaker or "").replace("先生", "")
+        _speaker_is_chair = bool(_chair_nm_key and _t_sp_key and _t_sp_key == _chair_nm_key)
+
+        if speaker and (not t.speaker or is_bad_speaker(t.speaker) or _speaker_is_chair):
             sp = clean_speaker_text(speaker)
 
             chair_name_key = normalize_key(getattr(payload.chair, "name", "") or "").replace("先生", "")
@@ -11901,6 +12714,8 @@ def finalize_people_fields(payload: DesignJSON) -> DesignJSON:
             print(f"[DEBUG] Chair affiliation after: '{clean_affiliation}'")
 
         payload.chair.affiliation = strip_outer_parens_suffix(payload.chair.affiliation or "")
+        # 「ご所属：」プレフィックスを除去
+        payload.chair.affiliation = re.sub(r'^ご?所属\s*[:：]\s*', '', payload.chair.affiliation)
 
     # talks - 不正な演者名を修正（講演自体は残す）
     for t in getattr(payload, "talks", []) or []:
@@ -11914,6 +12729,12 @@ def finalize_people_fields(payload: DesignJSON) -> DesignJSON:
             t.speaker = ""
             t.speaker_display = ""
         
+        # 「ご所属：」プレフィックスを除去
+        aff = normalize_space(getattr(t, "affiliation", "") or "")
+        aff = re.sub(r'^ご?所属\s*[:：]\s*', '', aff)
+        if aff != normalize_space(getattr(t, "affiliation", "") or ""):
+            t.affiliation = aff
+
         # 所属に座長情報が混入している場合の最終クリーニング
         aff = normalize_space(getattr(t, "affiliation", "") or "")
         if aff and "座長" in aff:
@@ -12357,6 +13178,9 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
 
         grouped = {}
         for t in talks:
+            if _is_program_chair_item(t):
+                grouped.setdefault(f"__chair__{len(grouped)}", []).append(t)
+                continue
             grouped.setdefault(_title_key(t), []).append(t)
 
         kept = []
@@ -12416,6 +13240,9 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
     dump_titles("after apply_learned_affiliation_format", refined)
 
     refined = fill_datetime_parts(refined, blocks)
+
+    refined = apply_inline_program_extraction(refined, blocks)
+    dump_titles("after apply_inline_program_extraction", refined)
 
     # NOTE: apply_correct_answer_overlay はバッチフロー側で
     # apply_precise_typeset_initial の「後」に呼ぶ（typeset が改行位置を上書きするため）
@@ -13024,6 +13851,10 @@ async def startup():
 
     # Playwright を1回だけ起動して使い回す
     _pw = await async_playwright().start()
+    try:
+        os.environ.setdefault("LECTURE_TOOL_CHROME_EXECUTABLE_PATH", _pw.chromium.executable_path)
+    except Exception as e:
+        print("[startup chromium executable path warning]", e)
     _browser = await _pw.chromium.launch(
         args=["--no-sandbox", "--disable-dev-shm-usage"],
     )
@@ -13057,6 +13888,1248 @@ async def shutdown():
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _lecture_normalize_drive_folder_id(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    folder_match = re.search(r"/folders/([^/?#]+)", text)
+    if folder_match:
+        return folder_match.group(1)
+    query_match = re.search(r"[?&]id=([^&#]+)", text)
+    if query_match:
+        return query_match.group(1)
+    return text
+
+
+LECTURE_TOOL_SPREADSHEET_KEY = os.getenv(
+    "LECTURE_TOOL_SPREADSHEET_KEY",
+    "1BA4e8UpnC9MSA7vIaX6nDKwbLnJjSlR4WGfnSilycQQ",
+)
+LECTURE_TOOL_SHEET_GID = int(os.getenv("LECTURE_TOOL_SHEET_GID", "156086772"))
+LECTURE_TOOL_OUTPUT_DIR = DATA_DIR / "lecture_search_guide"
+LECTURE_TOOL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+LECTURE_TOOL_IMAGE_WIDTH = 2048
+LECTURE_TOOL_IMAGE_QUALITY = 100
+LECTURE_TOOL_DRIVE_IMAGE_QUALITY = int(os.getenv("LECTURE_TOOL_DRIVE_IMAGE_QUALITY", "95"))
+LECTURE_TOOL_DRIVE_CONFIG_SIZES = [(453, 640), (480, 679)]
+LECTURE_TOOL_TARGET_IMAGE_BYTES = int(os.getenv("LECTURE_TOOL_TARGET_IMAGE_BYTES", str(100 * 1024)))
+LECTURE_TOOL_TARGET_IMAGE_TOLERANCE = int(os.getenv("LECTURE_TOOL_TARGET_IMAGE_TOLERANCE", str(15 * 1024)))
+LECTURE_TOOL_DRIVE_FOLDER_ID = _lecture_normalize_drive_folder_id(os.getenv("LECTURE_TOOL_DRIVE_FOLDER_ID") or "")
+LECTURE_TOOL_DEFAULT_VAULT_COMMAND = f"node {shlex.quote(str(APP_DIR / 'tools' / 'lecture_vault_register.js'))}"
+LECTURE_TOOL_VAULT_COMMAND = (os.getenv("LECTURE_TOOL_VAULT_COMMAND") or LECTURE_TOOL_DEFAULT_VAULT_COMMAND).strip()
+LECTURE_TOOL_VAULT_ACCOUNTS = [
+    account.strip()
+    for account in (
+        os.getenv(
+            "LECTURE_TOOL_VAULT_ACCOUNTS",
+            "mika.hirawatari@msd.com,maika.mori@msd.com,yura.fukuhara@msd.com,Hayato.Seto@vv-agency.com",
+        )
+    ).split(",")
+    if account.strip()
+]
+
+
+LECTURE_TOOL_COLUMN_ALIASES = {
+    "lecture_id": ["講演会ID", "システムID", "event_id", "Event ID", "講演会 id"],
+    "presentation_id": ["プレゼンテーションID", "Presentation ID", "presentation_id", "crmPresentationId_b"],
+    "product": ["Product", "プロダクト", "製品", "製品名"],
+    "reception_date": ["受付日", "受付日付", "開催受付日", "reception_date"],
+    "category": ["区分", "分類", "category"],
+    "event_date": ["開催日", "開催日時", "event_date"],
+    "event_time": ["時間", "開催時間", "event_time"],
+    "event_name": ["講演会名", "event_name"],
+    "image_name": ["画像名", "画像ファイル名", "image", "image_name"],
+    "media_file_name": ["メディアファイル名", "メディア名", "media", "media_file_name"],
+    "presentation_name": [
+        "プレゼンテーション/キーメッセージ名",
+        "プレゼンテーション名",
+        "キーメッセージ名",
+        "presentation",
+    ],
+}
+
+
+class LectureToolCancelled(Exception):
+    pass
+
+
+LECTURE_TOOL_CANCEL_LOCK = threading.Lock()
+LECTURE_TOOL_CANCEL_CONTROLLERS: dict[str, dict[str, Any]] = {}
+LECTURE_TOOL_VAULT_MAX_PARALLEL = max(
+    1,
+    int(os.getenv("LECTURE_TOOL_VAULT_MAX_PARALLEL", str(max(1, len(LECTURE_TOOL_VAULT_ACCOUNTS))))),
+)
+LECTURE_TOOL_VAULT_SEMAPHORE = threading.BoundedSemaphore(LECTURE_TOOL_VAULT_MAX_PARALLEL)
+LECTURE_TOOL_VAULT_LOCKS_LOCK = threading.Lock()
+LECTURE_TOOL_VAULT_ACCOUNT_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _lecture_register_cancel_controller(session_id: str) -> dict[str, Any]:
+    controller = {
+        "event": threading.Event(),
+        "process": None,
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+    }
+    with LECTURE_TOOL_CANCEL_LOCK:
+        LECTURE_TOOL_CANCEL_CONTROLLERS[session_id] = controller
+    return controller
+
+
+def _lecture_unregister_cancel_controller(session_id: str) -> None:
+    with LECTURE_TOOL_CANCEL_LOCK:
+        LECTURE_TOOL_CANCEL_CONTROLLERS.pop(session_id, None)
+
+
+def _lecture_set_cancel_process(session_id: str, proc: subprocess.Popen | None) -> None:
+    should_stop = False
+    with LECTURE_TOOL_CANCEL_LOCK:
+        controller = LECTURE_TOOL_CANCEL_CONTROLLERS.get(session_id)
+        if controller is not None:
+            controller["process"] = proc
+            should_stop = bool(proc and controller["event"].is_set())
+    if should_stop and proc:
+        _lecture_stop_process(proc)
+
+
+def _lecture_stop_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def _lecture_cancel_session(session_id: str) -> bool:
+    proc = None
+    with LECTURE_TOOL_CANCEL_LOCK:
+        controller = LECTURE_TOOL_CANCEL_CONTROLLERS.get(session_id)
+        if not controller:
+            return False
+        controller["event"].set()
+        proc = controller.get("process")
+    if proc:
+        _lecture_stop_process(proc)
+    return True
+
+
+def _lecture_raise_if_cancelled(cancel_event: threading.Event | None, message: str = "処理を中断しました。") -> None:
+    if cancel_event and cancel_event.is_set():
+        raise LectureToolCancelled(message)
+
+
+def _lecture_vault_account_key(vault_account: str) -> str:
+    return normalize_space(vault_account or "").lower()
+
+
+def _lecture_get_vault_account_lock(vault_account: str) -> threading.Lock:
+    key = _lecture_vault_account_key(vault_account) or "__blank__"
+    with LECTURE_TOOL_VAULT_LOCKS_LOCK:
+        lock = LECTURE_TOOL_VAULT_ACCOUNT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            LECTURE_TOOL_VAULT_ACCOUNT_LOCKS[key] = lock
+        return lock
+
+
+def _lecture_header_key(value: str) -> str:
+    return re.sub(r"[\s\u3000]+", "", normalize_space(value or "")).lower()
+
+
+def _lecture_pick_column(headers: list[str], field: str) -> str:
+    normalized = {_lecture_header_key(h): h for h in headers}
+    for alias in LECTURE_TOOL_COLUMN_ALIASES[field]:
+        hit = normalized.get(_lecture_header_key(alias))
+        if hit:
+            return hit
+    return ""
+
+
+def _lecture_find_header(values: list[list[str]]) -> tuple[int, list[str], dict[str, str]]:
+    for idx, row in enumerate(values[:20], start=1):
+        headers = make_unique(row)
+        columns = {
+            field: _lecture_pick_column(headers, field)
+            for field in LECTURE_TOOL_COLUMN_ALIASES.keys()
+        }
+        if columns["image_name"] and columns["media_file_name"] and columns["presentation_name"]:
+            return idx, headers, columns
+    raise RuntimeError("必要な列（画像名、メディアファイル名、プレゼンテーション/キーメッセージ名）が見つかりません。")
+
+
+def _lecture_safe_name(value: str, fallback: str) -> str:
+    text = normalize_space(value or "")
+    text = re.sub(r'[\\/:*?"<>|]+', "_", text)
+    text = re.sub(r"\s+", "", text)
+    text = text.strip("._ ")
+    return text or fallback
+
+
+def _lecture_normalize_filename(value: str) -> str:
+    name = Path(normalize_space(value or "")).name
+    stem = Path(name).stem if Path(name).suffix else name
+    return re.sub(r"[\s\u3000]+", "", stem).lower()
+
+
+def _lecture_sheet_image_filename(row: dict[str, Any], fallback: str) -> str:
+    raw = normalize_space(row.get("imageName") or fallback or "image.jpg")
+    name = Path(raw).name
+    stem = _lecture_safe_name(Path(name).stem if Path(name).suffix else name, "image")
+    return f"{stem}.jpg"
+
+
+def _lecture_spreadsheet_url() -> str:
+    return f"https://docs.google.com/spreadsheets/d/{LECTURE_TOOL_SPREADSHEET_KEY}/edit?gid={LECTURE_TOOL_SHEET_GID}"
+
+
+def _lecture_open_spreadsheet_and_worksheet():
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    credentials = get_gsa_credentials(scope)
+    gc = gspread.authorize(credentials)
+    workbook = _retry_gspread(lambda: gc.open_by_key(LECTURE_TOOL_SPREADSHEET_KEY))
+    worksheets = _retry_gspread(lambda: workbook.worksheets())
+    for ws in worksheets:
+        if int(getattr(ws, "id", -1)) == LECTURE_TOOL_SHEET_GID:
+            return workbook, ws
+    raise RuntimeError(f"gid={LECTURE_TOOL_SHEET_GID} のシートが見つかりません。")
+
+
+def _lecture_open_worksheet():
+    return _lecture_open_spreadsheet_and_worksheet()[1]
+
+
+def _lecture_drive_credentials():
+    scope = ["https://www.googleapis.com/auth/drive"]
+    credentials = get_gsa_credentials(scope)
+    credentials.refresh(GoogleAuthRequest())
+    return credentials
+
+
+def _lecture_drive_escape_query_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _lecture_drive_error(resp: requests.Response, action: str) -> RuntimeError:
+    message = resp.text
+    try:
+        body = resp.json()
+        message = body.get("error", {}).get("message") or message
+    except Exception:
+        pass
+    return RuntimeError(f"Google Drive {action} failed ({resp.status_code}): {message}")
+
+
+def _lecture_drive_find_files(folder_id: str, filename: str) -> list[dict[str, Any]]:
+    credentials = _lecture_drive_credentials()
+    q = (
+        f"name = '{_lecture_drive_escape_query_value(filename)}' "
+        f"and '{_lecture_drive_escape_query_value(folder_id)}' in parents "
+        "and trashed = false"
+    )
+    resp = requests.get(
+        "https://www.googleapis.com/drive/v3/files",
+        headers={"Authorization": f"Bearer {credentials.token}"},
+        params={
+            "q": q,
+            "fields": "files(id,name,modifiedTime)",
+            "pageSize": 20,
+            "orderBy": "modifiedTime desc",
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+            "corpora": "allDrives",
+        },
+        timeout=30,
+    )
+    if not resp.ok:
+        raise _lecture_drive_error(resp, "file lookup")
+    return resp.json().get("files") or []
+
+
+def _lecture_drive_upload_image(filename: str, data: bytes) -> dict[str, Any]:
+    if not LECTURE_TOOL_DRIVE_FOLDER_ID:
+        return {}
+
+    credentials = _lecture_drive_credentials()
+    headers = {"Authorization": f"Bearer {credentials.token}"}
+    existing_files = _lecture_drive_find_files(LECTURE_TOOL_DRIVE_FOLDER_ID, filename)
+    existing_id = existing_files[0]["id"] if existing_files else ""
+    metadata = {"name": filename, "mimeType": "image/jpeg"}
+    if not existing_id:
+        metadata["parents"] = [LECTURE_TOOL_DRIVE_FOLDER_ID]
+
+    files = {
+        "metadata": ("metadata", json.dumps(metadata, ensure_ascii=False), "application/json; charset=UTF-8"),
+        "file": (filename, data, "image/jpeg"),
+    }
+
+    if existing_id:
+        url = f"https://www.googleapis.com/upload/drive/v3/files/{existing_id}"
+        resp = requests.patch(
+            url,
+            headers=headers,
+            params={"uploadType": "multipart", "supportsAllDrives": "true", "fields": "id,name,webViewLink"},
+            files=files,
+            timeout=60,
+        )
+    else:
+        resp = requests.post(
+            "https://www.googleapis.com/upload/drive/v3/files",
+            headers=headers,
+            params={"uploadType": "multipart", "supportsAllDrives": "true", "fields": "id,name,webViewLink"},
+            files=files,
+            timeout=60,
+        )
+    if not resp.ok:
+        raise _lecture_drive_error(resp, "upload")
+    body = resp.json()
+    return {
+        "id": body.get("id", existing_id),
+        "name": body.get("name", filename),
+        "webViewLink": body.get("webViewLink", ""),
+        "size": len(data),
+        "updated": bool(existing_id),
+        "duplicateExistingCount": max(0, len(existing_files) - 1),
+    }
+
+
+def _lecture_bool(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "checked"}
+
+
+def _lecture_progress(progress, step: str, message: str, **data) -> None:
+    if progress:
+        progress({"step": step, "message": message, **data})
+
+
+def _lecture_vault_register_packages(
+    packages: list[dict[str, Any]],
+    vault_account: str,
+    progress=None,
+    *,
+    session_id: str = "",
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    if not LECTURE_TOOL_VAULT_COMMAND:
+        raise RuntimeError("Vault登録コマンドが未設定です。LECTURE_TOOL_VAULT_COMMAND を設定してください。")
+
+    _lecture_raise_if_cancelled(cancel_event, "Vault登録を中断しました。")
+    payload = json.dumps(
+        {
+            "vaultAccount": vault_account,
+            "packages": packages,
+        },
+        ensure_ascii=False,
+    )
+    _lecture_progress(
+        progress,
+        "vault",
+        f"Vault登録をまとめて開始しています: {len(packages)} 件",
+        count=len(packages),
+        vaultAccount=vault_account,
+    )
+    proc = subprocess.Popen(
+        shlex.split(LECTURE_TOOL_VAULT_COMMAND),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    if session_id:
+        _lecture_set_cancel_process(session_id, proc)
+    timeout_seconds = int(os.getenv("LECTURE_TOOL_VAULT_TIMEOUT", "1800"))
+    timed_out = threading.Event()
+
+    def kill_on_timeout():
+        if proc.poll() is None:
+            timed_out.set()
+            _lecture_stop_process(proc)
+
+    watchdog = threading.Timer(timeout_seconds, kill_on_timeout)
+    watchdog.daemon = True
+    watchdog.start()
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    try:
+        proc.stdin.write(payload)
+        proc.stdin.close()
+
+        stderr_lines: list[str] = []
+        marker_results: list[dict[str, Any]] = []
+        for line in proc.stderr:
+            _lecture_raise_if_cancelled(cancel_event, "Vault登録を中断しました。")
+            text = line.strip()
+            if not text:
+                continue
+            if text.startswith("__VAULT_RESULT__"):
+                try:
+                    result_item = json.loads(text.removeprefix("__VAULT_RESULT__"))
+                    if isinstance(result_item, dict):
+                        marker_results.append(result_item)
+                        if progress:
+                            progress({"event": "vault-result", "result": result_item})
+                except Exception:
+                    pass
+                continue
+            stderr_lines.append(text)
+            _lecture_progress(progress, "vault", text, vaultAccount=vault_account)
+
+        stdout = proc.stdout.read()
+        try:
+            return_code = proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _lecture_stop_process(proc)
+            return_code = proc.wait(timeout=10)
+        _lecture_raise_if_cancelled(cancel_event, "Vault登録を中断しました。")
+        if timed_out.is_set():
+            raise RuntimeError(f"Vault登録に失敗しました。timeout={timeout_seconds}s: プロセスが終了しなかったため停止しました。")
+        if return_code != 0:
+            message = "\n".join(stderr_lines) or stdout.strip()
+            raise RuntimeError(f"Vault登録に失敗しました。exit={return_code}: {message}")
+
+        stdout = (stdout or "").strip()
+        try:
+            body = json.loads(stdout) if stdout else {}
+        except Exception:
+            body = {"output": stdout}
+        if marker_results and (not isinstance(body, dict) or not isinstance(body.get("results"), list)):
+            return {"results": marker_results, "vaultAccount": vault_account}
+        return body if isinstance(body, dict) else {"output": body}
+    finally:
+        watchdog.cancel()
+        if session_id:
+            _lecture_set_cancel_process(session_id, None)
+
+
+def _lecture_fetch_sheet_rows() -> dict[str, Any]:
+    workbook, ws = _lecture_open_spreadsheet_and_worksheet()
+    values = _retry_gspread(lambda: ws.get_all_values())
+    if not values:
+        return {
+            "spreadsheetTitle": getattr(workbook, "title", ""),
+            "spreadsheetUrl": _lecture_spreadsheet_url(),
+            "sheetTitle": ws.title,
+            "sheetGid": getattr(ws, "id", LECTURE_TOOL_SHEET_GID),
+            "headerRow": 0,
+            "columns": {},
+            "rows": [],
+        }
+
+    header_row, headers, columns = _lecture_find_header(values)
+    rows: list[dict[str, Any]] = []
+
+    for row_number, raw in enumerate(values[header_row:], start=header_row + 1):
+        data = {headers[i]: raw[i] if i < len(raw) else "" for i in range(len(headers))}
+        lecture_id = normalize_space(data.get(columns.get("lecture_id", ""), ""))
+        presentation_id = normalize_space(data.get(columns.get("presentation_id", ""), ""))
+        product = normalize_space(data.get(columns.get("product", ""), ""))
+        reception_date = normalize_space(data.get(columns.get("reception_date", ""), ""))
+        category = normalize_space(data.get(columns.get("category", ""), ""))
+        event_name = normalize_space(data.get(columns.get("event_name", ""), ""))
+        event_date = normalize_space(data.get(columns.get("event_date", ""), ""))
+        event_time = normalize_space(data.get(columns.get("event_time", ""), ""))
+        image_name = normalize_space(data.get(columns["image_name"], ""))
+        media_file_name = normalize_space(data.get(columns["media_file_name"], ""))
+        presentation_name = normalize_space(data.get(columns["presentation_name"], ""))
+
+        if not (image_name or media_file_name or presentation_name):
+            continue
+
+        rows.append(
+            {
+                "id": str(row_number),
+                "rowNumber": row_number,
+                "lectureId": lecture_id,
+                "presentationId": presentation_id,
+                "product": product,
+                "receptionDate": reception_date,
+                "category": category,
+                "imageName": image_name,
+                "imageKey": _lecture_normalize_filename(image_name),
+                "mediaFileName": media_file_name,
+                "presentationName": presentation_name,
+                "eventName": event_name,
+                "eventDate": event_date,
+                "eventTime": event_time,
+            }
+        )
+
+    return {
+        "spreadsheetTitle": getattr(workbook, "title", ""),
+        "spreadsheetUrl": _lecture_spreadsheet_url(),
+        "sheetTitle": ws.title,
+        "sheetGid": getattr(ws, "id", LECTURE_TOOL_SHEET_GID),
+        "headerRow": header_row,
+        "columns": columns,
+        "rows": rows,
+    }
+
+
+def _lecture_session_root(session_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}", session_id or ""):
+        raise HTTPException(status_code=400, detail="invalid session id")
+    return LECTURE_TOOL_OUTPUT_DIR / session_id
+
+
+def _lecture_result_files(session_id: str, limit: int = 300) -> list[dict[str, Any]]:
+    result_dir = _lecture_session_root(session_id) / "result"
+    if not result_dir.exists():
+        return []
+
+    files: list[dict[str, Any]] = []
+    for path in result_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        files.append(
+            {
+                "path": path.relative_to(result_dir).as_posix(),
+                "name": path.name,
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            }
+        )
+
+    files.sort(key=lambda item: item["modified"], reverse=True)
+    return files[:limit]
+
+
+def _lecture_jpeg_bytes(
+    img: Image.Image,
+    *,
+    quality: int,
+    subsampling: int = 2,
+    optimize: bool = True,
+) -> bytes:
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=quality, subsampling=subsampling, optimize=optimize)
+    return out.getvalue()
+
+
+def _lecture_jpeg_near_target(img: Image.Image) -> tuple[bytes, int]:
+    target = LECTURE_TOOL_TARGET_IMAGE_BYTES
+    tolerance = LECTURE_TOOL_TARGET_IMAGE_TOLERANCE
+    lower = max(0, target - tolerance)
+    upper = target + tolerance
+
+    candidates: list[tuple[int, int, bytes]] = []
+    for subsampling in (2, 1, 0):
+        lo, hi = 1, 100
+        best_under: tuple[int, bytes] | None = None
+        while lo <= hi:
+            q = (lo + hi) // 2
+            data = _lecture_jpeg_bytes(img, quality=q, subsampling=subsampling)
+            size = len(data)
+            candidates.append((abs(size - target), q, data))
+            if size <= upper:
+                best_under = (q, data)
+                lo = q + 1
+            else:
+                hi = q - 1
+
+        if best_under:
+            q, data = best_under
+            if len(data) >= lower:
+                return data, q
+
+    candidates.sort(key=lambda item: (item[0], -item[1]))
+    _, quality, data = candidates[0]
+    return data, quality
+
+
+def _lecture_resize_width_jpeg(data: bytes) -> tuple[bytes, dict[str, int]]:
+    with Image.open(io.BytesIO(data)) as img:
+        img = ImageOps.exif_transpose(img)
+        original_width, original_height = img.size
+        next_height = max(1, round(original_height * (LECTURE_TOOL_IMAGE_WIDTH / original_width)))
+        img = img.convert("RGB")
+        if img.size != (LECTURE_TOOL_IMAGE_WIDTH, next_height):
+            img = img.resize((LECTURE_TOOL_IMAGE_WIDTH, next_height), Image.Resampling.LANCZOS)
+
+        output = _lecture_jpeg_bytes(
+            img,
+            quality=LECTURE_TOOL_IMAGE_QUALITY,
+            subsampling=0,
+            optimize=False,
+        )
+        return output, {
+            "originalWidth": original_width,
+            "originalHeight": original_height,
+            "width": LECTURE_TOOL_IMAGE_WIDTH,
+            "height": next_height,
+            "quality": LECTURE_TOOL_IMAGE_QUALITY,
+            "bytes": len(output),
+        }
+
+
+def _lecture_drive_jpeg_near_target(data: bytes) -> tuple[bytes, dict[str, int]]:
+    with Image.open(io.BytesIO(data)) as img:
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        original_width, original_height = img.size
+
+        target = LECTURE_TOOL_TARGET_IMAGE_BYTES
+
+        candidates: list[tuple[int, bytes, int, int]] = []
+        for width, height in LECTURE_TOOL_DRIVE_CONFIG_SIZES:
+            work = img if img.size == (width, height) else img.resize((width, height), Image.Resampling.LANCZOS)
+            output = _lecture_jpeg_bytes(
+                work,
+                quality=LECTURE_TOOL_DRIVE_IMAGE_QUALITY,
+                subsampling=2,
+                optimize=True,
+            )
+            candidates.append((abs(len(output) - target), output, width, height))
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        _, output, width, height = candidates[0]
+        return output, {
+            "originalWidth": original_width,
+            "originalHeight": original_height,
+            "width": width,
+            "height": height,
+            "quality": LECTURE_TOOL_DRIVE_IMAGE_QUALITY,
+            "bytes": len(output),
+            "targetBytes": LECTURE_TOOL_TARGET_IMAGE_BYTES,
+        }
+
+
+def _lecture_contain_jpeg(data: bytes, size: tuple[int, int]) -> bytes:
+    with Image.open(io.BytesIO(data)) as img:
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        img.thumbnail(size, Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", size, (0, 0, 0))
+        x = (size[0] - img.width) // 2
+        y = (size[1] - img.height) // 2
+        canvas.paste(img, (x, y))
+
+        out = io.BytesIO()
+        canvas.save(out, format="JPEG", quality=LECTURE_TOOL_IMAGE_QUALITY, subsampling=0)
+        return out.getvalue()
+
+
+def _lecture_write_html_assets(result_dir: Path, media_name: str, count: int) -> None:
+    (result_dir / "css").mkdir(parents=True, exist_ok=True)
+    (result_dir / "js").mkdir(parents=True, exist_ok=True)
+
+    reset_css = "@charset \"UTF-8\";html,body,div,span,object,iframe,h1,h2,h3,h4,h5,h6,p,blockquote,pre,abbr,address,cite,code,del,dfn,em,img,ins,kbd,q,samp,small,strong,sub,sup,var,b,i,dl,dt,dd,ol,ul,li,fieldset,form,label,legend,table,caption,tbody,tfoot,thead,tr,th,td,article,aside,canvas,details,figcaption,figure,footer,header,hgroup,menu,nav,section,summary,time,mark,audio,video{margin:0;padding:0;border:0;outline:0;font-size:100%;vertical-align:baseline;background:transparent}body{line-height:1}article,aside,details,figcaption,figure,footer,header,hgroup,menu,nav,section{display:block}blockquote,q{quotes:none}blockquote:before,blockquote:after,q:before,q:after{content:none}a{margin:0;padding:0;font-size:100%;vertical-align:baseline;background:transparent}ins{background-color:#ff9;color:#000;text-decoration:none}mark{background-color:#ff9;color:#000;font-style:italic;font-weight:bold}del{text-decoration:line-through}abbr[title],dfn[title]{border-bottom:1px dotted;cursor:help}table{border-collapse:collapse;border-spacing:0}hr{display:block;height:1px;border:0;border-top:1px solid #ccc;margin:1em 0;padding:0}input,select{vertical-align:middle}ul{list-style:none}ol{list-style:none}img{vertical-align:top;font-size:0;line-height:0}body,button,input,select,textarea{font-family:sans-serif}em{font-style:normal}\n"
+    index_css = """@charset "UTF-8";
+.wrapper {
+\twidth: 100vw;
+\t\theight: 100vh;
+\t\tposition: relative;
+\t\toverflow: hidden;
+}
+
+.wrapper img {
+\twidth: 100%;
+}
+
+
+
+
+
+"""
+    script_index_js = "(() => {\r\n\r\n\t\r\n\r\n})();\r\n\r\n\r\n"
+
+    (result_dir / "css" / "reset.css").write_text(
+        reset_css,
+        encoding="utf-8",
+    )
+    (result_dir / "css" / "index.css").write_text(
+        index_css,
+        encoding="utf-8",
+    )
+    with (result_dir / "js" / "script_index.js").open("w", encoding="utf-8", newline="") as f:
+        f.write(script_index_js)
+
+    image_tags = "\n".join(
+        f'\t\t\t<img id="link{i}" src="images/{i}.jpg" width="100%">'
+        for i in range(1, count + 1)
+    )
+    html = f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,minimum-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<meta name="format-detection" content="telephone=no">
+<title></title>
+<link rel="stylesheet" type="text/css" href="css/reset.css" />
+<link rel="stylesheet" type="text/css" href="css/index.css">
+<link rel="stylesheet" type="text/css" href="shared/css/shared.css">
+</head>
+<body>
+\t<section class="wrapper">
+\t\t<div class="inner">
+{image_tags}
+\t\t</div>
+\t</section>
+</body>
+<script src="shared/vendor/jquery.min.js" ></script>
+<script src="shared/vendor/iscroll.js"></script>
+<script src="shared/vendor/veeva-library.js"></script>
+<script src="js/script_index.js"></script>
+<script src="shared/js/shared.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.qrcode/1.0/jquery.qrcode.min.js"></script>
+</html>
+"""
+    (result_dir / f"{media_name}.html").write_text(html, encoding="utf-8")
+
+
+def _lecture_zip_directory(source_dir: Path, zip_path: Path, root_name: str) -> None:
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in source_dir.rglob("*"):
+            if path.is_file():
+                arcname = Path(root_name) / path.relative_to(source_dir)
+                zf.write(path, arcname.as_posix())
+
+
+def _lecture_result_url(session_id: str, rel_path: str) -> str:
+    encoded = "/".join(quote(part) for part in rel_path.split("/"))
+    return f"/lecture-tool/results/{session_id}/{encoded}"
+
+
+def _lecture_drive_folder_url() -> str:
+    if not LECTURE_TOOL_DRIVE_FOLDER_ID:
+        return ""
+    return f"https://drive.google.com/drive/folders/{quote(LECTURE_TOOL_DRIVE_FOLDER_ID)}"
+
+
+def _lecture_generation_result(
+    session_id: str,
+    packages: list[dict[str, Any]],
+    small_images: list[dict[str, Any]],
+    drive_uploads: list[dict[str, Any]],
+    drive_errors: list[dict[str, str]],
+    vault_registrations: list[dict[str, Any]],
+    vault_errors: list[dict[str, str]],
+) -> dict[str, Any]:
+    return {
+        "sessionId": session_id,
+        "packages": packages,
+        "smallImages": small_images,
+        "driveFolderConfigured": bool(LECTURE_TOOL_DRIVE_FOLDER_ID),
+        "driveFolderId": LECTURE_TOOL_DRIVE_FOLDER_ID,
+        "driveFolderUrl": _lecture_drive_folder_url(),
+        "googleServiceAccountEmail": get_gsa_client_email(),
+        "driveUploads": drive_uploads,
+        "driveErrors": drive_errors,
+        "vaultConfigured": bool(LECTURE_TOOL_VAULT_COMMAND),
+        "vaultRegistrations": vault_registrations,
+        "vaultErrors": vault_errors,
+        "resultFiles": _lecture_result_files(session_id),
+    }
+
+
+def _lecture_generate_packages(
+    records: list[dict[str, Any]],
+    vault_account: str = "",
+    progress=None,
+    *,
+    session_id: str | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    session_id = session_id or new_session_id()
+    result_root = _lecture_session_root(session_id) / "result"
+    result_root.mkdir(parents=True, exist_ok=True)
+    _lecture_progress(progress, "start", "生成処理を開始しました。", sessionId=session_id)
+    _lecture_raise_if_cancelled(cancel_event)
+
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for record in records:
+        row = record["row"]
+        presentation_name = row["presentationName"] or "presentation"
+        media_file_name = row["mediaFileName"] or Path(record["filename"]).stem
+        groups.setdefault((presentation_name, media_file_name), []).append(record)
+
+    packages: list[dict[str, Any]] = []
+    small_images = [
+        {
+            "filename": record["filename"],
+            "width": record["imageInfo"]["originalWidth"],
+            "height": record["imageInfo"]["originalHeight"],
+            "row": record["row"],
+        }
+        for record in records
+        if record["imageInfo"]["originalWidth"] < LECTURE_TOOL_IMAGE_WIDTH
+    ]
+
+    drive_uploads: list[dict[str, Any]] = []
+    drive_errors: list[dict[str, str]] = []
+    vault_registrations: list[dict[str, Any]] = []
+    vault_errors: list[dict[str, str]] = []
+
+    for (presentation_name, media_file_name), items in groups.items():
+        _lecture_raise_if_cancelled(cancel_event)
+        _lecture_progress(
+            progress,
+            "package",
+            f"生成物を作成しています: {media_file_name}",
+            presentationName=presentation_name,
+            mediaFileName=media_file_name,
+        )
+        presentation_safe = _lecture_safe_name(presentation_name, "presentation")
+        media_safe = _lecture_safe_name(media_file_name, "media")
+        result_dir = result_root / presentation_safe / media_safe
+        images_dir = result_dir / "images"
+        drive_images_dir = result_dir / "drive_images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+
+        for idx, item in enumerate(items, start=1):
+            _lecture_raise_if_cancelled(cancel_event)
+            (images_dir / f"{idx}.jpg").write_bytes(item["resizedBytes"])
+
+        _lecture_raise_if_cancelled(cancel_event)
+        _lecture_progress(progress, "zip", f"HTMLとサムネイルを作成しています: {media_file_name}", mediaFileName=media_file_name)
+        first_data = items[0]["originalBytes"]
+        (result_dir / f"{media_safe}-full.jpg").write_bytes(_lecture_contain_jpeg(first_data, (1024, 768)))
+        (result_dir / f"{media_safe}-thumb.jpg").write_bytes(_lecture_contain_jpeg(first_data, (200, 150)))
+        _lecture_write_html_assets(result_dir, media_safe, len(items))
+
+        zip_path = result_root / presentation_safe / f"{media_safe}.zip"
+        _lecture_raise_if_cancelled(cancel_event)
+        _lecture_progress(progress, "zip", f"ZIPを作成しています: {zip_path.name}", mediaFileName=media_file_name)
+        _lecture_zip_directory(result_dir, zip_path, media_safe)
+        _lecture_progress(progress, "zip", f"ZIP作成完了: {zip_path.name}", mediaFileName=media_file_name)
+
+        row_payloads = [item["row"] for item in items]
+        package = {
+            "presentationName": presentation_name,
+            "presentationId": next((item["row"].get("presentationId") for item in items if item["row"].get("presentationId")), ""),
+            "product": next((item["row"].get("product") for item in items if item["row"].get("product")), ""),
+            "mediaFileName": media_file_name,
+            "path": str(result_dir.relative_to(result_root)),
+            "absolutePath": str(result_dir),
+            "zipPath": str(zip_path.relative_to(result_root)),
+            "absoluteZipPath": str(zip_path),
+            "zipUrl": _lecture_result_url(session_id, str(zip_path.relative_to(result_root)).replace(os.sep, "/")),
+            "count": len(items),
+            "rows": row_payloads,
+            "driveEnabled": any(item.get("driveEnabled") for item in items),
+            "vaultEnabled": any(item.get("vaultEnabled") for item in items),
+            "vaultAccount": vault_account,
+        }
+
+        packages.append(package)
+        if progress:
+            progress(
+                {
+                    "event": "partial",
+                    "result": {
+                        "ok": True,
+                        "imageWidth": LECTURE_TOOL_IMAGE_WIDTH,
+                        "imageQuality": LECTURE_TOOL_IMAGE_QUALITY,
+                        "targetImageBytes": LECTURE_TOOL_TARGET_IMAGE_BYTES,
+                        **_lecture_generation_result(
+                            session_id,
+                            packages,
+                            small_images,
+                            drive_uploads,
+                            drive_errors,
+                            vault_registrations,
+                            vault_errors,
+                        ),
+                    },
+                }
+            )
+
+        for item in items:
+            _lecture_raise_if_cancelled(cancel_event)
+            drive_filename = _lecture_sheet_image_filename(item["row"], item["filename"])
+            download_url = ""
+            try:
+                _lecture_raise_if_cancelled(cancel_event)
+                _lecture_progress(progress, "drive", f"Drive用画像を作成しています: {drive_filename}", filename=drive_filename)
+                drive_bytes, drive_info = _lecture_drive_jpeg_near_target(item["originalBytes"])
+                drive_images_dir.mkdir(parents=True, exist_ok=True)
+                local_drive_path = drive_images_dir / drive_filename
+                local_drive_path.write_bytes(drive_bytes)
+                download_url = _lecture_result_url(session_id, str(local_drive_path.relative_to(result_root)).replace(os.sep, "/"))
+                local_drive_item = {
+                    "filename": drive_filename,
+                    "rowNumber": item["row"].get("rowNumber"),
+                    "mediaFileName": media_file_name,
+                    "imageInfo": drive_info,
+                    "downloadUrl": download_url,
+                    "uploadRequested": bool(item.get("driveEnabled")),
+                    "uploaded": False,
+                }
+
+                if item.get("driveEnabled") and LECTURE_TOOL_DRIVE_FOLDER_ID:
+                    _lecture_raise_if_cancelled(cancel_event)
+                    _lecture_progress(progress, "drive", f"Google Driveへアップロードしています: {drive_filename}", filename=drive_filename)
+                    drive_uploads.append(
+                        {
+                            **local_drive_item,
+                            "uploaded": True,
+                            **_lecture_drive_upload_image(drive_filename, drive_bytes),
+                        }
+                    )
+                    _lecture_progress(progress, "drive", f"Google Driveアップロード完了: {drive_filename}", filename=drive_filename)
+                else:
+                    local_drive_item["uploadSkipped"] = True
+                    if item.get("driveEnabled") and not LECTURE_TOOL_DRIVE_FOLDER_ID:
+                        local_drive_item["uploadSkipReason"] = "Google Driveフォルダが未設定です。"
+                    elif not item.get("driveEnabled"):
+                        local_drive_item["uploadSkipReason"] = "Drive格納のチェックが外れています。Drive格納は未実行です。"
+                    drive_uploads.append(local_drive_item)
+                    _lecture_progress(progress, "drive", f"Drive用画像作成完了: {drive_filename}", filename=drive_filename)
+            except Exception as exc:
+                drive_errors.append(
+                    {
+                        "filename": drive_filename,
+                        "mediaFileName": media_file_name,
+                        "downloadUrl": download_url,
+                        "error": str(exc),
+                    }
+                )
+                _lecture_progress(progress, "drive", f"Drive用画像処理失敗: {drive_filename}", filename=drive_filename, error=str(exc))
+
+    if progress:
+        progress(
+            {
+                "event": "partial",
+                "result": {
+                    "ok": True,
+                    "imageWidth": LECTURE_TOOL_IMAGE_WIDTH,
+                    "imageQuality": LECTURE_TOOL_IMAGE_QUALITY,
+                    "targetImageBytes": LECTURE_TOOL_TARGET_IMAGE_BYTES,
+                    **_lecture_generation_result(
+                        session_id,
+                        packages,
+                        small_images,
+                        drive_uploads,
+                        drive_errors,
+                        vault_registrations,
+                        vault_errors,
+                    ),
+                },
+            }
+        )
+        _lecture_progress(progress, "drive", "Drive処理が全件完了しました。")
+
+    vault_packages = [package for package in packages if package["vaultEnabled"]]
+    if vault_packages:
+        _lecture_raise_if_cancelled(cancel_event, "Vault登録の開始前に中断しました。")
+        vault_slot_acquired = False
+        vault_account_lock_acquired = False
+        vault_account_lock = _lecture_get_vault_account_lock(vault_account)
+        try:
+            _lecture_progress(
+                progress,
+                "vault",
+                f"Vault登録の並列実行枠を確保しています。（最大 {LECTURE_TOOL_VAULT_MAX_PARALLEL} 件）",
+            )
+            while not vault_slot_acquired:
+                _lecture_raise_if_cancelled(cancel_event, "Vault登録の待機中に中断しました。")
+                vault_slot_acquired = LECTURE_TOOL_VAULT_SEMAPHORE.acquire(timeout=1)
+            _lecture_progress(progress, "vault", "Vault登録の並列実行枠を確保しました。")
+
+            _lecture_progress(progress, "vault", f"Vaultアカウントの利用枠を確保しています: {vault_account}")
+            while not vault_account_lock_acquired:
+                _lecture_raise_if_cancelled(cancel_event, "Vault登録の待機中に中断しました。")
+                vault_account_lock_acquired = vault_account_lock.acquire(timeout=1)
+            _lecture_progress(progress, "vault", f"Vaultアカウントの利用枠を確保しました: {vault_account}")
+
+            vault_body = _lecture_vault_register_packages(
+                vault_packages,
+                vault_account,
+                progress=progress,
+                session_id=session_id,
+                cancel_event=cancel_event,
+            )
+            vault_results = vault_body.get("results") if isinstance(vault_body, dict) else None
+            if not isinstance(vault_results, list):
+                vault_results = [vault_body]
+            for idx, vault_result in enumerate(vault_results):
+                if not isinstance(vault_result, dict):
+                    vault_result = {"output": vault_result}
+                package = vault_packages[idx] if idx < len(vault_packages) else {}
+                common = {
+                    "presentationName": package.get("presentationName", ""),
+                    "presentationId": package.get("presentationId", ""),
+                    "mediaFileName": package.get("mediaFileName", ""),
+                    "zipPath": package.get("zipPath", ""),
+                    "vaultAccount": vault_account,
+                }
+                if vault_result.get("error"):
+                    vault_errors.append({**common, "error": str(vault_result.get("error"))})
+                    _lecture_progress(progress, "vault", f"Vault登録失敗: {common['mediaFileName']}", mediaFileName=common["mediaFileName"], error=str(vault_result.get("error")))
+                else:
+                    vault_registrations.append({**common, **vault_result})
+                    _lecture_progress(progress, "vault", f"Vault登録完了: {common['mediaFileName']}", mediaFileName=common["mediaFileName"])
+        except LectureToolCancelled:
+            raise
+        except Exception as exc:
+            for package in vault_packages:
+                vault_errors.append(
+                    {
+                        "presentationName": package.get("presentationName", ""),
+                        "presentationId": package.get("presentationId", ""),
+                        "mediaFileName": package.get("mediaFileName", ""),
+                        "zipPath": package.get("zipPath", ""),
+                        "vaultAccount": vault_account,
+                        "error": str(exc),
+                    }
+                )
+            _lecture_progress(progress, "vault", "Vault登録処理が停止しました。", error=str(exc))
+        finally:
+            if vault_account_lock_acquired:
+                vault_account_lock.release()
+            if vault_slot_acquired:
+                LECTURE_TOOL_VAULT_SEMAPHORE.release()
+
+    return _lecture_generation_result(
+        session_id,
+        packages,
+        small_images,
+        drive_uploads,
+        drive_errors,
+        vault_registrations,
+        vault_errors,
+    )
+
+
+@app.get("/lecture-tool/status")
+async def lecture_tool_status():
+    try:
+        sheet = _lecture_fetch_sheet_rows()
+        return JSONResponse(
+            {
+                "ok": True,
+                "mode": "spreadsheet_upload",
+                "spreadsheetKey": LECTURE_TOOL_SPREADSHEET_KEY,
+                "spreadsheetTitle": sheet["spreadsheetTitle"],
+                "spreadsheetUrl": sheet["spreadsheetUrl"],
+                "sheetTitle": sheet["sheetTitle"],
+                "sheetGid": sheet["sheetGid"],
+                "rowCount": len(sheet["rows"]),
+                "imageWidth": LECTURE_TOOL_IMAGE_WIDTH,
+                "imageQuality": LECTURE_TOOL_IMAGE_QUALITY,
+                "driveImageQuality": LECTURE_TOOL_DRIVE_IMAGE_QUALITY,
+                "driveConfigSizes": [{"width": width, "height": height} for width, height in LECTURE_TOOL_DRIVE_CONFIG_SIZES],
+                "targetImageBytes": LECTURE_TOOL_TARGET_IMAGE_BYTES,
+                "driveFolderConfigured": bool(LECTURE_TOOL_DRIVE_FOLDER_ID),
+                "driveFolderId": LECTURE_TOOL_DRIVE_FOLDER_ID,
+                "googleServiceAccountEmail": get_gsa_client_email(),
+                "vaultConfigured": bool(LECTURE_TOOL_VAULT_COMMAND),
+                "vaultAccounts": LECTURE_TOOL_VAULT_ACCOUNTS,
+                "vaultMaxParallel": LECTURE_TOOL_VAULT_MAX_PARALLEL,
+                "checkedAt": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"sheet status failed: {exc}") from exc
+
+
+@app.get("/lecture-tool/sheet-rows")
+async def lecture_tool_sheet_rows():
+    try:
+        sheet = _lecture_fetch_sheet_rows()
+        return JSONResponse({"ok": True, "vaultAccounts": LECTURE_TOOL_VAULT_ACCOUNTS, **sheet})
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"spreadsheet fetch failed: {exc}") from exc
+
+
+async def _lecture_records_from_uploads(
+    files: List[UploadFile] = File(...),
+    rowIds: List[str] = Form(...),
+    driveEnabled: Optional[List[str]] = Form(None),
+    vaultEnabled: Optional[List[str]] = Form(None),
+) -> list[dict[str, Any]]:
+    if not files:
+        raise HTTPException(status_code=400, detail="画像をアップロードしてください。")
+    if len(files) != len(rowIds):
+        raise HTTPException(status_code=400, detail="画像数と選択行数が一致しません。")
+    sheet = _lecture_fetch_sheet_rows()
+    rows_by_id = {row["id"]: row for row in sheet["rows"]}
+
+    records: list[dict[str, Any]] = []
+    for idx, upload in enumerate(files):
+        row_id = normalize_space(rowIds[idx])
+        row = rows_by_id.get(row_id)
+        if not row:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{upload.filename}: スプレッドシート行が選択されていません。行番号を指定してください。",
+            )
+
+        data = await upload.read()
+        try:
+            resized, image_info = _lecture_resize_width_jpeg(data)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"{upload.filename}: 画像として読み込めません。") from exc
+
+        records.append(
+            {
+                "filename": upload.filename or f"image_{idx + 1}",
+                "row": row,
+                "originalBytes": data,
+                "resizedBytes": resized,
+                "imageInfo": image_info,
+                "driveEnabled": _lecture_bool(driveEnabled[idx] if driveEnabled and idx < len(driveEnabled) else None, True),
+                "vaultEnabled": _lecture_bool(vaultEnabled[idx] if vaultEnabled and idx < len(vaultEnabled) else None, True),
+            }
+        )
+    return records
+
+
+@app.post("/lecture-tool/generate")
+async def lecture_tool_generate(
+    files: List[UploadFile] = File(...),
+    rowIds: List[str] = Form(...),
+    driveEnabled: Optional[List[str]] = Form(None),
+    vaultEnabled: Optional[List[str]] = Form(None),
+    vaultAccount: str = Form(""),
+):
+    records = await _lecture_records_from_uploads(files, rowIds, driveEnabled, vaultEnabled)
+    small_images = [
+        {
+            "filename": record["filename"],
+            "width": record["imageInfo"]["originalWidth"],
+            "height": record["imageInfo"]["originalHeight"],
+            "row": record["row"],
+        }
+        for record in records
+        if record["imageInfo"]["originalWidth"] < LECTURE_TOOL_IMAGE_WIDTH
+    ]
+    vault_account = normalize_space(vaultAccount)
+    if any(record.get("vaultEnabled") for record in records) and not vault_account:
+        raise HTTPException(status_code=400, detail="Vault登録対象がある場合はVaultアカウントを選択してください。")
+    result = _lecture_generate_packages(records, vault_account)
+    return JSONResponse(
+        {
+            "ok": True,
+            "imageWidth": LECTURE_TOOL_IMAGE_WIDTH,
+            "imageQuality": LECTURE_TOOL_IMAGE_QUALITY,
+            "targetImageBytes": LECTURE_TOOL_TARGET_IMAGE_BYTES,
+            **result,
+        }
+    )
+
+
+@app.post("/lecture-tool/generate-stream")
+async def lecture_tool_generate_stream(
+    request: Request,
+    files: List[UploadFile] = File(...),
+    rowIds: List[str] = Form(...),
+    driveEnabled: Optional[List[str]] = Form(None),
+    vaultEnabled: Optional[List[str]] = Form(None),
+    vaultAccount: str = Form(""),
+):
+    records = await _lecture_records_from_uploads(files, rowIds, driveEnabled, vaultEnabled)
+    vault_account = normalize_space(vaultAccount)
+    if any(record.get("vaultEnabled") for record in records) and not vault_account:
+        raise HTTPException(status_code=400, detail="Vault登録対象がある場合はVaultアカウントを選択してください。")
+
+    session_id = new_session_id()
+    controller = _lecture_register_cancel_controller(session_id)
+
+    def worker(progress_queue: queue.Queue):
+        def progress(payload: dict[str, Any]):
+            progress_queue.put({"event": "progress", **payload})
+
+        try:
+            result = _lecture_generate_packages(
+                records,
+                vault_account,
+                progress=progress,
+                session_id=session_id,
+                cancel_event=controller["event"],
+            )
+            progress_queue.put(
+                {
+                    "event": "done",
+                    "ok": True,
+                    "imageWidth": LECTURE_TOOL_IMAGE_WIDTH,
+                    "imageQuality": LECTURE_TOOL_IMAGE_QUALITY,
+                    "targetImageBytes": LECTURE_TOOL_TARGET_IMAGE_BYTES,
+                    **result,
+                }
+            )
+        except LectureToolCancelled as exc:
+            progress_queue.put({"event": "cancelled", "sessionId": session_id, "message": str(exc)})
+        except Exception as exc:
+            progress_queue.put({"event": "error", "message": str(exc)})
+        finally:
+            _lecture_unregister_cancel_controller(session_id)
+            progress_queue.put(None)
+
+    async def event_stream():
+        progress_queue: queue.Queue = queue.Queue()
+        thread = threading.Thread(target=worker, args=(progress_queue,), daemon=True)
+        thread.start()
+        completed = False
+        try:
+            while True:
+                try:
+                    item = await asyncio.to_thread(progress_queue.get, True, 0.5)
+                except queue.Empty:
+                    if await request.is_disconnected():
+                        _lecture_cancel_session(session_id)
+                        break
+                    continue
+                if item is None:
+                    completed = True
+                    break
+                event_name = item.pop("event", "progress")
+                yield _sse(event_name, item)
+        finally:
+            if not completed:
+                _lecture_cancel_session(session_id)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.post("/lecture-tool/cancel/{session_id}")
+async def lecture_tool_cancel(session_id: str):
+    try:
+        _lecture_session_root(session_id)
+    except HTTPException:
+        raise
+    if not _lecture_cancel_session(session_id):
+        raise HTTPException(status_code=404, detail="対象の処理が見つからないか、すでに完了しています。")
+    return JSONResponse({"ok": True, "sessionId": session_id, "message": "中断リクエストを送信しました。"})
+
+
+@app.get("/lecture-tool/results/{session_id}/{rel_path:path}")
+async def lecture_tool_result_file(session_id: str, rel_path: str, request: Request):
+    result_dir = (_lecture_session_root(session_id) / "result").resolve()
+    target = (result_dir / rel_path).resolve()
+
+    try:
+        target.relative_to(result_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid result path") from exc
+
+    if target == result_dir:
+        raise HTTPException(status_code=400, detail="invalid result path")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="result file not found")
+
+    media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    force_download = str(request.query_params.get("download") or "").lower() in {"1", "true", "yes"}
+    if force_download:
+        return FileResponse(
+            target,
+            media_type=media_type,
+            filename=target.name,
+            content_disposition_type="attachment",
+        )
+    return FileResponse(target, media_type=media_type)
 
 @app.post("/upload/simple/stream")
 async def upload_simple_stream(
@@ -13184,6 +15257,7 @@ async def upload_simple_stream(
                     payload.talks = sorted(
                         payload.talks or [],
                         key=lambda x: (
+                            getattr(x, "program_index", 10**9),
                             getattr(x, "_talk_index", 10**9),
                             _time_start_minutes(getattr(x, "time", "")),
                         )
@@ -13415,6 +15489,7 @@ async def upload_batch_stream(
                     payload.talks = sorted(
                         payload.talks or [],
                         key=lambda x: (
+                            getattr(x, "program_index", 10**9),
                             getattr(x, "_talk_index", 10**9),
                             _time_start_minutes(getattr(x, "time", "")),
                         )
