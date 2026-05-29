@@ -21,7 +21,7 @@ function AppShell({ children }) {
     <div className="app-shell">
       <aside className="app-sidebar" aria-label="ツールナビゲーション">
         <div className="app-sidebar__brand">
-          <div className="app-sidebar__eyebrow">MSD tools</div>
+          <div className="app-sidebar__eyebrow">M社用 tools</div>
           <div className="app-sidebar__title">制作支援ツール</div>
         </div>
 
