@@ -14041,6 +14041,10 @@ def _lecture_header_key(value: str) -> str:
     return re.sub(r"[\s\u3000]+", "", normalize_space(value or "")).lower()
 
 
+def _lecture_sheet_text(value: Any) -> str:
+    return str(value or "").strip(" \t\r\n\f\v\u3000")
+
+
 def _lecture_pick_column(headers: list[str], field: str) -> str:
     normalized = {_lecture_header_key(h): h for h in headers}
     for alias in LECTURE_TOOL_COLUMN_ALIASES[field]:
@@ -14077,7 +14081,7 @@ def _lecture_normalize_filename(value: str) -> str:
 
 
 def _lecture_sheet_image_filename(row: dict[str, Any], fallback: str) -> str:
-    raw = normalize_space(row.get("imageName") or fallback or "image.jpg")
+    raw = _lecture_sheet_text(row.get("imageName") or fallback or "image.jpg")
     name = Path(raw).name
     stem = _lecture_safe_name(Path(name).stem if Path(name).suffix else name, "image")
     return f"{stem}.jpg"
@@ -14336,12 +14340,12 @@ def _lecture_fetch_sheet_rows() -> dict[str, Any]:
         product = normalize_space(data.get(columns.get("product", ""), ""))
         reception_date = normalize_space(data.get(columns.get("reception_date", ""), ""))
         category = normalize_space(data.get(columns.get("category", ""), ""))
-        event_name = normalize_space(data.get(columns.get("event_name", ""), ""))
+        event_name = _lecture_sheet_text(data.get(columns.get("event_name", ""), ""))
         event_date = normalize_space(data.get(columns.get("event_date", ""), ""))
         event_time = normalize_space(data.get(columns.get("event_time", ""), ""))
-        image_name = normalize_space(data.get(columns["image_name"], ""))
-        media_file_name = normalize_space(data.get(columns["media_file_name"], ""))
-        presentation_name = normalize_space(data.get(columns["presentation_name"], ""))
+        image_name = _lecture_sheet_text(data.get(columns["image_name"], ""))
+        media_file_name = _lecture_sheet_text(data.get(columns["media_file_name"], ""))
+        presentation_name = _lecture_sheet_text(data.get(columns["presentation_name"], ""))
 
         if not (image_name or media_file_name or presentation_name):
             continue
@@ -14706,10 +14710,13 @@ def _lecture_generate_packages(
         _lecture_progress(progress, "zip", f"ZIP作成完了: {zip_path.name}", mediaFileName=media_file_name)
 
         row_payloads = [item["row"] for item in items]
+        categories = [item["row"].get("category") for item in items if item["row"].get("category")]
+        category = next((value for value in categories if "修正" in value), categories[0] if categories else "")
         package = {
             "presentationName": presentation_name,
             "presentationId": next((item["row"].get("presentationId") for item in items if item["row"].get("presentationId")), ""),
             "product": next((item["row"].get("product") for item in items if item["row"].get("product")), ""),
+            "category": category,
             "mediaFileName": media_file_name,
             "path": str(result_dir.relative_to(result_root)),
             "absolutePath": str(result_dir),
@@ -14861,6 +14868,7 @@ def _lecture_generate_packages(
                 common = {
                     "presentationName": package.get("presentationName", ""),
                     "presentationId": package.get("presentationId", ""),
+                    "category": package.get("category", ""),
                     "mediaFileName": package.get("mediaFileName", ""),
                     "zipPath": package.get("zipPath", ""),
                     "vaultAccount": vault_account,
@@ -14879,6 +14887,7 @@ def _lecture_generate_packages(
                     {
                         "presentationName": package.get("presentationName", ""),
                         "presentationId": package.get("presentationId", ""),
+                        "category": package.get("category", ""),
                         "mediaFileName": package.get("mediaFileName", ""),
                         "zipPath": package.get("zipPath", ""),
                         "vaultAccount": vault_account,
