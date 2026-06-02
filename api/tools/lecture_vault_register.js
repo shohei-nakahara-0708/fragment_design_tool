@@ -59,10 +59,15 @@ async function withTimeout(promise, timeoutMs, label) {
   const rawPackages = Array.isArray(input.packages) ? input.packages : [input];
   const LOGIN_USER = String(input.vaultAccount || rawPackages[0]?.vaultAccount || '').trim();
   const packages = rawPackages.map((item, index) => {
+    const rowCategory = Array.isArray(item.rows)
+      ? item.rows.map(row => String(row?.category || '').trim()).find(value => value.includes('修正')) ||
+      item.rows.map(row => String(row?.category || '').trim()).find(Boolean)
+      : '';
     const packageInput = {
       presentationName: String(item.presentationName || '').trim(),
       presentationId: String(item.presentationId || '').trim(),
       product: String(item.product || '').trim(),
+      category: String(item.category || rowCategory || '').trim(),
       absoluteZipPath: String(item.absoluteZipPath || '').trim(),
       mediaFileName: String(item.mediaFileName || item.presentationName || `package_${index + 1}`).trim(),
     };
@@ -169,6 +174,7 @@ async function withTimeout(promise, timeoutMs, label) {
         mediaFileName: packageInput.mediaFileName,
         presentationName: packageInput.presentationName,
         presentationId: packageInput.presentationId,
+        category: packageInput.category,
         vaultAccount: LOGIN_USER,
       };
       let vaultResult;
@@ -177,7 +183,8 @@ async function withTimeout(promise, timeoutMs, label) {
           packageInput.presentationName,
           packageInput.presentationId,
           packageInput.product,
-          packageInput.absoluteZipPath
+          packageInput.absoluteZipPath,
+          packageInput.category
         )
       } catch (err) {
         vaultResult = ['作成失敗', '', '', err?.stack || err?.toString?.() || String(err)];
@@ -224,7 +231,7 @@ async function withTimeout(promise, timeoutMs, label) {
   return;
 
 
-  async function createVAULT(presentationName, presentationId, product, zIPfolder) {
+  async function createVAULT(presentationName, presentationId, product, zIPfolder, category = '') {
 
     let status = "作成失敗";
     let slideURL = "";
@@ -251,6 +258,8 @@ async function withTimeout(promise, timeoutMs, label) {
 
     const NAME_SELECTOR = 'textarea[name=name]';
     const NAME = presentationName;
+    const CATEGORY = String(category || '').trim();
+    const IS_REVISION = CATEGORY.replace(/\s+/g, '').includes('修正');
 
     const PRODUCT_SELECTOR = 'div[name=crmProduct_b] > .vv_pill_container > input';
     const PRODUCT = product;
@@ -1370,25 +1379,25 @@ async function withTimeout(promise, timeoutMs, label) {
       } else if (selection.method === 'mouse') {
         console.log(`${label} 候補「${selection.text}」をマウスイベントで選択します。`);
         const focusState = await page.evaluate(selector => {
-            const marker = document.querySelector('[data-lecture-active-lookup="true"]');
-            const active = document.activeElement;
-            const input = marker?.matches?.(selector) ? marker : active?.matches?.(selector) ? active : null;
-            if (!input) {
-              return {
-                ok: false,
-                activeTag: document.activeElement?.tagName || '',
-                activeText: (document.activeElement?.textContent || '').trim().slice(0, 80),
-              };
-            }
-            input.focus();
-            const root = input.closest('div[name]') || input.closest('.vv_pill_container') || input.parentElement;
+          const marker = document.querySelector('[data-lecture-active-lookup="true"]');
+          const active = document.activeElement;
+          const input = marker?.matches?.(selector) ? marker : active?.matches?.(selector) ? active : null;
+          if (!input) {
             return {
-              ok: document.activeElement === input,
-              fieldName: root?.getAttribute('name') || '',
-              rootTitle: root?.getAttribute('title') || '',
+              ok: false,
               activeTag: document.activeElement?.tagName || '',
-              inputValue: input.value || '',
+              activeText: (document.activeElement?.textContent || '').trim().slice(0, 80),
             };
+          }
+          input.focus();
+          const root = input.closest('div[name]') || input.closest('.vv_pill_container') || input.parentElement;
+          return {
+            ok: document.activeElement === input,
+            fieldName: root?.getAttribute('name') || '',
+            rootTitle: root?.getAttribute('title') || '',
+            activeTag: document.activeElement?.tagName || '',
+            inputValue: input.value || '',
+          };
         }, inputSelector);
         console.log(`${label} 候補クリック前フォーカス: ${JSON.stringify(focusState)}`);
 
@@ -2019,14 +2028,26 @@ async function withTimeout(promise, timeoutMs, label) {
         const paginatorText = document.querySelector(".vv-expanded-search-paginator")?.textContent?.trim() || '';
         const gridText = document.querySelector(".vv-document-search-vcl-data-grid")?.textContent?.trim() || '';
         const normalizedGridText = gridText.toLowerCase();
-        const noItems = /no items found|no results found|no documents found/.test(normalizedGridText);
-        const linkIds = Array.from(document.querySelectorAll(".vv-document-search-vcl-data-grid a[data-linkid]"))
-          .map(link => link.getAttribute("data-linkid"))
+        const noItems = /no items found|no results found|no documents found|項目はありません|該当する項目はありません|検索結果はありません/.test(normalizedGridText);
+        const linkIds = Array.from(document.querySelectorAll(".vv-document-search-vcl-data-grid a"))
+          .map(link => {
+            const dataLinkId = link.getAttribute("data-linkid") || '';
+            if (dataLinkId) return dataLinkId;
+            const href = link.getAttribute("href") || '';
+            return href.match(/#doc_info\/(\d+)/)?.[1] || '';
+          })
           .filter(Boolean);
         const uniqueLinkIds = Array.from(new Set(linkIds));
-        const countMatch = paginatorText.match(/of\s+(?:about\s+)?([\d,]+)/i);
+        const normalizeNumber = value => String(value || '')
+          .replace(/[０-９]/g, char => String.fromCharCode(char.charCodeAt(0) - 0xFEE0))
+          .replace(/,/g, '');
+        const ofCountMatch = paginatorText.match(/of\s+(?:about\s+)?([\d,]+)/i);
+        const slashCountMatch = !ofCountMatch
+          ? paginatorText.match(/[\/／]\s*(?:約\s*)?([０-９\d,]+)\+?\s*$/)
+          : null;
+        const countMatch = ofCountMatch || slashCountMatch;
         const count = countMatch
-          ? Number(countMatch[1].replace(/,/g, ''))
+          ? Number(normalizeNumber(countMatch[1]))
           : noItems
             ? 0
             : uniqueLinkIds.length > 0
@@ -2035,7 +2056,7 @@ async function withTimeout(promise, timeoutMs, label) {
 
         return {
           count,
-          countSource: countMatch ? 'paginator' : noItems ? 'no-items' : uniqueLinkIds.length > 0 ? 'grid-links' : 'unknown',
+          countSource: ofCountMatch ? 'paginator-of' : slashCountMatch ? 'paginator-slash' : noItems ? 'no-items' : uniqueLinkIds.length > 0 ? 'grid-links' : 'unknown',
           paginatorText,
           gridText,
           resultRows: Array.from(document.querySelectorAll(".vv-document-search-vcl-data-grid tr, .vv-document-search-vcl-data-grid .vv_grid_row, .vv-document-search-vcl-data-grid [role=row]"))
@@ -2092,11 +2113,12 @@ async function withTimeout(promise, timeoutMs, label) {
             if (inputValue !== expected) return false;
             const paginatorText = document.querySelector(".vv-expanded-search-paginator")?.textContent || '';
             const gridText = document.querySelector(".vv-document-search-vcl-data-grid")?.textContent || '';
-            const resultReady = /of\s+[\d,]+/i.test(paginatorText) ||
-              /no items found|no results found|no documents found/i.test(gridText) ||
+            const resultReady = /of\s+(?:about\s+)?[\d,]+/i.test(paginatorText) ||
+              /[\/／]\s*(?:約\s*)?[０-９\d,]+\+?\s*$/.test(paginatorText) ||
+              /no items found|no results found|no documents found|項目はありません|該当する項目はありません|検索結果はありません/i.test(gridText) ||
               !!document.querySelector(".vv-document-search-vcl-data-grid a[data-linkid]");
             if (!resultReady) return false;
-            return gridText !== previousGridText || paginatorText !== previousPaginatorText || /no items found|no results found|no documents found/i.test(gridText);
+            return gridText !== previousGridText || paginatorText !== previousPaginatorText || /no items found|no results found|no documents found|項目はありません|該当する項目はありません|検索結果はありません/i.test(gridText);
           }, { timeout: 45000 }, expectedSearchName, beforeSummary?.gridText || '', beforeSummary?.paginatorText || '');
         } catch (e) {
           // ヘッダーだけ表示される中途半端な状態なら下のsummary判定でリトライする
@@ -2692,7 +2714,6 @@ async function withTimeout(promise, timeoutMs, label) {
       const statusButtonSelector = '.vv_docstatus_wrapper .documentLifecycleStateBadgeContainer button[data-corgix-internal="BUTTON"], .vv_docstatus_wrapper .vv-picker-badge button';
       const stagedMenuItemSelector = '.vv-picker-badge-menu li[data-value="dynamicAction:LifecycleUserAction3"], .vv-picker-badge-menu [role="option"], [data-corgix-internal="MENU-ITEM"]';
       const dialogSelector = '.ui-dialog, [role="dialog"], [data-corgix-internal="DIALOG"], .vv-dialog, .vv_modal, .modal';
-
       const visibleTextState = async () => page.evaluate((buttonSelector, menuSelector, modalSelector) => ({
         statusButtons: Array.from(document.querySelectorAll(buttonSelector)).map(button => ({
           text: (button.textContent || '').trim(),
@@ -2715,7 +2736,7 @@ async function withTimeout(promise, timeoutMs, label) {
             button.textContent || '',
             button.getAttribute('aria-label') || '',
           ].join(' ');
-          return /staged/i.test(label);
+          return /staged|ステージング|ステージ済|ステージ|アップロード済/i.test(label);
         });
       }, statusButtonSelector).catch(() => false);
 
@@ -2737,7 +2758,7 @@ async function withTimeout(promise, timeoutMs, label) {
               button.getAttribute('title') || '',
               button.textContent || '',
             ].join(' ');
-            return visible(button) && /draft/i.test(label);
+            return visible(button) && /draft|ドラフト|下書き/i.test(label);
           }) || buttons.find(visible);
           if (!target) return { ok: false, reason: 'status button not found' };
           target.scrollIntoView({ block: 'center', inline: 'center' });
@@ -2767,7 +2788,7 @@ async function withTimeout(promise, timeoutMs, label) {
               style.visibility !== 'hidden' &&
               style.display !== 'none' &&
               (element.getAttribute('data-value') === 'dynamicAction:LifecycleUserAction3' ||
-                (element.textContent || '').trim().toUpperCase() === 'STAGED');
+                /staged|ステージング|ステージ済|ステージ|アップロード済/i.test((element.textContent || '').trim()));
           });
         }, { timeout: NORMAL_WAIT }, stagedMenuItemSelector);
 
@@ -2784,7 +2805,7 @@ async function withTimeout(promise, timeoutMs, label) {
           const items = Array.from(document.querySelectorAll(selector));
           const target = items.find(element => visible(element) &&
             (element.getAttribute('data-value') === 'dynamicAction:LifecycleUserAction3' ||
-              (element.textContent || '').trim().toUpperCase() === 'STAGED'));
+              /staged|ステージング|ステージ済|ステージ|アップロード済/i.test((element.textContent || '').trim())));
           if (!target) return { ok: false, reason: 'staged menu item not found' };
           target.scrollIntoView({ block: 'center', inline: 'center' });
           const rect = target.getBoundingClientRect();
@@ -2831,9 +2852,9 @@ async function withTimeout(promise, timeoutMs, label) {
           ].join(' ');
           const hasYes = Array.from(dialog.querySelectorAll('button, a, .save, [role="button"]')).some(button => {
             const label = button.textContent || button.getAttribute('title') || button.getAttribute('aria-label') || '';
-            return visible(button) && /yes|はい|ok/i.test(label);
+            return visible(button) && /yes|はい|ok|続行|確認/i.test(label);
           });
-          return /Change Document Status|Change State to Staged|Staged/i.test(text) && hasYes;
+          return /Change Document Status|Change State to Staged|Staged|ドキュメントステータス|ステータス.*変更|状態.*変更|ステージング|ステージ/i.test(text) && hasYes;
         });
       }, dialogSelector).catch(() => false);
 
@@ -2876,11 +2897,11 @@ async function withTimeout(promise, timeoutMs, label) {
             candidate.querySelector('.ui-dialog-title')?.textContent || '',
             candidate.textContent || '',
           ].join(' ');
-          return /Change Document Status|Change State to Staged|Staged/i.test(text);
+          return /Change Document Status|Change State to Staged|Staged|ドキュメントステータス|ステータス.*変更|状態.*変更|ステージング|ステージ/i.test(text);
         });
         const yesButton = Array.from(dialog?.querySelectorAll('button, a, .save, [role="button"]') || []).find(button => {
           const label = button.textContent || button.getAttribute('title') || button.getAttribute('aria-label') || '';
-          return visible(button) && /yes|はい|ok/i.test(label);
+          return visible(button) && /yes|はい|ok|続行|確認/i.test(label);
         });
         if (!yesButton) return { ok: false, reason: 'yes button not found', dialogText: (dialog?.textContent || '').trim().slice(0, 500) };
         yesButton.scrollIntoView({ block: 'center', inline: 'center' });
@@ -2912,7 +2933,7 @@ async function withTimeout(promise, timeoutMs, label) {
               rect.height > 0 &&
               style.visibility !== 'hidden' &&
               style.display !== 'none' &&
-              /Change Document Status|Change State to Staged|Staged/i.test(text);
+              /Change Document Status|Change State to Staged|Staged|ドキュメントステータス|ステータス.*変更|状態.*変更|ステージング|ステージ/i.test(text);
           });
         }, { timeout: NORMAL_WAIT }, dialogSelector),
         page.waitForFunction(selector => {
@@ -2921,7 +2942,7 @@ async function withTimeout(promise, timeoutMs, label) {
               button.getAttribute('title') || '',
               button.textContent || '',
             ].join(' ');
-            return /staged/i.test(label);
+            return /staged|ステージング|ステージ済|ステージ/i.test(label);
           });
         }, { timeout: NORMAL_WAIT }, statusButtonSelector),
       ]).catch(() => null);
@@ -2933,7 +2954,7 @@ async function withTimeout(promise, timeoutMs, label) {
             button.textContent || '',
             button.getAttribute('aria-label') || '',
           ].join(' ');
-          return /staged/i.test(label);
+          return /staged|ステージング|ステージ済|ステージ|アップロード済/i.test(label);
         });
       }, { timeout: LONG_WAIT }, statusButtonSelector).catch(() => null);
 
@@ -2951,7 +2972,7 @@ async function withTimeout(promise, timeoutMs, label) {
               button.textContent || '',
               button.getAttribute('aria-label') || '',
             ].join(' ');
-            return /staged/i.test(label);
+            return /staged|ステージング|ステージ済|ステージ|アップロード済/i.test(label);
           });
         }, { timeout: NORMAL_WAIT }, statusButtonSelector).catch(() => null);
       }
@@ -3206,8 +3227,792 @@ async function withTimeout(promise, timeoutMs, label) {
       return url.toString();
     }
 
+    async function createDraftFromExistingPresentation(zipPath, baseUrl) {
+      const directCreateDraftButtonSelector = [
+        '.vv-action-bar-frequent-actions button[aria-label="下書きの作成"]',
+        '.vv-action-bar-frequent-actions button[aria-label="Create Draft"]',
+        '.vv-action-bar-frequent-actions button[aria-label="CreateDraft"]',
+        'button[aria-label="下書きの作成"]',
+        'button[aria-label="Create Draft"]',
+        'button[aria-label="CreateDraft"]',
+      ].join(', ');
+      const moreActionsButtonSelector = [
+        '.vv-more-actions-button button[data-corgix-internal="BUTTON"]',
+        '.vv-more-actions-button button',
+        'button[aria-label="すべてのアクション"]',
+        'button[aria-label="All Actions"]',
+        'button[aria-label="More Actions"]',
+      ].join(', ');
+      const createDraftMenuItemSelector = [
+        '[data-corgix-internal="MENU-ITEM"][data-value="CreateDraft"]',
+        '[role="option"][data-value="CreateDraft"]',
+        '.vv-action-bar-menu-item[data-value="CreateDraft"]',
+        '[data-corgix-internal="MENU-ITEM"]',
+        '[role="option"]',
+      ].join(', ');
+      const createDraftDialogSelector = '[data-corgix-internal="DIALOG"], [role="dialog"]';
+      const markedDraftUploadSelector = 'input[data-lecture-create-draft-upload="true"]';
+      const sourceDocId = page.url().match(/#doc_info\/(\d+)/)?.[1] || '';
+
+      const visibleState = async () => page.evaluate((directButtonSelector, buttonSelector, itemSelector, dialogSelector) => ({
+        directButtons: Array.from(document.querySelectorAll(directButtonSelector)).map(button => ({
+          text: (button.textContent || '').replace(/\s+/g, ' ').trim(),
+          ariaLabel: button.getAttribute('aria-label') || '',
+          visible: (() => {
+            const style = window.getComputedStyle(button);
+            const rect = button.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+          })(),
+        })),
+        buttons: Array.from(document.querySelectorAll(buttonSelector)).map(button => ({
+          text: (button.textContent || '').replace(/\s+/g, ' ').trim(),
+          ariaLabel: button.getAttribute('aria-label') || '',
+          expanded: button.getAttribute('aria-expanded') || '',
+          visible: (() => {
+            const style = window.getComputedStyle(button);
+            const rect = button.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+          })(),
+        })),
+        menuItems: Array.from(document.querySelectorAll(itemSelector)).map(item => ({
+          text: (item.textContent || '').replace(/\s+/g, ' ').trim(),
+          ariaLabel: item.getAttribute('aria-label') || '',
+          value: item.getAttribute('data-value') || '',
+        })),
+        dialogs: Array.from(document.querySelectorAll(dialogSelector)).map(dialog => ({
+          title: (dialog.querySelector('[data-corgix-internal="DIALOG-TITLE-CONTENT"]')?.textContent || '').replace(/\s+/g, ' ').trim(),
+          text: (dialog.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 500),
+          fileInputs: dialog.querySelectorAll('input[type="file"]').length,
+        })),
+      }), directCreateDraftButtonSelector, moreActionsButtonSelector, createDraftMenuItemSelector, createDraftDialogSelector).catch(err => ({ error: String(err) }));
+
+      const waitForCreateDraftDialog = async (timeout = 15000) => {
+        try {
+          await page.waitForFunction(dialogSelector => {
+            const visible = element => {
+              const style = window.getComputedStyle(element);
+              const rect = element.getBoundingClientRect();
+              return rect.width > 0 &&
+                rect.height > 0 &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none';
+            };
+            return Array.from(document.querySelectorAll(dialogSelector)).some(dialog => {
+              const text = [
+                dialog.querySelector('[data-corgix-internal="DIALOG-TITLE-CONTENT"]')?.textContent || '',
+                dialog.textContent || '',
+              ].join(' ');
+              return visible(dialog) &&
+                /Create\s*Draft|CreateDraft|下書きの作成/i.test(text) &&
+                dialog.querySelector('input[type="file"]');
+            });
+          }, { timeout }, createDraftDialogSelector);
+          return true;
+        } catch (e) {
+          return false;
+        }
+      };
+
+      const waitForDraftActionStarted = async (beforeUrl, beforeDocId, timeout = 12000) => {
+        try {
+          await page.waitForFunction((dialogSelector, previousUrl, previousDocId) => {
+            const visible = element => {
+              const style = window.getComputedStyle(element);
+              const rect = element.getBoundingClientRect();
+              return rect.width > 0 &&
+                rect.height > 0 &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none';
+            };
+            const dialogVisible = Array.from(document.querySelectorAll(dialogSelector)).some(dialog => {
+              const text = [
+                dialog.querySelector('[data-corgix-internal="DIALOG-TITLE-CONTENT"]')?.textContent || '',
+                dialog.textContent || '',
+              ].join(' ');
+              return visible(dialog) &&
+                /Create\s*Draft|CreateDraft|下書きの作成/i.test(text) &&
+                dialog.querySelector('input[type="file"]');
+            });
+            const statusText = Array.from(document.querySelectorAll('.vv_docstatus_wrapper, .vv-doc-state-badge'))
+              .filter(visible)
+              .map(element => [
+                element.textContent || '',
+                ...Array.from(element.querySelectorAll('button, [title], [aria-activedescendant]')).map(child => [
+                  child.getAttribute('title') || '',
+                  child.getAttribute('aria-label') || '',
+                  child.getAttribute('aria-activedescendant') || '',
+                  child.textContent || '',
+                ].join(' ')),
+              ].join(' '))
+              .join(' ');
+            const draftStatusVisible = /(^|[\s_-])(Draft|ドラフト)($|[\s_-])/i.test(statusText);
+            const currentDocId = location.hash.match(/#?doc_info\/(\d+)/)?.[1] || '';
+            return dialogVisible ||
+              draftStatusVisible ||
+              (!!previousUrl && location.href !== previousUrl) ||
+              (!!currentDocId && !!previousDocId && currentDocId !== previousDocId);
+          }, { timeout }, createDraftDialogSelector, beforeUrl, beforeDocId);
+          return true;
+        } catch (e) {
+          return false;
+        }
+      };
+
+      const waitForCreateDraftMenuItem = async (timeout = 5000) => {
+        try {
+          await page.waitForFunction(selector => {
+            const visible = element => {
+              const style = window.getComputedStyle(element);
+              const rect = element.getBoundingClientRect();
+              return rect.width > 0 &&
+                rect.height > 0 &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none';
+            };
+            return Array.from(document.querySelectorAll(selector)).some(item => {
+              const label = [
+                item.getAttribute('data-value') || '',
+                item.getAttribute('aria-label') || '',
+                item.textContent || '',
+              ].join(' ');
+              return visible(item) && /CreateDraft|Create Draft|下書きの作成/i.test(label);
+            });
+          }, { timeout }, createDraftMenuItemSelector);
+          return true;
+        } catch (e) {
+          return false;
+        }
+      };
+
+      const clickDirectCreateDraft = async (timeout = 8000) => {
+        try {
+          await page.waitForFunction(selector => {
+            const visible = element => {
+              const style = window.getComputedStyle(element);
+              const rect = element.getBoundingClientRect();
+              return rect.width > 0 &&
+                rect.height > 0 &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none' &&
+                !element.disabled;
+            };
+            return Array.from(document.querySelectorAll(selector)).some(button => {
+              const label = [
+                button.getAttribute('aria-label') || '',
+                button.getAttribute('title') || '',
+                button.textContent || '',
+              ].join(' ');
+              return visible(button) && /Create\s*Draft|CreateDraft|下書きの作成/i.test(label);
+            });
+          }, { timeout }, directCreateDraftButtonSelector);
+        } catch (e) {
+          return false;
+        }
+
+        const beforeUrl = page.url();
+        const beforeDocId = beforeUrl.match(/#doc_info\/(\d+)/)?.[1] || '';
+        await page.evaluate(selector => {
+          document.querySelectorAll(selector).forEach(button => {
+            button.removeAttribute('data-lecture-direct-create-draft');
+          });
+        }, directCreateDraftButtonSelector).catch(() => {});
+        const point = await page.evaluate(selector => {
+          const visible = element => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.visibility !== 'hidden' &&
+              style.display !== 'none' &&
+              !element.disabled;
+          };
+          const buttons = Array.from(document.querySelectorAll(selector));
+          const target = buttons.find(button => {
+            const label = [
+              button.getAttribute('aria-label') || '',
+              button.getAttribute('title') || '',
+              button.textContent || '',
+            ].join(' ');
+            return visible(button) && /Create\s*Draft|CreateDraft|下書きの作成/i.test(label);
+          });
+          if (!target) return { ok: false, reason: 'direct create draft button not found' };
+          target.setAttribute('data-lecture-direct-create-draft', 'true');
+          target.scrollIntoView({ block: 'center', inline: 'center' });
+          const rect = target.getBoundingClientRect();
+          const centerX = rect.left + rect.width / 2;
+          const centerY = rect.top + rect.height / 2;
+          const atPoint = document.elementFromPoint(centerX, centerY);
+          return {
+            ok: true,
+            x: centerX,
+            y: centerY,
+            text: (target.textContent || '').replace(/\s+/g, ' ').trim(),
+            ariaLabel: target.getAttribute('aria-label') || '',
+            elementAtPointTag: atPoint?.tagName || '',
+            elementAtPointText: (atPoint?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+            elementAtPointAriaLabel: atPoint?.getAttribute?.('aria-label') || '',
+          };
+        }, directCreateDraftButtonSelector);
+        if (!point.ok) return false;
+        console.log(`下書きの作成ボタンを押します: ${JSON.stringify(point)}`);
+        const handle = await page.$('[data-lecture-direct-create-draft="true"]');
+        if (handle) {
+          try {
+            await handle.click({ delay: 80 });
+            if (await waitForDraftActionStarted(beforeUrl, beforeDocId)) return true;
+            console.log(red + "直接ボタンのElementHandleクリックで画面変化がないため再試行します。" + reset);
+          } catch (e) {
+            console.log(red + `直接ボタンのElementHandleクリックに失敗しました: ${e.message}` + reset);
+          }
+        }
+
+        const jsClickResult = await page.evaluate(() => {
+          const target = document.querySelector('[data-lecture-direct-create-draft="true"]');
+          if (!target) return { ok: false, reason: 'marked direct button not found' };
+          target.focus();
+          ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(type => {
+            target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+          });
+          if (typeof target.click === 'function') target.click();
+          return {
+            ok: true,
+            text: (target.textContent || '').replace(/\s+/g, ' ').trim(),
+            ariaLabel: target.getAttribute('aria-label') || '',
+          };
+        }).catch(e => ({ ok: false, reason: String(e) }));
+        console.log(`下書きの作成ボタンをDOMイベントで押します: ${JSON.stringify(jsClickResult)}`);
+        if (jsClickResult.ok && await waitForDraftActionStarted(beforeUrl, beforeDocId)) return true;
+
+        console.log(red + "直接ボタンのDOMイベントでも画面変化がないためマウス座標で再試行します。" + reset);
+        await page.mouse.move(point.x, point.y);
+        await page.mouse.down();
+        await sleep(80);
+        await page.mouse.up();
+        if (await waitForDraftActionStarted(beforeUrl, beforeDocId)) return true;
+        console.log(red + "直接ボタン押下後に画面変化を確認できなかったため、メニューからの実行に切り替えます。" + reset);
+        return false;
+      };
+
+      const clickMoreActions = async () => {
+        await page.waitForFunction(selector => {
+          return Array.from(document.querySelectorAll(selector)).some(button => {
+            const style = window.getComputedStyle(button);
+            const rect = button.getBoundingClientRect();
+            const label = [
+              button.getAttribute('aria-label') || '',
+              button.getAttribute('title') || '',
+              button.textContent || '',
+              button.closest('.vv-more-actions-button') ? 'more-actions' : '',
+            ].join(' ');
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.visibility !== 'hidden' &&
+              style.display !== 'none' &&
+              !button.disabled &&
+              /すべてのアクション|all actions|more actions|more-actions/i.test(label);
+          });
+        }, { timeout: LONG_WAIT }, moreActionsButtonSelector);
+
+        await page.evaluate(selector => {
+          document.querySelectorAll(selector).forEach(button => {
+            button.removeAttribute('data-lecture-more-actions');
+          });
+        }, moreActionsButtonSelector).catch(() => {});
+        const point = await page.evaluate(selector => {
+          const visible = element => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.visibility !== 'hidden' &&
+              style.display !== 'none' &&
+              !element.disabled;
+          };
+          const buttons = Array.from(document.querySelectorAll(selector));
+          const target = buttons.find(button => {
+            const label = [
+              button.getAttribute('aria-label') || '',
+              button.getAttribute('title') || '',
+              button.textContent || '',
+              button.closest('.vv-more-actions-button') ? 'more-actions' : '',
+            ].join(' ');
+            return visible(button) && /すべてのアクション|all actions|more actions|more-actions/i.test(label);
+          });
+          if (!target) return { ok: false, reason: 'more actions button not found' };
+          target.setAttribute('data-lecture-more-actions', 'true');
+          target.scrollIntoView({ block: 'center', inline: 'center' });
+          const rect = target.getBoundingClientRect();
+          const centerX = rect.left + rect.width / 2;
+          const centerY = rect.top + rect.height / 2;
+          const atPoint = document.elementFromPoint(centerX, centerY);
+          return {
+            ok: true,
+            x: centerX,
+            y: centerY,
+            text: (target.textContent || '').replace(/\s+/g, ' ').trim(),
+            ariaLabel: target.getAttribute('aria-label') || '',
+            elementAtPointTag: atPoint?.tagName || '',
+            elementAtPointText: (atPoint?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+            elementAtPointAriaLabel: atPoint?.getAttribute?.('aria-label') || '',
+          };
+        }, moreActionsButtonSelector);
+        if (!point.ok) throw new Error(`すべてのアクションボタンが見つかりません: ${JSON.stringify(point)}`);
+        console.log(`すべてのアクションを開きます: ${JSON.stringify(point)}`);
+        const handle = await page.$('[data-lecture-more-actions="true"]');
+        if (handle) {
+          try {
+            await handle.click({ delay: 80 });
+            if (await waitForCreateDraftMenuItem()) return;
+            console.log(red + "すべてのアクションのElementHandleクリックでメニューが出ないため再試行します。" + reset);
+          } catch (e) {
+            console.log(red + `すべてのアクションのElementHandleクリックに失敗しました: ${e.message}` + reset);
+          }
+        }
+
+        const jsClickResult = await page.evaluate(() => {
+          const target = document.querySelector('[data-lecture-more-actions="true"]');
+          if (!target) return { ok: false, reason: 'marked more actions button not found' };
+          target.focus();
+          ['pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach(type => {
+            target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+          });
+          if (typeof target.click === 'function') target.click();
+          return {
+            ok: true,
+            text: (target.textContent || '').replace(/\s+/g, ' ').trim(),
+            ariaLabel: target.getAttribute('aria-label') || '',
+          };
+        }).catch(e => ({ ok: false, reason: String(e) }));
+        console.log(`すべてのアクションをDOMイベントで開きます: ${JSON.stringify(jsClickResult)}`);
+        if (jsClickResult.ok && await waitForCreateDraftMenuItem()) return;
+
+        await page.mouse.move(point.x, point.y);
+        await page.mouse.down();
+        await sleep(80);
+        await page.mouse.up();
+        if (await waitForCreateDraftMenuItem()) return;
+        throw new Error(`すべてのアクションを開けませんでした。状態: ${JSON.stringify(await visibleState())}`);
+      };
+
+      const clickCreateDraft = async () => {
+        await page.waitForFunction(selector => {
+          return Array.from(document.querySelectorAll(selector)).some(item => {
+            const style = window.getComputedStyle(item);
+            const rect = item.getBoundingClientRect();
+            const label = [
+              item.getAttribute('data-value') || '',
+              item.getAttribute('aria-label') || '',
+              item.textContent || '',
+            ].join(' ');
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.visibility !== 'hidden' &&
+              style.display !== 'none' &&
+              /CreateDraft|Create Draft|下書きの作成/i.test(label);
+          });
+        }, { timeout: NORMAL_WAIT }, createDraftMenuItemSelector);
+
+        const point = await page.evaluate(selector => {
+          const visible = element => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+          };
+          const target = Array.from(document.querySelectorAll(selector)).find(item => {
+            const label = [
+              item.getAttribute('data-value') || '',
+              item.getAttribute('aria-label') || '',
+              item.textContent || '',
+            ].join(' ');
+            return visible(item) && /CreateDraft|Create Draft|下書きの作成/i.test(label);
+          });
+          if (!target) return { ok: false, reason: 'CreateDraft menu item not found' };
+          target.scrollIntoView({ block: 'center', inline: 'center' });
+          const rect = target.getBoundingClientRect();
+          return {
+            ok: true,
+            x: rect.left + rect.width / 2,
+            y: rect.top + rect.height / 2,
+            text: (target.textContent || '').replace(/\s+/g, ' ').trim(),
+            ariaLabel: target.getAttribute('aria-label') || '',
+            value: target.getAttribute('data-value') || '',
+          };
+        }, createDraftMenuItemSelector);
+        if (!point.ok) throw new Error(`下書きの作成メニューが見つかりません: ${JSON.stringify(point)}`);
+        console.log(`下書きの作成を押します: ${JSON.stringify(point)}`);
+        await page.mouse.move(point.x, point.y);
+        await page.mouse.down();
+        await sleep(80);
+        await page.mouse.up();
+      };
+
+      const clickCreateDraftAction = async () => {
+        if (await clickDirectCreateDraft()) return 'direct';
+        await clickMoreActions();
+        await clickCreateDraft();
+        return 'menu';
+      };
+
+      const openCreateDraftDialog = async () => {
+        if (await waitForCreateDraftDialog(1000)) return;
+        await clickCreateDraftAction();
+        if (await waitForCreateDraftDialog(30000)) return;
+        throw new Error(`スライドの下書き作成ダイアログが表示されませんでした。状態: ${JSON.stringify(await visibleState())}`);
+      };
+
+      const uploadZipAndCreateDraft = async () => {
+        if (!await waitForCreateDraftDialog(10000)) {
+          throw new Error(`下書き作成ダイアログを確認できませんでした。状態: ${JSON.stringify(await visibleState())}`);
+        }
+
+        const markResult = await page.evaluate((dialogSelector, uploadSelector) => {
+          document.querySelectorAll(uploadSelector).forEach(input => {
+            input.removeAttribute('data-lecture-create-draft-upload');
+            input.removeAttribute('data-lecture-create-draft-upload-index');
+          });
+          const visible = element => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+          };
+          const dialog = Array.from(document.querySelectorAll(dialogSelector)).find(candidate => {
+            const text = [
+              candidate.querySelector('[data-corgix-internal="DIALOG-TITLE-CONTENT"]')?.textContent || '',
+              candidate.textContent || '',
+            ].join(' ');
+            return visible(candidate) && /Create\s*Draft|CreateDraft|下書きの作成/i.test(text);
+          });
+          if (!dialog) return { ok: false, reason: 'dialog not found' };
+          const inputs = Array.from(dialog.querySelectorAll('input[type="file"]'));
+          if (inputs.length === 0) return { ok: false, reason: 'file input not found' };
+          const orderedInputs = [
+            ...inputs.filter(input => input.closest('.vv-upload-file-button')),
+            ...inputs.filter(input => !input.closest('.vv-upload-file-button') && !input.multiple),
+            ...inputs.filter(input => !input.closest('.vv-upload-file-button') && input.multiple),
+          ].filter((input, index, list) => list.indexOf(input) === index);
+          orderedInputs.forEach((input, index) => {
+            input.setAttribute('data-lecture-create-draft-upload', 'true');
+            input.setAttribute('data-lecture-create-draft-upload-index', String(index));
+          });
+          return {
+            ok: true,
+            inputCount: inputs.length,
+            targets: orderedInputs.map((input, index) => ({
+              index,
+              multiple: !!input.multiple,
+              inUploadButton: !!input.closest('.vv-upload-file-button'),
+              className: String(input.className || ''),
+            })),
+            title: (dialog.querySelector('[data-corgix-internal="DIALOG-TITLE-CONTENT"]')?.textContent || '').trim(),
+          };
+        }, createDraftDialogSelector, markedDraftUploadSelector);
+        if (!markResult.ok) {
+          throw new Error(`下書き作成ダイアログのファイル入力が見つかりません: ${JSON.stringify(markResult)}`);
+        }
+        console.log(`下書き作成ダイアログにZIPをアップロードします: ${zipPath} / ${JSON.stringify(markResult)}`);
+        const uploadHandles = await page.$$(markedDraftUploadSelector);
+        if (uploadHandles.length === 0) {
+          throw new Error("下書き作成ダイアログのファイル入力を取得できませんでした。");
+        }
+        const zipBaseName = path.basename(zipPath);
+        let uploadConfirmed = false;
+        let lastUploadState = null;
+        for (let inputIndex = 0; inputIndex < uploadHandles.length; inputIndex += 1) {
+          console.log(`下書き作成用ZIPをファイル入力へ反映します。(${inputIndex + 1}/${uploadHandles.length})`);
+          await uploadHandles[inputIndex].uploadFile(zipPath);
+          await sleep(1000);
+          lastUploadState = await page.evaluate((dialogSelector, expectedName) => {
+            const visible = element => {
+              const style = window.getComputedStyle(element);
+              const rect = element.getBoundingClientRect();
+              return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            const dialog = Array.from(document.querySelectorAll(dialogSelector)).find(candidate => {
+              const text = [
+                candidate.querySelector('[data-corgix-internal="DIALOG-TITLE-CONTENT"]')?.textContent || '',
+                candidate.textContent || '',
+              ].join(' ');
+              return visible(candidate) && /Create\s*Draft|CreateDraft|下書きの作成/i.test(text);
+            });
+            const inputs = Array.from(dialog?.querySelectorAll('input[type="file"]') || []);
+            const files = inputs.flatMap((input, index) => Array.from(input.files || []).map(file => ({
+              index,
+              name: file.name,
+              size: file.size,
+              multiple: !!input.multiple,
+            })));
+            const text = dialog?.textContent || '';
+            const fileLabels = Array.from(dialog?.querySelectorAll('[role="fileSelectSelectionFileName"], .vv-file-name, .vv-file-name-container') || [])
+              .map(element => (element.textContent || '').replace(/\s+/g, ' ').trim())
+              .filter(Boolean);
+            return {
+              ok: files.length > 0 || text.includes(expectedName),
+              files,
+              fileLabels,
+              text: text.replace(/\s+/g, ' ').trim().slice(0, 600),
+            };
+          }, createDraftDialogSelector, zipBaseName);
+          console.log(`下書き作成用ZIPの反映状態: ${JSON.stringify(lastUploadState)}`);
+          if (lastUploadState.ok) {
+            uploadConfirmed = true;
+            break;
+          }
+        }
+        if (!uploadConfirmed) {
+          throw new Error(`下書き作成用ZIPの選択を確認できませんでした: ${zipBaseName} / 状態: ${JSON.stringify(lastUploadState)}`);
+        }
+        console.log(`下書き作成用ZIPの選択を確認しました: ${zipBaseName}`);
+
+        await page.waitForFunction(dialogSelector => {
+          const visible = element => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.visibility !== 'hidden' &&
+              style.display !== 'none' &&
+              !element.disabled &&
+              element.getAttribute('aria-disabled') !== 'true';
+          };
+          const dialogs = Array.from(document.querySelectorAll(dialogSelector));
+          return dialogs.some(dialog => {
+            if (!visible(dialog)) return false;
+            return Array.from(dialog.querySelectorAll('button')).some(button => {
+              const label = [
+                button.textContent || '',
+                button.getAttribute('aria-label') || '',
+                button.getAttribute('title') || '',
+                button.className || '',
+              ].join(' ');
+              return visible(button) && /vv-create-draft-button|^作成$|^Create$/i.test(label.trim());
+            });
+          });
+        }, { timeout: LONG_WAIT }, createDraftDialogSelector);
+
+        const createPoint = await page.evaluate(dialogSelector => {
+          const visible = element => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.visibility !== 'hidden' &&
+              style.display !== 'none' &&
+              !element.disabled &&
+              element.getAttribute('aria-disabled') !== 'true';
+          };
+          const dialogs = Array.from(document.querySelectorAll(dialogSelector));
+          const dialog = dialogs.find(visible);
+          const button = Array.from(dialog?.querySelectorAll('button') || []).find(candidate => {
+            const label = [
+              candidate.textContent || '',
+              candidate.getAttribute('aria-label') || '',
+              candidate.getAttribute('title') || '',
+              candidate.className || '',
+            ].join(' ');
+            return visible(candidate) && /vv-create-draft-button|^作成$|^Create$/i.test(label.trim());
+          });
+          if (!button) return { ok: false, reason: 'create button not found' };
+          button.scrollIntoView({ block: 'center', inline: 'center' });
+          const rect = button.getBoundingClientRect();
+          return {
+            ok: true,
+            x: rect.left + rect.width / 2,
+            y: rect.top + rect.height / 2,
+            text: (button.textContent || '').replace(/\s+/g, ' ').trim(),
+            ariaLabel: button.getAttribute('aria-label') || '',
+          };
+        }, createDraftDialogSelector);
+        if (!createPoint.ok) {
+          throw new Error(`下書き作成ダイアログの作成ボタンが見つかりません: ${JSON.stringify(createPoint)}`);
+        }
+        console.log(`下書き作成ダイアログの作成ボタンを押します: ${JSON.stringify(createPoint)}`);
+        await page.mouse.move(createPoint.x, createPoint.y);
+        await page.mouse.down();
+        await sleep(80);
+        await page.mouse.up();
+      };
+
+      const collectDraftPageState = async () => page.evaluate(dialogSelector => {
+        const visible = element => {
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return rect.width > 0 &&
+            rect.height > 0 &&
+            style.visibility !== 'hidden' &&
+            style.display !== 'none';
+        };
+        const dialogVisible = Array.from(document.querySelectorAll(dialogSelector)).some(dialog => {
+          const text = [
+            dialog.querySelector('[data-corgix-internal="DIALOG-TITLE-CONTENT"]')?.textContent || '',
+            dialog.textContent || '',
+          ].join(' ');
+          return visible(dialog) && /Create\s*Draft|CreateDraft|下書きの作成/i.test(text);
+        });
+        const currentDocId = location.hash.match(/#?doc_info\/(\d+)/)?.[1] || '';
+        const binderRows = Array.from(document.querySelectorAll('.vv_library_list .binderDocRow, .vv_library_list .vv_veeva_document'))
+          .filter(visible)
+          .map(row => (row.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200));
+        const docStatusText = Array.from(document.querySelectorAll('.vv_docstatus_wrapper, .vv-doc-state-badge'))
+          .filter(visible)
+          .map(element => [
+            element.textContent || '',
+            ...Array.from(element.querySelectorAll('button, [title], [aria-activedescendant]')).map(child => [
+              child.getAttribute('title') || '',
+              child.getAttribute('aria-label') || '',
+              child.getAttribute('aria-activedescendant') || '',
+              child.textContent || '',
+            ].join(' ')),
+          ].join(' ').replace(/\s+/g, ' ').trim())
+          .filter(Boolean);
+        const docStatusJoined = docStatusText.join(' ');
+        return {
+          url: location.href,
+          title: document.title || '',
+          currentDocId,
+          dialogVisible,
+          binderRowCount: binderRows.length,
+          binderRows: binderRows.slice(0, 5),
+          editBinderVisible: Array.from(document.querySelectorAll('.vv-edit-binder')).some(visible),
+          docStatusText: docStatusText.slice(0, 5),
+          docStatusIsDraft: /(^|[\s_-])(Draft|ドラフト)($|[\s_-])/i.test(docStatusJoined),
+        };
+      }, createDraftDialogSelector).catch(err => ({ error: String(err) }));
+
+      const waitForBinderDraftToOpenSlide = async (previousUrl, previousDocId) => {
+        console.log("Binderの下書き作成後、スライド画面への遷移を待っています。");
+        const waitResult = await Promise.race([
+          page.waitForNavigation({ waitUntil: ['load', 'networkidle2'], timeout: 120000 })
+            .then(() => ({ ok: true, reason: 'navigation' }))
+            .catch(e => ({ ok: false, reason: `navigation timeout: ${e.message}` })),
+          page.waitForFunction((dialogSelector, beforeUrl, beforeDocId) => {
+            const visible = element => {
+              const style = window.getComputedStyle(element);
+              const rect = element.getBoundingClientRect();
+              return rect.width > 0 &&
+                rect.height > 0 &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none';
+            };
+            const dialogVisible = Array.from(document.querySelectorAll(dialogSelector)).some(dialog => {
+              const text = [
+                dialog.querySelector('[data-corgix-internal="DIALOG-TITLE-CONTENT"]')?.textContent || '',
+                dialog.textContent || '',
+              ].join(' ');
+              return visible(dialog) && /Create\s*Draft|CreateDraft|下書きの作成/i.test(text);
+            });
+            const statusText = Array.from(document.querySelectorAll('.vv_docstatus_wrapper, .vv-doc-state-badge'))
+              .filter(visible)
+              .map(element => [
+                element.textContent || '',
+                ...Array.from(element.querySelectorAll('button, [title], [aria-activedescendant]')).map(child => [
+                  child.getAttribute('title') || '',
+                  child.getAttribute('aria-label') || '',
+                  child.getAttribute('aria-activedescendant') || '',
+                  child.textContent || '',
+                ].join(' ')),
+              ].join(' '))
+              .join(' ');
+            const draftStatusVisible = /(^|[\s_-])(Draft|ドラフト)($|[\s_-])/i.test(statusText);
+            const currentDocId = location.hash.match(/#?doc_info\/(\d+)/)?.[1] || '';
+            return dialogVisible ||
+              draftStatusVisible ||
+              (!!currentDocId && !!beforeDocId && currentDocId !== beforeDocId) ||
+              (!!beforeUrl && location.href !== beforeUrl);
+          }, { timeout: 120000 }, createDraftDialogSelector, previousUrl, previousDocId)
+            .then(() => ({ ok: true, reason: 'page state changed' }))
+            .catch(e => ({ ok: false, reason: `state timeout: ${e.message}` })),
+        ]);
+        await sleep(1500);
+        const state = await collectDraftPageState();
+        console.log(`Binder下書き作成後の状態: ${JSON.stringify({ waitResult, state })}`);
+        if (!state.dialogVisible && !state.docStatusIsDraft && state.binderRowCount === 0 && (!state.currentDocId || state.currentDocId === previousDocId)) {
+          throw new Error(`Binderの下書き作成後にスライドへ遷移していません。状態: ${JSON.stringify(state)}`);
+        }
+        return state;
+      };
+
+      console.log("修正用に既存Binderの下書き作成を押します。");
+      const beforeBinderDraftUrl = page.url();
+      const binderDraftMethod = await clickCreateDraftAction();
+      console.log(`既存Binderの下書き作成を押しました: ${binderDraftMethod}`);
+      const afterBinderDraftState = await waitForBinderDraftToOpenSlide(beforeBinderDraftUrl, sourceDocId);
+      let binderDraftUrl = normalizeVeevaUrl(afterBinderDraftState.url || beforeBinderDraftUrl);
+      if (!afterBinderDraftState.dialogVisible) {
+        if (afterBinderDraftState.binderRowCount > 0 || afterBinderDraftState.editBinderVisible || afterBinderDraftState.docStatusIsDraft) {
+          console.log("Binderドラフト画面内のスライドへ移動します。");
+          await gotoSlideFromBinderList(baseUrl, NAME);
+        }
+        console.log("スライド側の下書き作成ダイアログを開きます。");
+        await openCreateDraftDialog();
+      }
+      await uploadZipAndCreateDraft();
+
+      console.log("スライドの下書き作成完了を待っています。");
+      const draftResultState = await page.waitForFunction(dialogSelector => {
+        const visible = element => {
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return rect.width > 0 &&
+            rect.height > 0 &&
+            style.visibility !== 'hidden' &&
+            style.display !== 'none';
+        };
+        const dialogVisible = Array.from(document.querySelectorAll(dialogSelector)).some(dialog => visible(dialog));
+        const docInfoVisible = Array.from(document.querySelectorAll('.vv_docstatus_wrapper, li[data-target-key=doc_info_relationships__sys]')).some(visible);
+        return !dialogVisible && docInfoVisible;
+      }, { timeout: 180000 }, createDraftDialogSelector)
+        .then(() => ({ ok: true, reason: 'dialog closed' }))
+        .catch(e => ({ ok: false, reason: `completion timeout: ${e.message}` }));
+
+      console.log(`下書き作成後の待機結果: ${JSON.stringify(draftResultState)}`);
+      await sleep(1500);
+
+      const currentUrl = normalizeVeevaUrl(page.url());
+      const currentDocId = currentUrl.match(/#doc_info\/(\d+)/)?.[1] || '';
+      const afterDraftState = await collectDraftPageState();
+      if (!currentDocId || (sourceDocId && currentDocId === sourceDocId) || afterDraftState.binderRowCount > 0 || afterDraftState.editBinderVisible) {
+        const state = await visibleState();
+        throw new Error(`スライドの下書き作成後にスライド画面を確認できませんでした。現在URL: ${currentUrl} / BinderDocId: ${sourceDocId || '(なし)'} / 現在DocId: ${currentDocId || '(なし)'} / 画面状態: ${JSON.stringify(afterDraftState)} / UI状態: ${JSON.stringify(state)}`);
+      }
+
+      console.log(`修正用スライドの下書き作成が完了しました: ${currentUrl}`);
+      return {
+        slideUrl: currentUrl,
+        binderUrl: normalizeVeevaUrl(binderDraftUrl),
+      };
+    }
+
     async function gotoSlideFromBinderList(baseUrl, expectedName = '') {
-      await page.waitForSelector('.vv_library_list .binderDocRow, .vv_library_list .vv_veeva_document', { timeout: LONG_WAIT });
+      const binderRowSelector = '.vv_library_list .binderDocRow, .vv_library_list .vv_veeva_document';
+      let rowHandle = await waitForOptionalSelector(binderRowSelector, 8000, { visible: true });
+      if (!rowHandle) {
+        const editButton = await waitForOptionalSelector(".vv-edit-binder", 8000, { visible: true });
+        if (editButton) {
+          console.log("Binder内のスライド一覧が見えないため、Binder編集画面を開きます。");
+          await clickWhenReady(".vv-edit-binder", LONG_WAIT);
+          rowHandle = await waitForOptionalSelector(binderRowSelector, LONG_WAIT, { visible: true });
+        }
+      }
+      if (!rowHandle) {
+        const state = await page.evaluate(() => {
+          const visible = element => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.visibility !== 'hidden' &&
+              style.display !== 'none';
+          };
+          return {
+            url: location.href,
+            title: document.title || '',
+            editBinderVisible: Array.from(document.querySelectorAll('.vv-edit-binder')).some(visible),
+            docStatusText: Array.from(document.querySelectorAll('.vv_docstatus_wrapper, .vv-doc-state-badge')).map(el => (el.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 5),
+            bodyText: (document.body?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 800),
+          };
+        }).catch(err => ({ error: String(err) }));
+        throw new Error(`Binder内のスライド一覧を表示できませんでした。状態: ${JSON.stringify(state)}`);
+      }
 
       const collectBinderRows = async () => page.evaluate(targetName => {
         const normalizeName = value => String(value || '')
@@ -3386,266 +4191,343 @@ async function withTimeout(promise, timeoutMs, label) {
           console.log("代理アクセスユーザーへの切り替えが完了しました。");
         }
 
-        const duplicateSearchTargets = [
-          { label: 'プレゼンテーションID', value: String(presentationId).trim() },
-        ].filter((item, index, self) => item.value && self.findIndex(candidate => candidate.value === item.value) === index);
+      }
 
-        console.log(`既存登録チェック対象: ${duplicateSearchTargets.map(item => `${item.label}="${item.value}"`).join(' / ')}`);
-        for (const duplicateTarget of duplicateSearchTargets) {
-          const searchName = duplicateTarget.value;
-          console.log(`既存登録を厳格検索しています: ${duplicateTarget.label} "${searchName}"`);
-          const searchSummary = await searchExistingDocument(searchName, tUrl);
-          if (!searchSummary.verified || searchSummary.count === null) {
-            const message = `${duplicateTarget.label} "${searchName}" の検索結果を厳格に判定できませんでした。既存登録の確認ができないため、処理を中断します。`;
+      const duplicateSearchTargets = [
+        { label: 'プレゼンテーションID', value: String(presentationId).trim() },
+      ].filter((item, index, self) => item.value && self.findIndex(candidate => candidate.value === item.value) === index);
+
+      let binderURL = "";
+      if (IS_REVISION) {
+        console.log(`区分が修正のため、既存プレゼンテーションをプレゼンテーションIDから検索して開きます: ${presentationId}`);
+      }
+      console.log(`既存登録チェック対象: ${duplicateSearchTargets.map(item => `${item.label}="${item.value}"`).join(' / ')}`);
+      for (const duplicateTarget of duplicateSearchTargets) {
+        const searchName = duplicateTarget.value;
+        console.log(`既存登録を厳格検索しています: ${duplicateTarget.label} "${searchName}"`);
+        const searchSummary = await searchExistingDocument(searchName, tUrl);
+        if (!searchSummary.verified || searchSummary.count === null) {
+          const message = `${duplicateTarget.label} "${searchName}" の検索結果を厳格に判定できませんでした。既存登録の確認ができないため、処理を中断します。`;
+          console.log(red + message + reset);
+          if (searchSummary.error) console.log("error:", searchSummary.error);
+          console.log("input:", searchSummary.inputValue || "(なし)");
+          console.log("paginator:", searchSummary.paginatorText || "(なし)");
+          console.log("grid:", searchSummary.gridText ? searchSummary.gridText.slice(0, 300) : "(なし)");
+          if (searchSummary.resultRows?.length) {
+            console.log("rows:", searchSummary.resultRows.join(" / ").slice(0, 500));
+          }
+          return ["作成失敗", page.url(), slideURL, message];
+        }
+
+        if (IS_REVISION) {
+          if (searchSummary.count === 0) {
+            const message = `区分が修正ですが、${duplicateTarget.label} "${searchName}" の既存プレゼンテーションが見つかりませんでした。`;
             console.log(red + message + reset);
-            if (searchSummary.error) console.log("error:", searchSummary.error);
-            console.log("input:", searchSummary.inputValue || "(なし)");
-            console.log("paginator:", searchSummary.paginatorText || "(なし)");
-            console.log("grid:", searchSummary.gridText ? searchSummary.gridText.slice(0, 300) : "(なし)");
+            return ["作成失敗", page.url(), slideURL, message];
+          }
+          if (searchSummary.count !== 1) {
+            const message = `区分が修正ですが、${duplicateTarget.label} "${searchName}" の検索結果が${searchSummary.count}件あり、対象を1件に絞れないため中断しました。`;
+            console.log(red + message + reset);
+            if (searchSummary.urls.length > 0) {
+              searchSummary.urls.forEach(url => console.log(url));
+            }
             if (searchSummary.resultRows?.length) {
               console.log("rows:", searchSummary.resultRows.join(" / ").slice(0, 500));
             }
             return ["作成失敗", page.url(), slideURL, message];
           }
 
-          if (searchSummary.count === 0) {
-            console.log(`${duplicateTarget.label} "${searchName}" で検索した結果、登録済みドキュメントは0件でした。`);
-            continue;
+          const existingUrl = searchSummary.urls[0] ? normalizeVeevaUrl(searchSummary.urls[0]) : "";
+          if (!existingUrl) {
+            const message = `区分が修正ですが、${duplicateTarget.label} "${searchName}" の既存プレゼンテーションURLを取得できませんでした。`;
+            console.log(red + message + reset);
+            if (searchSummary.resultRows?.length) {
+              console.log("rows:", searchSummary.resultRows.join(" / ").slice(0, 500));
+            }
+            return ["作成失敗", page.url(), slideURL, message];
           }
 
-          const message = `${duplicateTarget.label} "${searchName}" で検索した結果、${searchSummary.count}件の登録済みドキュメントが見つかったため中断しました。`;
-          console.log(red + message + reset);
-          if (searchSummary.urls.length > 0) {
-            searchSummary.urls.forEach(url => console.log(url));
-            if (searchSummary.count > searchSummary.urls.length) {
-              console.log("表示中のURLのみ出力しています。");
-            }
-          }
-          if (searchSummary.resultRows?.length) {
-            console.log("rows:", searchSummary.resultRows.join(" / ").slice(0, 500));
-          }
-          return ["作成失敗", page.url(), slideURL, message];
+          binderURL = existingUrl;
+          console.log(`既存プレゼンテーションを開いています: ${binderURL}`);
+          await page.goto(binderURL, DCL);
+          await waitForAnySelector([
+            ".vv-edit-binder",
+            "li[data-target-key=doc_info_relationships__sys]",
+            ".vv_docstatus_wrapper",
+          ], LONG_WAIT, { visible: true });
+          console.log(`既存プレゼンテーションを開きました: ${binderURL}`);
+          const revisionDraftResult = await createDraftFromExistingPresentation(zIPfolder, tUrl);
+          slideURL = revisionDraftResult?.slideUrl || revisionDraftResult || "";
+          binderURL = revisionDraftResult?.binderUrl || binderURL;
+          break;
         }
+
+        if (searchSummary.count === 0) {
+          console.log(`${duplicateTarget.label} "${searchName}" で検索した結果、登録済みドキュメントは0件でした。`);
+          continue;
+        }
+
+        const message = `${duplicateTarget.label} "${searchName}" で検索した結果、${searchSummary.count}件の登録済みドキュメントが見つかったため中断しました。`;
+        console.log(red + message + reset);
+        if (searchSummary.urls.length > 0) {
+          searchSummary.urls.forEach(url => console.log(url));
+          if (searchSummary.count > searchSummary.urls.length) {
+            console.log("表示中のURLのみ出力しています。");
+          }
+        }
+        if (searchSummary.resultRows?.length) {
+          console.log("rows:", searchSummary.resultRows.join(" / ").slice(0, 500));
+        }
+        return ["作成失敗", page.url(), slideURL, message];
+      }
+      if (IS_REVISION && !binderURL) {
+        const message = `区分が修正ですが、プレゼンテーションID "${presentationId}" の既存プレゼンテーションを開けませんでした。`;
+        console.log(red + message + reset);
+        return ["作成失敗", page.url(), slideURL, message];
+      }
+
+      if (!IS_REVISION) {
         console.log("既存登録チェックが完了しました。登録処理を続行します。");
 
-      }
 
+        console.log("Engage PresentationのBinder作成画面を開いています。");
+        await openBinderCreateWizard(tUrl);
 
-      console.log("Engage PresentationのBinder作成画面を開いています。");
-      await openBinderCreateWizard(tUrl);
-
-      await page.select(TPYE_SUBMIT_SELECTOR, 'engagePresentation_b');
-      await page.waitForFunction(
-        selector => document.querySelector(selector)?.value === 'engagePresentation_b',
-        { timeout: NORMAL_WAIT },
-        TPYE_SUBMIT_SELECTOR
-      );
-      console.log("ドキュメントタイプ選択後のOKボタンを押します。");
-      await clickWhenReady(OK_SUBMIT_SELECTOR, LONG_WAIT);
-      try {
-        await page.waitForSelector(OK_SUBMIT_SELECTOR, { hidden: true, timeout: 10000 });
-      } catch (e) {
-        console.log(red + "OK押下後もOKボタンが残っています。もう一度OKを押します。" + reset);
-        await clickWhenReady(OK_SUBMIT_SELECTOR, LONG_WAIT);
-        await page.waitForSelector(OK_SUBMIT_SELECTOR, { hidden: true, timeout: 30000 });
-      }
-
-      console.log("作成ウィザードのNextボタンを押します。");
-      await clickWhenReady(NEXT_SUBMIT_SELECTOR, LONG_WAIT);
-      const countryInput = await waitForOptionalSelector(COUNTRY_SELECTOR, 15000);
-      if (!countryInput) {
-        console.log(red + "Next押下後に国入力欄が表示されませんでした。もう一度Nextを押します。" + reset);
-        await clickWhenReady(NEXT_SUBMIT_SELECTOR, LONG_WAIT);
-        await page.waitForSelector(COUNTRY_SELECTOR, { timeout: LONG_WAIT });
-      }
-
-      console.log("Binder基本情報を入力しています。");
-      await typeAndSelectMenuItem(COUNTRY_SELECTOR, COUNTRY);
-      await clearAndType(NAME_SELECTOR, NAME);
-
-      if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
-        console.log(`Productを選択しています: ${PRODUCT}`);
-        await typeAndSelectMenuItem(PRODUCT_SELECTOR, PRODUCT, {
-          label: 'Product',
-          clearSelectedItems: true,
-          requireSelectedText: true,
-          selectionMode: 'mouse',
-        });
-
-        // CS環境
-        console.log("Detail Groupと言語を設定しています。");
-        await typeAndSelectMenuItem(DETAILGROUP_SELECTOR, DETAILGROUP);
-        await typeAndSelectMenuItem(LANGUAGE_SELECTOR, LANGUAGE, {
-          label: 'Binder Language',
-        });
-        await clearAndType(PRODUCTTEXT_SELECTOR, PRODUCT);
-        await ensurePresentationIdFieldVisible();
-        await clearAndTypeRequired(presentationId_SELECTOR, presentationId, 'Presentation ID');
-
-      } else {
-
-        console.log("嵐丸環境の製品情報を設定しています。");
-        await typeAndSelectMultipleMenuItems(
-          PRODUCT_SELECTOR_TEST,
-          ["Cholecap"],
-          { sectionTitle: "製品情報", label: "製品" }
+        await page.select(TPYE_SUBMIT_SELECTOR, 'engagePresentation_b');
+        await page.waitForFunction(
+          selector => document.querySelector(selector)?.value === 'engagePresentation_b',
+          { timeout: NORMAL_WAIT },
+          TPYE_SUBMIT_SELECTOR
         );
-      }
+        console.log("ドキュメントタイプ選択後のOKボタンを押します。");
+        await clickWhenReady(OK_SUBMIT_SELECTOR, LONG_WAIT);
+        try {
+          await page.waitForSelector(OK_SUBMIT_SELECTOR, { hidden: true, timeout: 10000 });
+        } catch (e) {
+          console.log(red + "OK押下後もOKボタンが残っています。もう一度OKを押します。" + reset);
+          await clickWhenReady(OK_SUBMIT_SELECTOR, LONG_WAIT);
+          await page.waitForSelector(OK_SUBMIT_SELECTOR, { hidden: true, timeout: 30000 });
+        }
 
-      await selectRadioById('clmContent_bYES');
-      await selectRadioById('crmHidden_bYES');
+        console.log("作成ウィザードのNextボタンを押します。");
+        await clickWhenReady(NEXT_SUBMIT_SELECTOR, LONG_WAIT);
+        const countryInput = await waitForOptionalSelector(COUNTRY_SELECTOR, 15000);
+        if (!countryInput) {
+          console.log(red + "Next押下後に国入力欄が表示されませんでした。もう一度Nextを押します。" + reset);
+          await clickWhenReady(NEXT_SUBMIT_SELECTOR, LONG_WAIT);
+          await page.waitForSelector(COUNTRY_SELECTOR, { timeout: LONG_WAIT });
+        }
+
+        console.log("Binder基本情報を入力しています。");
+        await typeAndSelectMenuItem(COUNTRY_SELECTOR, COUNTRY);
+        await clearAndType(NAME_SELECTOR, NAME);
+
+        if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
+          console.log(`Productを選択しています: ${PRODUCT}`);
+          await typeAndSelectMenuItem(PRODUCT_SELECTOR, PRODUCT, {
+            label: 'Product',
+            clearSelectedItems: true,
+            requireSelectedText: true,
+            selectionMode: 'mouse',
+          });
+
+          // CS環境
+          console.log("Detail Groupと言語を設定しています。");
+          await typeAndSelectMenuItem(DETAILGROUP_SELECTOR, DETAILGROUP);
+          await typeAndSelectMenuItem(LANGUAGE_SELECTOR, LANGUAGE, {
+            label: 'Binder Language',
+          });
+          await clearAndType(PRODUCTTEXT_SELECTOR, PRODUCT);
+          await ensurePresentationIdFieldVisible();
+          await clearAndTypeRequired(presentationId_SELECTOR, presentationId, 'Presentation ID');
+
+        } else {
+
+          console.log("嵐丸環境の製品情報を設定しています。");
+          await typeAndSelectMultipleMenuItems(
+            PRODUCT_SELECTOR_TEST,
+            ["Cholecap"],
+            { sectionTitle: "製品情報", label: "製品" }
+          );
+        }
+
+        await selectRadioById('clmContent_bYES');
+        await selectRadioById('crmHidden_bYES');
 
 
 
-      console.log("Binderを保存しています。");
-      await waitForClickable(SAVE_SUBMIT_SELECTOR);
-      await page.click(SAVE_SUBMIT_SELECTOR);
+        console.log("Binderを保存しています。");
+        await waitForClickable(SAVE_SUBMIT_SELECTOR);
+        await page.click(SAVE_SUBMIT_SELECTOR);
 
 
-      console.log("Binderのレンディション生成完了を待っています。");
-      await waitForRenditionToFinish();
+        console.log("Binderのレンディション生成完了を待っています。");
+        await waitForRenditionToFinish();
 
-      // アップテスト
-      const binderURL = normalizeVeevaUrl(page.url())
-      console.log("Binderが作成されました:" + binderURL);
+        // アップテスト
+        binderURL = normalizeVeevaUrl(page.url());
+        console.log("Binderが作成されました:" + binderURL);
 
 
-      console.log("Binder編集画面を開いてZIPを追加しています。");
-      const createButton2 = await waitForOptionalSelector(".vv-edit-binder", LONG_WAIT, { visible: true });
-      await clickWhenReady(".vv-edit-binder", LONG_WAIT);
+        console.log("Binder編集画面を開いてZIPを追加しています。");
+        const createButton2 = await waitForOptionalSelector(".vv-edit-binder", LONG_WAIT, { visible: true });
+        await clickWhenReady(".vv-edit-binder", LONG_WAIT);
 
-      await openBinderAddFilesMenu();
-
-      try {
-        await page.waitForSelector('#inboxFileChooserHTML5', { timeout: 10000 });
-      } catch (e) {
-        console.log(red + "Upload File押下後もファイル選択欄が表示されません。もう一度Addメニューを開きます。" + reset);
         await openBinderAddFilesMenu();
-        await page.waitForSelector('#inboxFileChooserHTML5', { timeout: 30000 });
-      }
+
+        try {
+          await page.waitForSelector('#inboxFileChooserHTML5', { timeout: 10000 });
+        } catch (e) {
+          console.log(red + "Upload File押下後もファイル選択欄が表示されません。もう一度Addメニューを開きます。" + reset);
+          await openBinderAddFilesMenu();
+          await page.waitForSelector('#inboxFileChooserHTML5', { timeout: 30000 });
+        }
 
 
 
-      await page.waitForSelector('#inboxFileChooserHTML5', { timeout: 60000 });
-      const inputUploadHandle = await page.$('#inboxFileChooserHTML5');
-      console.log(`ZIPをアップロードしています: ${zIPfolder}`);
-      await inputUploadHandle.uploadFile(zIPfolder);
+        await page.waitForSelector('#inboxFileChooserHTML5', { timeout: 60000 });
+        const inputUploadHandle = await page.$('#inboxFileChooserHTML5');
+        console.log(`ZIPをアップロードしています: ${zIPfolder}`);
+        await inputUploadHandle.uploadFile(zIPfolder);
 
-      console.log("スライド作成ウィザードを開いています。");
-      console.log("ZIPアップロード完了とスライド作成ボタンの有効化を待っています。");
-      await clickActiveSaveButton(BINOCULARS_SUBMIT_SELECTOR, "スライド作成", LONG_WAIT, {
-        waitForGlobalBusy: true,
-      });
-
-      const typeSelect = await waitForOptionalSelector(TPYE_SUBMIT_SELECTOR, 30000, { visible: true });
-
-
-
-
-      await page.select(TPYE_SUBMIT_SELECTOR, 'slide_b');
-      await page.waitForFunction(
-        selector => document.querySelector(selector)?.value === 'slide_b',
-        { timeout: NORMAL_WAIT },
-        TPYE_SUBMIT_SELECTOR
-      );
-      console.log("ドキュメントタイプ選択後のOKボタンを押します。");
-      await clickWhenReady(OK_SUBMIT_SELECTOR, LONG_WAIT);
-      try {
-        await page.waitForSelector(OK_SUBMIT_SELECTOR, { hidden: true, timeout: 10000 });
-      } catch (e) {
-        console.log(red + "OK押下後もOKボタンが残っています。もう一度OKを押します。" + reset);
-        await clickWhenReady(OK_SUBMIT_SELECTOR, LONG_WAIT);
-        await page.waitForSelector(OK_SUBMIT_SELECTOR, { hidden: true, timeout: 30000 });
-      }
-
-
-
-
-      console.log("作成ウィザードのNextボタンを押します。");
-      await clickWhenReady(NEXT_SUBMIT_SELECTOR, LONG_WAIT);
-      const countryInput_s = await waitForOptionalSelector(COUNTRY_SELECTOR, 15000);
-      if (!countryInput_s) {
-        console.log(red + "Next押下後に国入力欄が表示されませんでした。もう一度Nextを押します。" + reset);
-        await clickWhenReady(NEXT_SUBMIT_SELECTOR, LONG_WAIT);
-        await page.waitForSelector(COUNTRY_SELECTOR, { timeout: LONG_WAIT });
-      }
-
-
-
-      console.log("スライド基本情報を入力しています。");
-      await clearAndType(NAME_SELECTOR, NAME);
-
-      if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
-        console.log("スライドの言語とDisable Actionsを設定しています。");
-        await typeAndSelectMenuItem(LANGUAGE_SELECTOR, LANGUAGE, {
-          label: 'スライド Language',
+        console.log("スライド作成ウィザードを開いています。");
+        console.log("ZIPアップロード完了とスライド作成ボタンの有効化を待っています。");
+        await clickActiveSaveButton(BINOCULARS_SUBMIT_SELECTOR, "スライド作成", LONG_WAIT, {
+          waitForGlobalBusy: true,
         });
-        const DISABLE_ACTIONS_SELECTOR = "div[name=crmDisableActions_b] > .vv_pill_container > input";
 
-        await typeAndSelectMultipleMenuItems(
-          DISABLE_ACTIONS_SELECTOR,
-          ["Pinch to Exit", "Rotation Lock"],
-          { sectionTitle: "CLM Properties", label: "Disable Actions" }
+        const typeSelect = await waitForOptionalSelector(TPYE_SUBMIT_SELECTOR, 30000, { visible: true });
+
+
+
+
+        await page.select(TPYE_SUBMIT_SELECTOR, 'slide_b');
+        await page.waitForFunction(
+          selector => document.querySelector(selector)?.value === 'slide_b',
+          { timeout: NORMAL_WAIT },
+          TPYE_SUBMIT_SELECTOR
         );
+        console.log("ドキュメントタイプ選択後のOKボタンを押します。");
+        await clickWhenReady(OK_SUBMIT_SELECTOR, LONG_WAIT);
+        try {
+          await page.waitForSelector(OK_SUBMIT_SELECTOR, { hidden: true, timeout: 10000 });
+        } catch (e) {
+          console.log(red + "OK押下後もOKボタンが残っています。もう一度OKを押します。" + reset);
+          await clickWhenReady(OK_SUBMIT_SELECTOR, LONG_WAIT);
+          await page.waitForSelector(OK_SUBMIT_SELECTOR, { hidden: true, timeout: 30000 });
+        }
+
+
+
+
+        console.log("作成ウィザードのNextボタンを押します。");
+        await clickWhenReady(NEXT_SUBMIT_SELECTOR, LONG_WAIT);
+        const countryInput_s = await waitForOptionalSelector(COUNTRY_SELECTOR, 15000);
+        if (!countryInput_s) {
+          console.log(red + "Next押下後に国入力欄が表示されませんでした。もう一度Nextを押します。" + reset);
+          await clickWhenReady(NEXT_SUBMIT_SELECTOR, LONG_WAIT);
+          await page.waitForSelector(COUNTRY_SELECTOR, { timeout: LONG_WAIT });
+        }
+
+
+
+        console.log("スライド基本情報を入力しています。");
+        await clearAndType(NAME_SELECTOR, NAME);
+
+        if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
+          console.log("スライドの言語とDisable Actionsを設定しています。");
+          await typeAndSelectMenuItem(LANGUAGE_SELECTOR, LANGUAGE, {
+            label: 'スライド Language',
+          });
+          const DISABLE_ACTIONS_SELECTOR = "div[name=crmDisableActions_b] > .vv_pill_container > input";
+
+          await typeAndSelectMultipleMenuItems(
+            DISABLE_ACTIONS_SELECTOR,
+            ["Pinch to Exit", "Rotation Lock"],
+            { sectionTitle: "CLM Properties", label: "Disable Actions" }
+          );
+        } else {
+
+          const DISABLE_ACTIONS_SELECTOR = "div[name=crmDisableActions_b] > .vv_pill_container > input";
+
+          await typeAndSelectMultipleMenuItems(
+            DISABLE_ACTIONS_SELECTOR,
+            ["終了用ピンチアクション", "Rotation Lock"],
+            { sectionTitle: "CLM のプロパティ", label: "アクションの無効化" }
+          );
+        }
+
+
+
+
+        console.log("スライドを保存しています。");
+        await clickActiveSaveButton(SAVE_SUBMIT_SELECTOR, "スライドのSave", LONG_WAIT, {
+          beforeUrl: page.url(),
+          confirmAfterClick: true,
+        });
+
+        console.log("スライドのレンディション生成完了を待っています。");
+        await waitForRenditionToFinish();
+
+
+
+
+
+        // 紐付けテスト
+
+        await page.goto(binderURL, DCL);
+        console.log("Binder内のスライドを探しています。");
+        slideURL = await gotoSlideFromBinderList(tUrl, NAME);
+
+
+        const createButton5 = await waitForOptionalSelector("li[data-target-key=doc_info_relationships__sys]", LONG_WAIT, { visible: true });
+        await clickWhenReady("li[data-target-key=doc_info_relationships__sys]", LONG_WAIT);
+        await openSharedResourceAddDialog();
+
+        console.log("Shared Resourceを紐付けています: MSD_ONC_TOOL_SHARED");
+        await addSharedResource("MSD_ONC_TOOL_SHARED");
+
+        if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
+          console.log("スライドのステータスをStagedへ変更しています。");
+          await changeDocumentStatusToStaged();
+        }
+
+
+        await page.goto(binderURL, DCL);
+        if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
+          console.log("BinderのステータスをStagedへ変更しています。");
+          await changeDocumentStatusToStaged();
+        }
+
+
+        console.log("登録が正常に完了しました。");
+        console.log("BinderURL:", binderURL);
+        console.log("SlideURL:", slideURL);
+
       } else {
-
-        const DISABLE_ACTIONS_SELECTOR = "div[name=crmDisableActions_b] > .vv_pill_container > input";
-
-        await typeAndSelectMultipleMenuItems(
-          DISABLE_ACTIONS_SELECTOR,
-          ["終了用ピンチアクション", "Rotation Lock"],
-          { sectionTitle: "CLM のプロパティ", label: "アクションの無効化" }
-        );
-      }
-
-
-
-
-      console.log("スライドを保存しています。");
-      await clickActiveSaveButton(SAVE_SUBMIT_SELECTOR, "スライドのSave", LONG_WAIT, {
-        beforeUrl: page.url(),
-        confirmAfterClick: true,
-      });
-
-      console.log("スライドのレンディション生成完了を待っています。");
-      await waitForRenditionToFinish();
-
-
-
-
-
-      // 紐付けテスト
-
-      await page.goto(binderURL, DCL);
-      console.log("Binder内のスライドを探しています。");
-      slideURL = await gotoSlideFromBinderList(tUrl, NAME);
-
-
-      const createButton5 = await waitForOptionalSelector("li[data-target-key=doc_info_relationships__sys]", LONG_WAIT, { visible: true });
-      await clickWhenReady("li[data-target-key=doc_info_relationships__sys]", LONG_WAIT);
-      await openSharedResourceAddDialog();
-
-      console.log("Shared Resourceを紐付けています: MSD_ONC_TOOL_SHARED");
-      await addSharedResource("MSD_ONC_TOOL_SHARED");
-
-      if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
-        console.log("スライドのステータスをStagedへ変更しています。");
+        console.log("修正用の既存プレゼンテーションDraftを使用するため、新規Binder作成をスキップします。");
+        if (!slideURL) {
+          throw new Error("修正用スライドURLが取得できていないため、ステータス変更に進めません。");
+        }
+        if (!binderURL) {
+          throw new Error("修正用Binder URLが取得できていないため、ステータス変更に進めません。");
+        }
+        console.log("修正用スライドのステータスをStagedへ変更しています。");
+        await page.goto(slideURL, DCL);
+        await waitForOptionalSelector(".vv_docstatus_wrapper", LONG_WAIT, { visible: true });
         await changeDocumentStatusToStaged();
-      }
 
-
-      await page.goto(binderURL, DCL);
-      if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
-        console.log("BinderのステータスをStagedへ変更しています。");
+        console.log("修正用BinderのステータスをStagedへ変更しています。");
+        await page.goto(binderURL, DCL);
+        await waitForOptionalSelector(".vv_docstatus_wrapper", LONG_WAIT, { visible: true });
         await changeDocumentStatusToStaged();
+
       }
 
 
-      console.log("登録が正常に完了しました。");
-      console.log("BinderURL:", binderURL);
-      console.log("SlideURL:", slideURL);
 
-      status = "作成完了";
+
+      status = IS_REVISION ? "修正完了" : "作成完了";
       return [status, binderURL, slideURL];
 
     } catch (err) {

@@ -6,6 +6,7 @@ const FALLBACK_VAULT_ACCOUNTS = [
   "mika.hirawatari@msd.com",
   "maika.mori@msd.com",
   "yura.fukuhara@msd.com",
+  "hidenori.sonohata@msd.com",
   "Hayato.Seto@vv-agency.com",
 ];
 
@@ -105,6 +106,46 @@ function Field({ label, value }) {
   );
 }
 
+function getRowProcessMode(row) {
+  const category = String(row?.category || "").trim();
+  const compactCategory = category.replace(/\s|\u3000/g, "");
+  const isRevision = compactCategory.includes("修正");
+  return {
+    isRevision,
+    label: isRevision ? "修正" : "新規",
+    category: category || "-",
+    title: isRevision ? "修正として処理されます" : "新規として登録されます",
+    note: isRevision
+      ? "プレゼンテーションIDで既存バインダーを検索し、対象が1件だけ見つかった場合のみ下書き作成とZIP更新を行います。見つからない場合や複数件ある場合は停止します。"
+      : "新規登録として処理します。プレゼンテーションIDの既存登録が見つかった場合は、重複防止のため処理を停止します。",
+  };
+}
+
+function RowModeBadge({ row }) {
+  const mode = getRowProcessMode(row);
+  return (
+    <span
+      className={`lecture-tool-mode-badge${mode.isRevision ? " lecture-tool-mode-badge--revision" : " lecture-tool-mode-badge--new"}`}
+      title={mode.category}
+    >
+      {mode.label}
+    </span>
+  );
+}
+
+function RowProcessNotice({ row }) {
+  const mode = getRowProcessMode(row);
+  return (
+    <div className={`lecture-tool-process-note${mode.isRevision ? " lecture-tool-process-note--revision" : " lecture-tool-process-note--new"}`}>
+      <div className="lecture-tool-process-note__title">
+        <RowModeBadge row={row} />
+        <span>{mode.title}</span>
+      </div>
+      <div className="lecture-tool-process-note__body">{mode.note}</div>
+    </div>
+  );
+}
+
 function CandidateRows({ rows, selectedRowId, onSelect, disabled }) {
   return (
     <div className="lecture-tool-candidates" aria-label="スプレッドシート行候補">
@@ -137,7 +178,7 @@ function CandidateRows({ rows, selectedRowId, onSelect, disabled }) {
               </span>
               <span className="lecture-tool-candidate__cell">
                 <small>区分</small>
-                {row.category || "-"}
+                <RowModeBadge row={row} />
               </span>
               <span className="lecture-tool-candidate__cell lecture-tool-candidate__cell--wide">
                 <small>開催日</small>
@@ -181,7 +222,7 @@ function RowCellPreview({ row }) {
         </span>
         <span className="lecture-tool-candidate__cell">
           <small>区分</small>
-          <span className="lecture-tool-candidate__value">{row.category || "-"}</span>
+          <RowModeBadge row={row} />
         </span>
         <span className="lecture-tool-candidate__cell lecture-tool-candidate__cell--wide">
           <small>開催日</small>
@@ -210,12 +251,13 @@ function SelectedRowInfo({ row, showCellPreview = false }) {
   return (
     <div>
       {showCellPreview ? <RowCellPreview row={row} /> : null}
+      <RowProcessNotice row={row} />
       <div className="lecture-tool-hint mb_10">以下の内容で処理が実行されます。</div>
       <div className="lecture-tool-rowinfo">
         {/* <Field label="講演会ID" value={row.lectureId} /> */}
         <Field label="Product" value={row.product} />
-        {/* <Field label="受付日" value={row.receptionDate} />
-        <Field label="区分" value={row.category} /> */}
+        {/* <Field label="受付日" value={row.receptionDate} /> */}
+        <Field label="区分" value={row.category} />
         <Field label="プレゼンテーションID" value={row.presentationId} />
         <Field label="メディアファイル名" value={row.mediaFileName} />
         <Field label="プレゼンテーション/キーメッセージ名" value={row.presentationName} />

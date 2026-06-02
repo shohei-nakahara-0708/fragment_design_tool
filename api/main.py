@@ -5063,17 +5063,29 @@ def extract_chair_from_blocks(blocks, speaker_map):
     return None
 
 def ensure_display_fields(payload: DesignJSON) -> DesignJSON:
+    def _compact_person(value: str) -> str:
+        return norm_name(value or "").replace("先生", "")
+
     # chair
     if getattr(payload, "chair", None):
         c = payload.chair
-        if (getattr(c, "name", "") or "").strip() and not (getattr(c, "name_display", "") or "").strip():
+        name = (getattr(c, "name", "") or "").strip()
+        display = (getattr(c, "name_display", "") or "").strip()
+        if name and (not display or _compact_person(display) != _compact_person(name)):
             c.name_display = build_speaker_display(c.name) or c.name
 
     # talks
     for t in (payload.talks or []):
+        if _is_program_chair_item(t):
+            name_display = (getattr(t, "name_display", "") or "").strip()
+            if name_display:
+                t.name_display = build_speaker_display(name_display) or name_display
+            continue
+
         # speaker_display を必ず作る（speaker優先）
         sp = (getattr(t, "speaker", "") or "").strip()
-        if sp and not (getattr(t, "speaker_display", "") or "").strip():
+        disp = (getattr(t, "speaker_display", "") or "").strip()
+        if sp and (not disp or _compact_person(disp) != _compact_person(sp)):
             t.speaker_display = build_speaker_display(sp) or sp
 
         # speaker が空で display だけある場合は speaker を作る（逆補完）
@@ -5082,6 +5094,18 @@ def ensure_display_fields(payload: DesignJSON) -> DesignJSON:
             t.speaker = norm_name(disp) or disp.replace(" ", "").replace("\u3000", "")
 
     return payload
+
+def ensure_display_fields_in_dict(data: dict) -> dict:
+    try:
+        payload = DesignJSON(**(data or {}))
+        payload = ensure_display_fields(payload)
+        return (
+            payload.model_dump(exclude_none=True)
+            if hasattr(payload, "model_dump")
+            else json.loads(payload.json(ensure_ascii=False))
+        )
+    except Exception:
+        return data
 
 def is_valid_person_name(name: str) -> bool:
     """有効な人名かどうかをチェック（トップレベル関数）"""
@@ -6884,6 +6908,29 @@ def _extract_inline_program_from_blocks(
     def is_chair_label(b: TextBlock) -> bool:
         return "座長" in normalize_key(b.text or "") or "総合司会" in normalize_key(b.text or "")
 
+    def is_non_lecture_chair_context(b: TextBlock) -> bool:
+        """講演ではない短い進行項目に付く座長は、途中座長として追加しない。"""
+        non_lecture_words = [
+            "会のご挨拶", "ご挨拶", "挨拶", "開会", "閉会", "開会の辞", "閉会の辞",
+            "休憩", "質疑応答", "Q&A", "総合討論", "総合討議", "ディスカッション",
+            "事務連絡", "諸連絡", "注意事項", "ご案内",
+        ]
+        window_top = b.top - 900000
+        window_bottom = b.top + 250000
+        nearby = [
+            x for x in ordered
+            if x is not b and window_top <= x.top <= window_bottom
+        ]
+        nearby.sort(key=lambda x: (abs(x.top - b.top), abs(x.left - b.left)))
+        for x in nearby[:8]:
+            raw = normalize_space(x.text or "")
+            if not raw or "先生" in raw:
+                continue
+            key = normalize_key(raw)
+            if any(normalize_key(word) in key for word in non_lecture_words):
+                return True
+        return False
+
     def person_blocks_in_segment(y0: int, y1: int, *, speaker_only: bool = False) -> list[TextBlock]:
         out = []
         for b in ordered:
@@ -7026,6 +7073,9 @@ def _extract_inline_program_from_blocks(
             )
             continue
 
+        if is_non_lecture_chair_context(b):
+            continue
+
         item = Talk(
             item_type="chair",
             role=role or "座長",
@@ -7084,7 +7134,8 @@ def apply_inline_program_extraction(payload: DesignJSON, blocks: list[TextBlock]
     warnings = set(payload.warnings or [])
     warnings.discard("talks_pruned_by_vm_hint")
     warnings.discard("talks_pruned_heuristic_only")
-    warnings.add("inline_chair_extracted")
+    if extracted_chair_count > 0:
+        warnings.add("inline_chair_extracted")
     payload.warnings = sorted(warnings)
     return payload
 
@@ -13924,7 +13975,7 @@ LECTURE_TOOL_VAULT_ACCOUNTS = [
     for account in (
         os.getenv(
             "LECTURE_TOOL_VAULT_ACCOUNTS",
-            "mika.hirawatari@msd.com,maika.mori@msd.com,yura.fukuhara@msd.com,Hayato.Seto@vv-agency.com",
+            "mika.hirawatari@msd.com,maika.mori@msd.com,yura.fukuhara@msd.com,hidenori.sonohata@msd.com,Hayato.Seto@vv-agency.com",
         )
     ).split(",")
     if account.strip()
@@ -15255,6 +15306,7 @@ async def upload_simple_stream(
                     except Exception:
                         pass
                     payload = apply_correct_answer_overlay(payload, _blocks_for_overlay)
+                    payload = ensure_display_fields(payload)
                     dump_titles("after apply_correct_answer_overlay", payload)
                     _t4 = _time_mod.monotonic()
                     print(f"[TIMING][simple] overlay+display: {_t4 - _t3:.2f}s")
@@ -15489,6 +15541,7 @@ async def upload_batch_stream(
                     except Exception:
                         pass
                     payload = apply_correct_answer_overlay(payload, _blocks_for_overlay, vm_rows=vm_rows)
+                    payload = ensure_display_fields(payload)
                     dump_titles("after apply_correct_answer_overlay", payload)
 
                     payload.region = presence_rows[0].get("VP/PH/ONC", "")
@@ -15961,6 +16014,7 @@ async def get_job(job_id: str):
     # 1) ローカル json 優先
     if p["json"].exists():
         data = json.loads(p["json"].read_text(encoding="utf-8"))
+        data = ensure_display_fields_in_dict(data)
         return JSONResponse({"jobId": job_id, "json": data})
 
     # 2) DBに存在確認
@@ -15976,6 +16030,7 @@ async def get_job(job_id: str):
     # 3) Storage fallback → ダウンロード後ローカルにキャッシュ
     try:
         data = download_storage_json(f"{job_id}/latest.json")
+        data = ensure_display_fields_in_dict(data)
         try:
             p["json"].write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         except Exception:
@@ -16090,11 +16145,13 @@ async def debug_latest(job_id: str):
     if local.exists() and local.stat().st_size > 0:
         try:
             data = json.loads(local.read_text(encoding="utf-8"))
+            data = ensure_display_fields_in_dict(data)
             return JSONResponse(content=data, headers={"Cache-Control": "no-cache"})
         except Exception:
             pass
     sp = storage_paths(job_id)
     data = download_storage_json(sp["json"])
+    data = ensure_display_fields_in_dict(data)
     return JSONResponse(content=data, headers={"Cache-Control": "no-cache"})
 
 
