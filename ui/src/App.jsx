@@ -6,6 +6,7 @@ import UploadPage from "./pages/UploadPage.jsx";
 import JobEditorPage from "./pages/JobEditorPage.jsx";
 import DiffPage from "./pages/DiffPage.jsx";
 import LectureSearchGuidePage from "./pages/LectureSearchGuidePage.jsx";
+import FragmentRegistrationPage from "./pages/FragmentRegistrationPage.jsx";
 import "./styles/shell.css";
 
 function AppShell({ children }) {
@@ -45,6 +46,17 @@ function AppShell({ children }) {
             <span className="app-sidebar__link-main">講演会検索案内ツール</span>
             <span className="app-sidebar__link-sub">ZIP生成・Vault登録</span>
           </NavLink>
+
+
+          <NavLink
+            to="/fragment-registration"
+            className={({ isActive }) =>
+              `app-sidebar__link${isActive ? " app-sidebar__link--active" : ""}`
+            }
+          >
+            <span className="app-sidebar__link-main">フラグメント登録ツール</span>
+            <span className="app-sidebar__link-sub">ZIP生成・Vault登録</span>
+          </NavLink>
         </nav>
       </aside>
 
@@ -71,6 +83,10 @@ export default function App() {
 
         {/* 講演会検索案内ツール */}
         <Route path="/lecture-search-guide" element={<LectureSearchGuidePage />} />
+
+
+        {/* フラグメント登録ツール */}
+        <Route path="/fragment-registration" element={<FragmentRegistrationPage />} />
 
         {/* それ以外は一覧へ */}
         <Route path="*" element={<Navigate to="/" replace />} />

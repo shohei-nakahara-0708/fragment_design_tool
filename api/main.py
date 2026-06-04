@@ -3520,6 +3520,41 @@ def fix_warnings(payload: DesignJSON) -> None:
     payload.warnings = sorted(w)
 
 
+def _has_real_inline_chair(payload: DesignJSON) -> bool:
+    for t in (getattr(payload, "talks", None) or []):
+        if not _is_program_chair_item(t):
+            continue
+        name = _json_person_display_value(t)
+        aff = _json_get(t, "affiliation", "")
+        if normalize_space(str(name or "")) or normalize_space(str(aff or "")):
+            return True
+    return False
+
+
+def sync_warning_flags(payload: DesignJSON) -> DesignJSON:
+    """最終 payload の実態に合わせて一覧用 warning を同期する。"""
+    w = set(getattr(payload, "warnings", None) or [])
+
+    if _has_real_inline_chair(payload):
+        w.add("inline_chair_extracted")
+    else:
+        w.discard("inline_chair_extracted")
+
+    if getattr(payload, "chair", None) and getattr(payload.chair, "name", ""):
+        w.discard("missing_chair")
+    if getattr(payload, "organizer", ""):
+        w.discard("missing_organizer")
+    if getattr(payload, "talks", None):
+        w.discard("no_talks")
+    if getattr(payload, "event_title", "") or getattr(payload, "event_title_lines", None):
+        w.discard("missing_event_title")
+    if getattr(payload, "datetime", ""):
+        w.discard("missing_datetime")
+
+    payload.warnings = sorted(w)
+    return payload
+
+
 ORG_LABEL_PAT = re.compile(r"^(主催|共催|提供|企画|運営)\s*[:：]\s*(.+)$")
 
 ORG_LABEL_PAT = re.compile(r"^(主催|共催|提供|企画|運営)\s*[:：]\s*(.+)$")
@@ -3861,6 +3896,37 @@ def parse_warnings(warnings_json: str) -> List[str]:
     except Exception:
         return []
 
+
+def _normalize_warning_list(value) -> list[str]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value or "[]")
+        except Exception:
+            parsed = [value] if value else []
+    else:
+        parsed = value or []
+    if not isinstance(parsed, (list, tuple, set)):
+        return []
+    return [str(x) for x in parsed if x]
+
+
+def warnings_for_job_item(job_id: str, warnings_value) -> list[str]:
+    warnings = _normalize_warning_list(warnings_value)
+    if "inline_chair_extracted" not in warnings:
+        return warnings
+
+    try:
+        local_json_path = DATA_DIR / job_id / "latest.json"
+        if not local_json_path.exists():
+            return warnings
+        data = json.loads(local_json_path.read_text(encoding="utf-8"))
+        payload = DesignJSON.model_validate(data) if hasattr(DesignJSON, "model_validate") else DesignJSON(**data)
+        if not _has_real_inline_chair(payload):
+            warnings = [w for w in warnings if w != "inline_chair_extracted"]
+    except Exception:
+        return warnings
+    return sorted(set(warnings))
+
 # def row_to_job_item(r: sqlite3.Row) -> Dict[str, Any]:
 #     job_id = r["job_id"]
 #     session_id = r["session_id"]
@@ -3900,7 +3966,7 @@ def row_to_job_item(r) -> Dict[str, Any]:
         "organizer": r.get("organizer") or "",
         "datetime": r.get("datetime") or "",
         "confidence": float(r.get("confidence") or 0.0),
-        "warnings": r.get("warnings_json") or [],
+        "warnings": warnings_for_job_item(job_id, r.get("warnings_json")),
         "manualOverride": bool(r.get("manual_override")),
         "note": r.get("note") or "",
         "locked": bool(r.get("locked")),
@@ -4194,6 +4260,7 @@ def now_ts():
 def upsert_job_ok(job_id: str, filename: str, payload, session_id: str = "", event_id: str = ""):
     created_at = now_ts()
     updated_at = created_at
+    payload = sync_warning_flags(payload)
     warnings = payload.warnings or []
 
     # jsonb array として入れる（["missing_organizer", ...]）
@@ -7137,7 +7204,7 @@ def apply_inline_program_extraction(payload: DesignJSON, blocks: list[TextBlock]
     if extracted_chair_count > 0:
         warnings.add("inline_chair_extracted")
     payload.warnings = sorted(warnings)
-    return payload
+    return sync_warning_flags(payload)
 
 
 
@@ -13298,19 +13365,7 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
     # NOTE: apply_correct_answer_overlay はバッチフロー側で
     # apply_precise_typeset_initial の「後」に呼ぶ（typeset が改行位置を上書きするため）
 
-    # --- warnings を実態に合わせて再計算 ---
-    _w = list(refined.warnings or [])
-    if refined.chair and refined.chair.name:
-        _w = [w for w in _w if w != "missing_chair"]
-    if refined.organizer:
-        _w = [w for w in _w if w != "missing_organizer"]
-    if refined.talks:
-        _w = [w for w in _w if w != "no_talks"]
-    if refined.event_title or refined.event_title_lines:
-        _w = [w for w in _w if w != "missing_event_title"]
-    if refined.datetime:
-        _w = [w for w in _w if w != "missing_datetime"]
-    refined.warnings = sorted(set(_w))
+    refined = sync_warning_flags(refined)
 
     return refined
 
@@ -13968,6 +14023,14 @@ LECTURE_TOOL_DRIVE_CONFIG_SIZES = [(453, 640), (480, 679)]
 LECTURE_TOOL_TARGET_IMAGE_BYTES = int(os.getenv("LECTURE_TOOL_TARGET_IMAGE_BYTES", str(100 * 1024)))
 LECTURE_TOOL_TARGET_IMAGE_TOLERANCE = int(os.getenv("LECTURE_TOOL_TARGET_IMAGE_TOLERANCE", str(15 * 1024)))
 LECTURE_TOOL_DRIVE_FOLDER_ID = _lecture_normalize_drive_folder_id(os.getenv("LECTURE_TOOL_DRIVE_FOLDER_ID") or "")
+FRAGMENT_TOOL_DRIVE_FOLDER_ID = _lecture_normalize_drive_folder_id(os.getenv("FRAGMENT_TOOL_DRIVE_FOLDER_ID") or "")
+FRAGMENT_TOOL_DRIVE_MAX_DEPTH = max(0, int(os.getenv("FRAGMENT_TOOL_DRIVE_MAX_DEPTH", "8")))
+FRAGMENT_TOOL_DRIVE_MAX_FOLDERS = max(1, int(os.getenv("FRAGMENT_TOOL_DRIVE_MAX_FOLDERS", "500")))
+FRAGMENT_TOOL_DRIVE_IGNORE_FOLDER_NAMES = {
+    normalize_space(name)
+    for name in os.getenv("FRAGMENT_TOOL_DRIVE_IGNORE_FOLDER_NAMES", "_済").split(",")
+    if normalize_space(name)
+}
 LECTURE_TOOL_DEFAULT_VAULT_COMMAND = f"node {shlex.quote(str(APP_DIR / 'tools' / 'lecture_vault_register.js'))}"
 LECTURE_TOOL_VAULT_COMMAND = (os.getenv("LECTURE_TOOL_VAULT_COMMAND") or LECTURE_TOOL_DEFAULT_VAULT_COMMAND).strip()
 LECTURE_TOOL_VAULT_ACCOUNTS = [
@@ -14253,6 +14316,264 @@ def _lecture_drive_upload_image(filename: str, data: bytes) -> dict[str, Any]:
         "updated": bool(existing_id),
         "duplicateExistingCount": max(0, len(existing_files) - 1),
     }
+
+
+def _fragment_drive_folder_url() -> str:
+    if not FRAGMENT_TOOL_DRIVE_FOLDER_ID:
+        return ""
+    return f"https://drive.google.com/drive/folders/{quote(FRAGMENT_TOOL_DRIVE_FOLDER_ID)}"
+
+
+def _fragment_drive_is_ignored_folder_name(name: str) -> bool:
+    return normalize_space(name or "") in FRAGMENT_TOOL_DRIVE_IGNORE_FOLDER_NAMES
+
+
+def _fragment_drive_child_folder_id(item: dict[str, Any]) -> str:
+    mime_type = item.get("mimeType") or ""
+    if mime_type == "application/vnd.google-apps.folder":
+        return item.get("id") or ""
+    if mime_type != "application/vnd.google-apps.shortcut":
+        return ""
+
+    shortcut = item.get("shortcutDetails") or {}
+    if shortcut.get("targetMimeType") == "application/vnd.google-apps.folder":
+        return shortcut.get("targetId") or ""
+    return ""
+
+
+def _fragment_drive_query_files(
+    credentials,
+    *,
+    query: str,
+    fields: str,
+    order_by: str = "",
+    page_size: int = 200,
+    page_token: str = "",
+) -> dict[str, Any]:
+    params = {
+        "q": query,
+        "fields": fields,
+        "pageSize": max(1, min(int(page_size or 200), 200)),
+        "supportsAllDrives": "true",
+        "includeItemsFromAllDrives": "true",
+        "corpora": "allDrives",
+    }
+    if order_by:
+        params["orderBy"] = order_by
+    if page_token:
+        params["pageToken"] = page_token
+
+    resp = requests.get(
+        "https://www.googleapis.com/drive/v3/files",
+        headers={"Authorization": f"Bearer {credentials.token}"},
+        params=params,
+        timeout=30,
+    )
+    if not resp.ok:
+        raise _lecture_drive_error(resp, "fragment image list")
+    return resp.json()
+
+
+def _fragment_drive_query_all_files(
+    credentials,
+    *,
+    query: str,
+    fields: str,
+    order_by: str = "",
+    page_size: int = 200,
+) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    page_token = ""
+    while True:
+        body = _fragment_drive_query_files(
+            credentials,
+            query=query,
+            fields=fields,
+            order_by=order_by,
+            page_size=page_size,
+            page_token=page_token,
+        )
+        print(f"Query: q={query}, orderBy={order_by}, pageSize={page_size}, pageToken='{page_token}'")
+        print(f"Response: {body}")
+        print(f"Queried {len(body.get('files') or [])} files with pageToken='{page_token}'")
+        files.extend(body.get("files") or [])
+        page_token = body.get("nextPageToken") or ""
+        if not page_token:
+            return files
+
+
+def _fragment_drive_descendant_folder_ids(credentials) -> tuple[list[str], bool]:
+    root_id = FRAGMENT_TOOL_DRIVE_FOLDER_ID
+    folder_ids = [root_id]
+    seen = {root_id}
+    queue_items: list[tuple[str, int]] = [(root_id, 0)]
+    truncated = False
+
+    while queue_items:
+        folder_id, depth = queue_items.pop(0)
+        if depth >= FRAGMENT_TOOL_DRIVE_MAX_DEPTH:
+            continue
+
+        print(f"Querying child folders of {folder_id} at depth {depth}...")
+
+        q = (
+            f"'{_lecture_drive_escape_query_value(folder_id)}' in parents "
+            "and trashed = false "
+            "and ("
+            "mimeType = 'application/vnd.google-apps.folder' "
+            "or mimeType = 'application/vnd.google-apps.shortcut'"
+            ")"
+        )
+        children = _fragment_drive_query_all_files(
+            credentials,
+            query=q,
+            fields="nextPageToken,files(id,name,mimeType,modifiedTime,shortcutDetails(targetId,targetMimeType))",
+            order_by="name",
+        )
+        print(f"Found {len(children)} {children} child folders in folder {folder_id} at depth {depth}")    
+        for child in children:
+            child_id = _fragment_drive_child_folder_id(child)
+            if not child_id or child_id in seen:
+                continue
+            if _fragment_drive_is_ignored_folder_name(child.get("name") or ""):
+                continue
+            seen.add(child_id)
+            folder_ids.append(child_id)
+            if len(folder_ids) >= FRAGMENT_TOOL_DRIVE_MAX_FOLDERS:
+                truncated = True
+                return folder_ids, truncated
+            queue_items.append((child_id, depth + 1))
+
+    return folder_ids, truncated
+
+
+def _fragment_drive_list_images(
+    *,
+    search: str = "",
+    page_token: str = "",
+    page_size: int = 100,
+) -> dict[str, Any]:
+    if not FRAGMENT_TOOL_DRIVE_FOLDER_ID:
+        raise HTTPException(status_code=500, detail="FRAGMENT_TOOL_DRIVE_FOLDER_ID が未設定です。")
+
+    credentials = _lecture_drive_credentials()
+    folder_ids, folders_truncated = _fragment_drive_descendant_folder_ids(credentials)
+    normalized_search = normalize_space(search)
+    all_files: list[dict[str, Any]] = []
+    seen_file_ids: set[str] = set()
+
+    for folder_id in folder_ids:
+        query_parts = [
+            f"'{_lecture_drive_escape_query_value(folder_id)}' in parents",
+            "trashed = false",
+            "mimeType contains 'image/'",
+        ]
+        if normalized_search:
+            query_parts.append(f"name contains '{_lecture_drive_escape_query_value(normalized_search)}'")
+
+        for item in _fragment_drive_query_all_files(
+            credentials,
+            query=" and ".join(query_parts),
+            fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,thumbnailLink,webViewLink,imageMediaMetadata(width,height),parents)",
+            order_by="modifiedTime desc,name",
+        ):
+            file_id = item.get("id")
+            if not file_id or file_id in seen_file_ids:
+                continue
+            seen_file_ids.add(file_id)
+            item["parentFolderId"] = folder_id
+            all_files.append(item)
+
+    all_files.sort(
+        key=lambda item: (
+            item.get("modifiedTime") or "",
+            item.get("name") or "",
+        ),
+        reverse=True,
+    )
+    try:
+        offset = max(0, int(page_token or "0"))
+    except Exception:
+        offset = 0
+    limit = max(1, min(int(page_size or 100), 200))
+    next_offset = offset + limit
+    files = all_files[offset:next_offset]
+
+    return {
+        "files": files,
+        "nextPageToken": str(next_offset) if next_offset < len(all_files) else "",
+        "folderCount": len(folder_ids),
+        "foldersTruncated": folders_truncated,
+        "recursive": True,
+        "maxDepth": FRAGMENT_TOOL_DRIVE_MAX_DEPTH,
+    }
+
+
+def _fragment_drive_is_inside_root(credentials, file_id: str) -> bool:
+    allowed_folder_ids, _ = _fragment_drive_descendant_folder_ids(credentials)
+    allowed_folder_id_set = set(allowed_folder_ids)
+    queue_ids = [file_id]
+    seen: set[str] = set()
+    depth = 0
+    while queue_ids and depth <= FRAGMENT_TOOL_DRIVE_MAX_DEPTH + 1:
+        next_ids: list[str] = []
+        for current_id in queue_ids:
+            if not current_id or current_id in seen:
+                continue
+            seen.add(current_id)
+            resp = requests.get(
+                f"https://www.googleapis.com/drive/v3/files/{quote(current_id, safe='')}",
+                headers={"Authorization": f"Bearer {credentials.token}"},
+                params={
+                    "fields": "id,name,mimeType,parents",
+                    "supportsAllDrives": "true",
+                },
+                timeout=30,
+            )
+            if resp.status_code == 404:
+                continue
+            if not resp.ok:
+                raise _lecture_drive_error(resp, "fragment parent check")
+            body = resp.json()
+            if (
+                body.get("mimeType") == "application/vnd.google-apps.folder"
+                and _fragment_drive_is_ignored_folder_name(body.get("name") or "")
+            ):
+                return False
+            parents = body.get("parents") or []
+            if any(parent_id in allowed_folder_id_set for parent_id in parents):
+                return True
+            next_ids.extend(parents)
+        queue_ids = next_ids
+        depth += 1
+    return False
+
+
+def _fragment_drive_file_metadata(file_id: str) -> dict[str, Any]:
+    if not FRAGMENT_TOOL_DRIVE_FOLDER_ID:
+        raise HTTPException(status_code=500, detail="FRAGMENT_TOOL_DRIVE_FOLDER_ID が未設定です。")
+
+    credentials = _lecture_drive_credentials()
+    resp = requests.get(
+        f"https://www.googleapis.com/drive/v3/files/{quote(file_id, safe='')}",
+        headers={"Authorization": f"Bearer {credentials.token}"},
+        params={
+            "fields": "id,name,mimeType,size,parents,modifiedTime",
+            "supportsAllDrives": "true",
+        },
+        timeout=30,
+    )
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="Drive画像が見つかりません。")
+    if not resp.ok:
+        raise _lecture_drive_error(resp, "fragment image metadata")
+
+    body = resp.json()
+    if not _fragment_drive_is_inside_root(credentials, file_id):
+        raise HTTPException(status_code=404, detail="指定フォルダ内の画像ではありません。")
+    if not str(body.get("mimeType") or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="画像ファイルではありません。")
+    return body
 
 
 def _lecture_bool(value: Any, default: bool = True) -> bool:
@@ -15004,6 +15325,55 @@ async def lecture_tool_sheet_rows():
         raise HTTPException(status_code=500, detail=f"spreadsheet fetch failed: {exc}") from exc
 
 
+@app.get("/fragment-tool/drive-images")
+async def fragment_tool_drive_images(search: str = "", pageToken: str = "", pageSize: int = 100):
+    try:
+        result = _fragment_drive_list_images(search=search, page_token=pageToken, page_size=pageSize)
+        return JSONResponse(
+            {
+                "ok": True,
+                "folderConfigured": bool(FRAGMENT_TOOL_DRIVE_FOLDER_ID),
+                "folderId": FRAGMENT_TOOL_DRIVE_FOLDER_ID,
+                "folderUrl": _fragment_drive_folder_url(),
+                **result,
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Drive画像一覧の取得に失敗しました: {exc}") from exc
+
+
+@app.get("/fragment-tool/drive-images/{file_id}/content")
+async def fragment_tool_drive_image_content(file_id: str):
+    metadata = _fragment_drive_file_metadata(file_id)
+    credentials = _lecture_drive_credentials()
+    resp = requests.get(
+        f"https://www.googleapis.com/drive/v3/files/{quote(file_id, safe='')}",
+        headers={"Authorization": f"Bearer {credentials.token}"},
+        params={
+            "alt": "media",
+            "supportsAllDrives": "true",
+        },
+        timeout=60,
+    )
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="Drive画像が見つかりません。")
+    if not resp.ok:
+        raise _lecture_drive_error(resp, "fragment image download")
+
+    filename = metadata.get("name") or "drive-image"
+    mime_type = metadata.get("mimeType") or resp.headers.get("content-type") or "application/octet-stream"
+    return Response(
+        content=resp.content,
+        media_type=mime_type,
+        headers={
+            "Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}",
+            "Cache-Control": "private, max-age=300",
+        },
+    )
+
+
 async def _lecture_records_from_uploads(
     files: List[UploadFile] = File(...),
     rowIds: List[str] = Form(...),
@@ -15323,6 +15693,7 @@ async def upload_simple_stream(
                             _time_start_minutes(getattr(x, "time", "")),
                         )
                     )
+                    payload = sync_warning_flags(payload)
 
                     payload_dict = (
                         payload.model_dump(exclude_none=True)
@@ -15556,6 +15927,7 @@ async def upload_batch_stream(
                             _time_start_minutes(getattr(x, "time", "")),
                         )
                     )
+                    payload = sync_warning_flags(payload)
 
                     payload_dict = (
                         payload.model_dump(exclude_none=True)
@@ -15662,6 +16034,7 @@ async def render(req: RenderReq, background_tasks: BackgroundTasks):
         event_id = payload.event_id.strip()
     # /render はエディタからの手動保存でのみ呼ばれるので常に manual_override=True
     payload.manual_override = True
+    payload = sync_warning_flags(payload)
 
     payload_dict = (
         payload.model_dump(exclude_none=True)
@@ -15840,6 +16213,7 @@ async def restore_from_json_batch(files: list[UploadFile] = File(...)):
             data = json.loads(text)
 
             payload = DesignJSON.model_validate(data)
+            payload = sync_warning_flags(payload)
 
             payload_dict = (
                 payload.model_dump(exclude_none=True)

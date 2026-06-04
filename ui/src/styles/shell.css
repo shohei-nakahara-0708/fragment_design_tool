@@ -568,6 +568,106 @@ body {
   display: none;
 }
 
+.lecture-tool-drive-picker {
+  display: grid;
+  gap: 12px;
+}
+
+.lecture-tool-drive-picker__toolbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.lecture-tool-drive-picker__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.lecture-tool-drive-picker__meta {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.lecture-tool-drive-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px;
+  max-height: 520px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.lecture-tool-drive-card {
+  display: grid;
+  grid-template-columns: 78px minmax(0, 1fr);
+  gap: 10px;
+  min-height: 104px;
+  padding: 9px;
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.lecture-tool-drive-card--selected {
+  border-color: rgba(34, 197, 94, 0.35);
+  background: rgba(240, 253, 244, 0.78);
+}
+
+.lecture-tool-drive-card__thumb {
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  aspect-ratio: 3 / 4;
+  border-radius: 6px;
+  background: #e2e8f0;
+  color: #64748b;
+  font-size: 10px;
+  font-weight: 950;
+}
+
+.lecture-tool-drive-card__thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #f8fafc;
+}
+
+.lecture-tool-drive-card__body {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+  align-content: start;
+}
+
+.lecture-tool-drive-card__name {
+  overflow: hidden;
+  color: #0f172a;
+  font-size: 13px;
+  font-weight: 950;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lecture-tool-drive-card__meta {
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.lecture-tool-drive-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
 .lecture-tool-image-list {
   display: grid;
   gap: 12px;
@@ -1256,6 +1356,14 @@ body {
     grid-template-columns: 1fr;
   }
 
+  .lecture-tool-drive-picker__toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .lecture-tool-drive-picker__actions {
+    justify-content: flex-start;
+  }
+
   .lecture-tool-candidate {
     min-width: 840px;
     grid-template-columns: 52px 128px 86px 68px 86px 96px minmax(240px, 1fr);
@@ -1287,6 +1395,11 @@ body {
   .lecture-tool-image-card,
   .lecture-tool-rowinfo {
     grid-template-columns: 1fr;
+  }
+
+  .lecture-tool-drive-grid {
+    grid-template-columns: 1fr;
+    max-height: none;
   }
 
   .lecture-tool-image-card__media {
