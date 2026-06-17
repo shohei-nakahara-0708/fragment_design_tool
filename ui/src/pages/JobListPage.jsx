@@ -335,6 +335,16 @@ const ui = {
     background: "#0b1220",
   },
   empty: { padding: 14, color: "#64748b", fontSize: 13, lineHeight: 1.5 },
+  errorBox: {
+    marginBottom: 12,
+    padding: 14,
+    borderRadius: 12,
+    border: "1px solid rgba(239,68,68,0.22)",
+    background: "rgba(254,242,242,0.95)",
+    color: "#991b1b",
+    fontSize: 13,
+    lineHeight: 1.6,
+  },
 
   pager: { marginTop: 14, display: "flex", gap: 10, alignItems: "center" },
 
@@ -389,6 +399,7 @@ export default function JobListPage() {
   const [pageSize] = useState(15);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState("");
   const [debug, setDebug] = useState(false);
 
   // right preview (sticky)
@@ -411,6 +422,9 @@ export default function JobListPage() {
   useEffect(() => {
     const run = async () => {
       setLoading(true);
+      setLoadError("");
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), 10000);
       try {
         const params = new URLSearchParams();
         if (q.trim()) params.set("q", q.trim());
@@ -424,12 +438,15 @@ export default function JobListPage() {
         if (ct) params.set("created_to", ct);
 
         const API_BASE = import.meta.env.VITE_API_BASE || "";
-        const r = await fetch(`${API_BASE}/jobs?${params.toString()}`);
+        const r = await fetch(`${API_BASE}/jobs?${params.toString()}`, {
+          signal: controller.signal,
+        });
         if (!r.ok) throw new Error(await r.text());
         const d = await r.json();
 
         setItems(d.items || []);
         setTotal(d.total || 0);
+        setLoadError("");
 
 
 
@@ -437,8 +454,15 @@ export default function JobListPage() {
         // setPreview((p) => p || ((d.items || [])[0] ? buildPreview((d.items || [])[0]) : null));
       } catch (e) {
         console.error(e);
-        alert(`list failed: ${String(e)}`);
+        setItems([]);
+        setTotal(0);
+        setLoadError(
+          e?.name === "AbortError"
+            ? "一覧取得がタイムアウトしました。ローカル環境からDATABASE_URLのDBへ接続できていない可能性があります。"
+            : `一覧取得に失敗しました。${String(e?.message || e)}`,
+        );
       } finally {
+        window.clearTimeout(timer);
         setLoading(false);
       }
     };
@@ -801,6 +825,12 @@ export default function JobListPage() {
           {/* Left panel */}
           <div style={ui.panel}>
             <div style={ui.panelInner}>
+              {loadError ? (
+                <div style={ui.errorBox}>
+                  {loadError}
+                </div>
+              ) : null}
+
               {loading && groups.length === 0 && (
                 <div style={ui.listGrid}>
                   {Array.from({ length: 6 }).map((_, i) => (
@@ -825,7 +855,7 @@ export default function JobListPage() {
                 </div>
               )}
 
-              {!loading && groups.length === 0 && <div style={ui.empty}>該当なし</div>}
+              {!loading && !loadError && groups.length === 0 && <div style={ui.empty}>該当なし</div>}
 
               <div style={{ ...ui.listGrid, opacity: loading && groups.length > 0 ? 0.5 : 1, transition: "opacity 0.15s ease" }}>
                 {groups.map((group) => (

@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import json
 import os, subprocess
+import posixpath
 import re
 import signal
 import shlex
@@ -20,7 +21,10 @@ from fastapi.responses import FileResponse, JSONResponse,StreamingResponse,Redir
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from playwright.async_api import async_playwright
+try:
+    from playwright.async_api import async_playwright
+except ModuleNotFoundError:
+    async_playwright = None
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pydantic import BaseModel, Field
@@ -60,21 +64,24 @@ import io
 import asyncio
 import queue
 import threading
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
 import logging
 
 logger = logging.getLogger(__name__)
 load_dotenv()
+_pw = None
+_browser = None
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "")
 
 # データベース接続設定
-DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "30"))  # 接続タイムアウト（秒）
+DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "5"))   # 接続タイムアウト（秒）
 DB_QUERY_TIMEOUT = int(os.getenv("DB_QUERY_TIMEOUT", "60"))      # クエリタイムアウト（秒）
-DB_RETRY_ATTEMPTS = int(os.getenv("DB_RETRY_ATTEMPTS", "3"))     # リトライ回数
-DB_RETRY_DELAY = float(os.getenv("DB_RETRY_DELAY", "2.0"))        # リトライ間隔（秒）
+DB_RETRY_ATTEMPTS = int(os.getenv("DB_RETRY_ATTEMPTS", "1"))     # リトライ回数
+DB_RETRY_DELAY = float(os.getenv("DB_RETRY_DELAY", "0.5"))        # リトライ間隔（秒）
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -109,6 +116,24 @@ DB_PATH = DATA_DIR / "index.sqlite"
 
 EXPORT_DIR = DATA_DIR / "_exports"
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+FRAGMENT_SLIDE_TEMPLATE_DIR = APP_DIR / "fragment_slide_template"
+FRAGMENT_SLIDE_OUTPUT_DIR = DATA_DIR / "fragment_slide_results"
+FRAGMENT_SLIDE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+FRAGMENT_SLIDE_BG_SIZE = (2048, 1125)
+FRAGMENT_SLIDE_POSTER_SIZE = (1024, 768)
+FRAGMENT_SLIDE_THUMB_SIZE = (200, 150)
+FRAGMENT_SLIDE_JPEG_QUALITY = int(os.getenv("FRAGMENT_SLIDE_JPEG_QUALITY", "90"))
+FRAGMENT_SLIDE_MAX_PAGES = max(1, int(os.getenv("FRAGMENT_SLIDE_MAX_PAGES", "300")))
+FRAGMENT_SLIDE_MAX_PDF_BYTES = max(1, int(os.getenv("FRAGMENT_SLIDE_MAX_PDF_BYTES", str(250 * 1024 * 1024))))
+FRAGMENT_SLIDE_MAX_BATCH_FILES = max(1, int(os.getenv("FRAGMENT_SLIDE_MAX_BATCH_FILES", "20")))
+FRAGMENT_SLIDE_MAX_BATCH_PAGES = max(1, int(os.getenv("FRAGMENT_SLIDE_MAX_BATCH_PAGES", "1000")))
+FRAGMENT_SLIDE_RESULT_TTL_SEC = max(3600, int(os.getenv("FRAGMENT_SLIDE_RESULT_TTL_SEC", str(24 * 60 * 60))))
+FOLDER_ZIP_MAX_FILES = max(1, int(os.getenv("FOLDER_ZIP_MAX_FILES", "3000")))
+FOLDER_ZIP_MAX_TOTAL_BYTES = max(1, int(os.getenv("FOLDER_ZIP_MAX_TOTAL_BYTES", str(1024 * 1024 * 1024))))
+REQUIRE_DB_INIT = (os.getenv("REQUIRE_DB_INIT") or "").strip().lower() in {"1", "true", "yes", "on"}
+SKIP_DB_INIT = (os.getenv("SKIP_DB_INIT") or "").strip().lower() in {"1", "true", "yes", "on"}
+SKIP_PLAYWRIGHT_STARTUP = (os.getenv("SKIP_PLAYWRIGHT_STARTUP") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 MAX_HEIGHT = 2000
 BASE_VIEWPORT = {"width": 600, "height": 800}
@@ -175,6 +200,16 @@ def normalize_medical_terms(text: str) -> str:
             result = re.sub(pattern, standard, result)
 
     return result
+
+
+def require_async_playwright():
+    if async_playwright is None:
+        raise RuntimeError(
+            "Playwright is not installed. Run `pip install -r requirements.txt` and "
+            "`python -m playwright install chromium` in the api environment."
+        )
+    return async_playwright
+
 
 ORG_CANON = {
     "MSD": "MSD株式会社",
@@ -2306,7 +2341,7 @@ async def apply_precise_typeset_initial(payload: DesignJSON, page=None) -> Desig
                 await ctx.close()
         else:
             # フォールバック: グローバルブラウザが未初期化の場合のみ新規起動
-            async with async_playwright() as p:
+            async with require_async_playwright()() as p:
                 browser = await p.chromium.launch()
                 pg = await browser.new_page(viewport=BASE_VIEWPORT)
                 try:
@@ -13440,7 +13475,7 @@ async def render_png(payload: DesignJSON, out_path: Path, debug_html_path: Path)
     if _cached_template is None:
         _cached_template = TEMPLATE_PATH.read_text(encoding="utf-8")
 
-    async with async_playwright() as p:
+    async with require_async_playwright()() as p:
         browser = await p.chromium.launch(
             args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
@@ -13871,25 +13906,30 @@ async def database_exception_handler(request: Request, exc: OperationalError):
 async def startup():
     global _cached_template, _pw, _browser
 
-    # データベース初期化（エラーハンドリング付き）
-    try:
-        logger.info("Starting database initialization...")
-        init_db()
-        logger.info("Database initialization completed successfully")
-    except OperationalError as e:
-        error_msg = f"Database connection failed during startup: {e}"
-        logger.error(error_msg)
-        if "timed out" in str(e).lower():
-            logger.error("This appears to be a connection timeout issue. Please check:")
-            logger.error("1. Network connectivity to the database server")
-            logger.error("2. Database server status")
-            logger.error("3. Firewall settings")
-            logger.error("4. DATABASE_URL configuration")
-        raise RuntimeError(error_msg) from e
-    except Exception as e:
-        error_msg = f"Unexpected error during database initialization: {e}"
-        logger.error(error_msg)
-        raise RuntimeError(error_msg) from e
+    if SKIP_DB_INIT:
+        logger.warning("Skipping database initialization because SKIP_DB_INIT is enabled.")
+    elif not REQUIRE_DB_INIT:
+        logger.warning("Skipping database initialization on startup. Set REQUIRE_DB_INIT=1 to enable it.")
+    else:
+        # データベース初期化（エラーハンドリング付き）
+        try:
+            logger.info("Starting database initialization...")
+            init_db()
+            logger.info("Database initialization completed successfully")
+        except OperationalError as e:
+            error_msg = f"Database connection failed during startup: {e}"
+            logger.error(error_msg)
+            if "timed out" in str(e).lower():
+                logger.error("This appears to be a connection timeout issue. Please check:")
+                logger.error("1. Network connectivity to the database server")
+                logger.error("2. Database server status")
+                logger.error("3. Firewall settings")
+                logger.error("4. DATABASE_URL configuration")
+            raise RuntimeError(error_msg) from e
+        except Exception as e:
+            error_msg = f"Unexpected error during database initialization: {e}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg) from e
 
     if not TEMPLATE_PATH.exists():
         raise RuntimeError(f"template.html not found: {TEMPLATE_PATH}")
@@ -13900,15 +13940,20 @@ async def startup():
     if browsers_path:
         Path(browsers_path).mkdir(parents=True, exist_ok=True)
 
-    # Playwright を1回だけ起動して使い回す
-    _pw = await async_playwright().start()
-    try:
-        os.environ.setdefault("LECTURE_TOOL_CHROME_EXECUTABLE_PATH", _pw.chromium.executable_path)
-    except Exception as e:
-        print("[startup chromium executable path warning]", e)
-    _browser = await _pw.chromium.launch(
-        args=["--no-sandbox", "--disable-dev-shm-usage"],
-    )
+    if SKIP_PLAYWRIGHT_STARTUP:
+        logger.warning("Skipping Playwright startup because SKIP_PLAYWRIGHT_STARTUP is enabled.")
+    elif async_playwright is None:
+        logger.warning("Playwright is not installed; browser rendering endpoints are disabled.")
+    else:
+        # Playwright を1回だけ起動して使い回す
+        _pw = await require_async_playwright()().start()
+        try:
+            os.environ.setdefault("LECTURE_TOOL_CHROME_EXECUTABLE_PATH", _pw.chromium.executable_path)
+        except Exception as e:
+            print("[startup chromium executable path warning]", e)
+        _browser = await _pw.chromium.launch(
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
 
     # Ensure Chromium exists
     # try:
@@ -14960,6 +15005,1737 @@ def _lecture_generate_packages(
         drive_errors,
         vault_registrations,
         vault_errors,
+    )
+
+
+def _fragment_slide_safe_presentation_id(value: str) -> str:
+    raw = normalize_space(value or "")
+    raw = re.sub(r"\.zip$", "", raw, flags=re.IGNORECASE)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._-")
+    if not safe:
+        raise ValueError("Presentation IDを入力してください。")
+    return safe
+
+
+def _fragment_slide_template_files() -> dict[str, bytes]:
+    paths = {
+        "css/style.css": FRAGMENT_SLIDE_TEMPLATE_DIR / "css" / "style.css",
+        "index.html": FRAGMENT_SLIDE_TEMPLATE_DIR / "index.html",
+        "js/script.js": FRAGMENT_SLIDE_TEMPLATE_DIR / "js" / "script.js",
+    }
+    missing = [str(path) for path in paths.values() if not path.exists()]
+    if missing:
+        raise RuntimeError(f"Fragment ZIPテンプレートが見つかりません: {', '.join(missing)}")
+    return {arcname: path.read_bytes().removesuffix(b"\n") for arcname, path in paths.items()}
+
+
+def _fragment_slide_image_bytes(image: Image.Image, *, image_format: str, **save_options) -> bytes:
+    output = io.BytesIO()
+    image.save(output, format=image_format, **save_options)
+    return output.getvalue()
+
+
+def _fragment_slide_extract_page_title(page, page_number: int) -> str:
+    lines: list[dict[str, Any]] = []
+    for block in page.get_text("dict").get("blocks", []):
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            text = normalize_space("".join(str(span.get("text") or "") for span in spans))
+            if not text or not spans:
+                continue
+            bbox = line.get("bbox") or (0, 0, 0, 0)
+            lines.append(
+                {
+                    "text": text,
+                    "bbox": tuple(float(value) for value in bbox),
+                    "size": max(float(span.get("size") or 0) for span in spans),
+                }
+            )
+
+    if not lines:
+        return ""
+
+    if page_number == 1:
+        return "表紙"
+
+    centered_large_lines = [
+        line
+        for line in lines
+        if line["size"] >= 32
+        and page.rect.height * 0.2 <= (line["bbox"][1] + line["bbox"][3]) / 2 <= page.rect.height * 0.75
+        and line["bbox"][0] <= page.rect.width * 0.75
+        and line["bbox"][2] >= page.rect.width * 0.25
+    ]
+    if centered_large_lines:
+        max_centered_size = max(line["size"] for line in centered_large_lines)
+        title_lines = sorted(
+            (line for line in centered_large_lines if line["size"] >= max_centered_size - 0.5),
+            key=lambda line: (line["bbox"][1], line["bbox"][0]),
+        )
+        return " ".join(dict.fromkeys(line["text"] for line in title_lines))
+
+    top_lines = [
+        line
+        for line in lines
+        if line["bbox"][1] <= page.rect.height * 0.16
+        and line["bbox"][0] <= page.rect.width * 0.82
+    ]
+    title_pool = top_lines or lines
+    max_size = max(line["size"] for line in title_pool)
+    title_size_threshold = max(16, max_size * 0.68)
+    main_title_top = min(
+        line["bbox"][1]
+        for line in title_pool
+        if line["size"] >= max_size - 0.5
+    )
+    title_lines = sorted(
+        (
+            line
+            for line in title_pool
+            if line["size"] >= max_size - 0.5
+            or (
+                line["size"] >= title_size_threshold
+                and line["bbox"][1] <= main_title_top
+            )
+        ),
+        key=lambda line: (line["bbox"][1], line["bbox"][0]),
+    )
+
+    unique_texts: list[str] = []
+    for line in title_lines:
+        if line["text"] not in unique_texts:
+            unique_texts.append(line["text"])
+    return " ".join(unique_texts)
+
+
+def _fragment_slide_extract_titles(pdf_bytes: bytes) -> list[dict[str, Any]]:
+    document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        page_count = document.page_count
+        if page_count < 1:
+            raise ValueError("PDFにページがありません。")
+        if page_count > FRAGMENT_SLIDE_MAX_PAGES:
+            raise ValueError(f"PDFは最大{FRAGMENT_SLIDE_MAX_PAGES}ページまでです。")
+        return [
+            {
+                "page": index + 1,
+                "title": _fragment_slide_extract_page_title(document[index], index + 1),
+            }
+            for index in range(page_count)
+        ]
+    finally:
+        document.close()
+
+
+def _fragment_slide_render_page(page) -> tuple[bytes, bytes, bytes]:
+    width, height = FRAGMENT_SLIDE_BG_SIZE
+    rect = page.rect
+    if not rect.width or not rect.height:
+        raise RuntimeError("PDFページサイズを取得できません。")
+
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(width / rect.width, height / rect.height),
+        colorspace=fitz.csRGB,
+        alpha=False,
+    )
+    bg = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    if bg.size != FRAGMENT_SLIDE_BG_SIZE:
+        bg = bg.resize(FRAGMENT_SLIDE_BG_SIZE, Image.Resampling.LANCZOS)
+
+    bg_bytes = _fragment_slide_image_bytes(
+        bg,
+        image_format="JPEG",
+        quality=FRAGMENT_SLIDE_JPEG_QUALITY,
+        optimize=True,
+        subsampling=0,
+        dpi=(150, 150),
+    )
+
+    poster = Image.new("RGB", FRAGMENT_SLIDE_POSTER_SIZE, "black")
+    poster_image = ImageOps.contain(bg, FRAGMENT_SLIDE_POSTER_SIZE, Image.Resampling.LANCZOS)
+    poster.paste(
+        poster_image,
+        (
+            (FRAGMENT_SLIDE_POSTER_SIZE[0] - poster_image.width) // 2,
+            (FRAGMENT_SLIDE_POSTER_SIZE[1] - poster_image.height) // 2,
+        ),
+    )
+    poster_bytes = _fragment_slide_image_bytes(poster, image_format="PNG", optimize=True)
+
+    thumb = poster.resize(FRAGMENT_SLIDE_THUMB_SIZE, Image.Resampling.LANCZOS)
+    thumb_bytes = _fragment_slide_image_bytes(thumb, image_format="PNG", optimize=True)
+    return bg_bytes, poster_bytes, thumb_bytes
+
+
+def _fragment_slide_zip_bytes(
+    *,
+    template_files: dict[str, bytes],
+    bg_bytes: bytes,
+    poster_bytes: bytes,
+    thumb_bytes: bytes,
+) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("css/", b"")
+        archive.writestr("css/style.css", template_files["css/style.css"])
+        archive.writestr("images/", b"")
+        archive.writestr("images/bg.jpg", bg_bytes)
+        archive.writestr("index.html", template_files["index.html"])
+        archive.writestr("js/", b"")
+        archive.writestr("js/script.js", template_files["js/script.js"])
+        archive.writestr("poster.png", poster_bytes)
+        archive.writestr("thumb.png", thumb_bytes)
+    return output.getvalue()
+
+
+def _pdf_document_zip_safe_filename(value: str) -> str:
+    raw = normalize_space(value or "")
+    raw = re.sub(r"\.zip$", "", raw, flags=re.IGNORECASE)
+    safe = re.sub(r"[\x00-\x1f<>:\"/\\|?*]+", "_", raw).strip(" ._")
+    if not safe or safe in {".", ".."}:
+        raise ValueError("ZIPファイル名を入力してください。")
+    return safe
+
+
+def _pdf_document_zip_preview_images(pdf_bytes: bytes) -> tuple[bytes, bytes, int]:
+    document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        page_count = document.page_count
+        if page_count < 1:
+            raise ValueError("PDFにページがありません。")
+
+        page = document[0]
+        rect = page.rect
+        if not rect.width or not rect.height:
+            raise RuntimeError("PDFページサイズを取得できません。")
+
+        scale = min(
+            FRAGMENT_SLIDE_POSTER_SIZE[0] / rect.width,
+            FRAGMENT_SLIDE_POSTER_SIZE[1] / rect.height,
+        )
+        render_scale = scale * 2
+        pix = page.get_pixmap(
+            matrix=fitz.Matrix(render_scale, render_scale),
+            colorspace=fitz.csRGB,
+            alpha=False,
+        )
+        rendered = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        preview = ImageOps.contain(rendered, FRAGMENT_SLIDE_POSTER_SIZE, Image.Resampling.LANCZOS)
+
+        poster = Image.new("RGB", FRAGMENT_SLIDE_POSTER_SIZE, "black")
+        poster.paste(
+            preview,
+            (
+                (FRAGMENT_SLIDE_POSTER_SIZE[0] - preview.width) // 2,
+                (FRAGMENT_SLIDE_POSTER_SIZE[1] - preview.height) // 2,
+            ),
+        )
+        poster_bytes = _fragment_slide_image_bytes(poster, image_format="PNG", optimize=True)
+
+        thumb = poster.resize(FRAGMENT_SLIDE_THUMB_SIZE, Image.Resampling.LANCZOS)
+        thumb_bytes = _fragment_slide_image_bytes(thumb, image_format="PNG", optimize=True)
+        return poster_bytes, thumb_bytes, page_count
+    finally:
+        document.close()
+
+
+def _pdf_document_zip_bytes(pdf_bytes: bytes) -> tuple[bytes, int]:
+    poster_bytes, thumb_bytes, page_count = _pdf_document_zip_preview_images(pdf_bytes)
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("pdf.pdf", pdf_bytes, compress_type=zipfile.ZIP_DEFLATED)
+        archive.writestr("poster.png", poster_bytes, compress_type=zipfile.ZIP_DEFLATED)
+        archive.writestr("thumb.png", thumb_bytes, compress_type=zipfile.ZIP_STORED)
+    return output.getvalue(), page_count
+
+
+def _pdf_document_zip_generate(pdf_bytes: bytes, zip_filename: str) -> tuple[Path, int, str]:
+    safe_filename = _pdf_document_zip_safe_filename(zip_filename)
+    zip_bytes, page_count = _pdf_document_zip_bytes(pdf_bytes)
+
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    zip_path = Path(temp.name)
+    temp.close()
+    try:
+        zip_path.write_bytes(zip_bytes)
+        return zip_path, page_count, safe_filename
+    except Exception:
+        delete_file_quietly(zip_path)
+        raise
+
+
+def _pdf_document_zip_result_url(session_id: str, filename: str) -> str:
+    return f"/pdf-document-zip-tool/results/{session_id}/{quote(filename)}?download=1"
+
+
+def _pdf_document_zip_generate_batch_artifacts(items: list[tuple[bytes, str]]) -> dict[str, Any]:
+    if not items:
+        raise ValueError("PDFを1件以上アップロードしてください。")
+    if len(items) > FRAGMENT_SLIDE_MAX_BATCH_FILES:
+        raise ValueError(f"PDFは一度に最大{FRAGMENT_SLIDE_MAX_BATCH_FILES}件までです。")
+
+    safe_filenames = [_pdf_document_zip_safe_filename(zip_filename) for _, zip_filename in items]
+    safe_filename_counts = Counter(filename.casefold() for filename in safe_filenames)
+    duplicate_filenames = sorted({
+        filename
+        for filename in safe_filenames
+        if safe_filename_counts[filename.casefold()] > 1
+    })
+    if duplicate_filenames:
+        raise ValueError(f"ZIPファイル名が重複しています: {', '.join(duplicate_filenames)}")
+
+    _fragment_slide_cleanup_old_results()
+    session_id = uuid.uuid4().hex
+    result_dir = FRAGMENT_SLIDE_OUTPUT_DIR / session_id
+    result_dir.mkdir(parents=True, exist_ok=False)
+
+    individual_filenames = [f"{safe_filename}.zip" for safe_filename in safe_filenames]
+    individual_filename_keys = {filename.casefold() for filename in individual_filenames}
+    batch_base = "pdf-document-packages"
+    batch_filename = f"{batch_base}.zip"
+    suffix = 2
+    while batch_filename.casefold() in individual_filename_keys:
+        batch_filename = f"{batch_base}_{suffix}.zip"
+        suffix += 1
+    batch_path = result_dir / batch_filename
+
+    try:
+        results = []
+        total_pages = 0
+        with zipfile.ZipFile(batch_path, "w", compression=zipfile.ZIP_STORED) as batch_bundle:
+            for pdf_bytes, safe_filename, individual_filename in zip(
+                (pdf_bytes for pdf_bytes, _ in items),
+                safe_filenames,
+                individual_filenames,
+            ):
+                zip_bytes, page_count = _pdf_document_zip_bytes(pdf_bytes)
+                total_pages += page_count
+
+                individual_path = result_dir / individual_filename
+                individual_path.write_bytes(zip_bytes)
+                batch_bundle.writestr(individual_filename, zip_bytes)
+                results.append(
+                    {
+                        "zipName": safe_filename,
+                        "filename": individual_filename,
+                        "pageCount": page_count,
+                        "size": individual_path.stat().st_size,
+                        "downloadUrl": _pdf_document_zip_result_url(session_id, individual_filename),
+                    }
+                )
+
+        return {
+            "ok": True,
+            "sessionId": session_id,
+            "pdfCount": len(items),
+            "pageCount": total_pages,
+            "batch": {
+                "filename": batch_filename,
+                "size": batch_path.stat().st_size,
+                "downloadUrl": _pdf_document_zip_result_url(session_id, batch_filename),
+            },
+            "results": results,
+        }
+    except Exception:
+        shutil.rmtree(result_dir, ignore_errors=True)
+        raise
+
+
+def _folder_zip_safe_filename(value: str) -> str:
+    raw = normalize_space(value or "")
+    raw = re.sub(r"\.zip$", "", raw, flags=re.IGNORECASE)
+    safe = re.sub(r"[\x00-\x1f<>:\"/\\|?*]+", "_", raw).strip(" ._")
+    if not safe or safe in {".", ".."}:
+        raise ValueError("ZIPファイル名を入力してください。")
+    return safe
+
+
+def _folder_zip_clean_relative_path(value: str) -> str:
+    text = str(value or "").replace("\\", "/").strip()
+    text = re.sub(r"/+", "/", text).lstrip("/")
+    normalized = posixpath.normpath(text)
+    if normalized in {"", "."} or normalized.startswith("../") or normalized == "..":
+        raise ValueError("フォルダ内のファイルパスが不正です。")
+    return normalized
+
+
+def _folder_zip_is_ignored(path: str) -> bool:
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        return True
+    ignored_dirs = {
+        "__macosx",
+        ".appledouble",
+        ".fseventsd",
+        ".spotlight-v100",
+        ".temporaryitems",
+        ".trashes",
+    }
+    if any(part.lower() in ignored_dirs for part in parts):
+        return True
+    ignored_files = {
+        ".ds_store",
+        ".localized",
+        "desktop.ini",
+        "icon\r",
+        "thumbs.db",
+    }
+    name = parts[-1]
+    return name.lower() in ignored_files or name.startswith("._")
+
+
+def _folder_zip_common_root(paths: list[str]) -> str:
+    if not paths:
+        return ""
+    first_parts = paths[0].split("/")
+    if len(first_parts) <= 1:
+        return ""
+    root = first_parts[0]
+    if all(path.split("/")[0] == root and len(path.split("/")) > 1 for path in paths):
+        return root
+    return ""
+
+
+def _folder_zip_detect_mode(paths: list[str]) -> str:
+    names = [path.rsplit("/", 1)[-1].lower() for path in paths]
+    if any(re.search(r"-thumb\.jpe?g$", name) for name in names):
+        return "include_root"
+    if any(name == "thumb.png" for name in names):
+        return "contents_only"
+    return "contents_only"
+
+
+def _folder_zip_artifact(
+    items: list[tuple[str, bytes]],
+    *,
+    zip_filename: str,
+    mode: str,
+    root_name: str,
+) -> tuple[Path, str, str, int]:
+    safe_filename = _folder_zip_safe_filename(zip_filename)
+    if mode not in {"auto", "include_root", "contents_only"}:
+        raise ValueError("ZIP方法が不正です。")
+
+    cleaned_items = [
+        (_folder_zip_clean_relative_path(relative_path), data)
+        for relative_path, data in items
+        if data
+    ]
+    cleaned_items = [
+        (relative_path, data)
+        for relative_path, data in cleaned_items
+        if not _folder_zip_is_ignored(relative_path)
+    ]
+    if not cleaned_items:
+        raise ValueError("ZIP化できるファイルがありません。")
+    if len(cleaned_items) > FOLDER_ZIP_MAX_FILES:
+        raise ValueError(f"ファイル数は最大{FOLDER_ZIP_MAX_FILES}件までです。")
+
+    total_bytes = sum(len(data) for _, data in cleaned_items)
+    if total_bytes > FOLDER_ZIP_MAX_TOTAL_BYTES:
+        raise ValueError(f"合計サイズは最大{FOLDER_ZIP_MAX_TOTAL_BYTES // (1024 * 1024)}MBまでです。")
+
+    paths = [relative_path for relative_path, _ in cleaned_items]
+    common_root = _folder_zip_common_root(paths)
+    resolved_mode = _folder_zip_detect_mode(paths) if mode == "auto" else mode
+    fallback_root = _folder_zip_safe_filename(root_name or common_root or safe_filename)
+
+    used_arcnames: set[str] = set()
+    output = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    zip_path = Path(output.name)
+    output.close()
+    try:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for relative_path, data in cleaned_items:
+                arcname = relative_path
+                if resolved_mode == "contents_only" and common_root:
+                    arcname = relative_path[len(common_root) + 1 :]
+                elif resolved_mode == "include_root" and not common_root:
+                    arcname = f"{fallback_root}/{relative_path}"
+
+                arcname = _folder_zip_clean_relative_path(arcname)
+                arcname_key = arcname.casefold()
+                if arcname_key in used_arcnames:
+                    raise ValueError(f"ZIP内のパスが重複しています: {arcname}")
+                used_arcnames.add(arcname_key)
+                archive.writestr(arcname, data)
+        return zip_path, safe_filename, resolved_mode, len(cleaned_items)
+    except Exception:
+        delete_file_quietly(zip_path)
+        raise
+
+
+def _folder_zip_group_items(items: list[tuple[str, bytes]]) -> dict[str, list[tuple[str, bytes]]]:
+    grouped: dict[str, list[tuple[str, bytes]]] = {}
+    for relative_path, data in items:
+        cleaned_path = _folder_zip_clean_relative_path(relative_path)
+        parts = cleaned_path.split("/")
+        if len(parts) <= 1:
+            raise ValueError("フォルダごと追加してください。")
+        grouped.setdefault(parts[0], []).append((cleaned_path, data))
+    if not grouped:
+        raise ValueError("ZIP化できるフォルダがありません。")
+    return grouped
+
+
+def _folder_zip_result_url(session_id: str, filename: str) -> str:
+    return f"/folder-zip-tool/results/{session_id}/{quote(filename)}?download=1"
+
+
+def _folder_zip_generate_batch_artifacts(
+    items: list[tuple[str, bytes]],
+    *,
+    mode: str,
+    folder_modes: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    if mode not in {"auto", "include_root", "contents_only"}:
+        raise ValueError("ZIP方法が不正です。")
+    folder_modes = folder_modes or {}
+    invalid_modes = sorted({
+        value
+        for value in folder_modes.values()
+        if value not in {"auto", "include_root", "contents_only"}
+    })
+    if invalid_modes:
+        raise ValueError("フォルダごとのZIP方法が不正です。")
+
+    grouped_items = _folder_zip_group_items(items)
+    safe_filenames = [_folder_zip_safe_filename(root_name) for root_name in grouped_items]
+    safe_filename_counts = Counter(filename.casefold() for filename in safe_filenames)
+    duplicate_filenames = sorted({
+        filename
+        for filename in safe_filenames
+        if safe_filename_counts[filename.casefold()] > 1
+    })
+    if duplicate_filenames:
+        raise ValueError(f"フォルダ名から作るZIPファイル名が重複しています: {', '.join(duplicate_filenames)}")
+
+    _fragment_slide_cleanup_old_results()
+    session_id = uuid.uuid4().hex
+    result_dir = FRAGMENT_SLIDE_OUTPUT_DIR / session_id
+    result_dir.mkdir(parents=True, exist_ok=False)
+
+    results: list[dict[str, Any]] = []
+    batch_filename = "folder-zip-packages.zip"
+    batch_path = result_dir / batch_filename
+    try:
+        with zipfile.ZipFile(batch_path, "w", compression=zipfile.ZIP_STORED) as batch_archive:
+            for root_name, root_items in grouped_items.items():
+                root_mode = folder_modes.get(root_name, mode)
+                zip_path, safe_filename, resolved_mode, file_count = _folder_zip_artifact(
+                    root_items,
+                    zip_filename=root_name,
+                    mode=root_mode,
+                    root_name=root_name,
+                )
+                target = result_dir / f"{safe_filename}.zip"
+                try:
+                    shutil.move(str(zip_path), target)
+                except Exception:
+                    delete_file_quietly(zip_path)
+                    raise
+
+                zip_bytes = target.read_bytes()
+                batch_archive.writestr(target.name, zip_bytes)
+                results.append({
+                    "rootName": root_name,
+                    "filename": target.name,
+                    "size": len(zip_bytes),
+                    "fileCount": file_count,
+                    "mode": resolved_mode,
+                    "downloadUrl": _folder_zip_result_url(session_id, target.name),
+                })
+
+        return {
+            "ok": True,
+            "sessionId": session_id,
+            "folderCount": len(results),
+            "fileCount": sum(item["fileCount"] for item in results),
+            "batch": {
+                "filename": batch_filename,
+                "size": batch_path.stat().st_size,
+                "downloadUrl": _folder_zip_result_url(session_id, batch_filename),
+            },
+            "results": results,
+        }
+    except Exception:
+        shutil.rmtree(result_dir, ignore_errors=True)
+        raise
+
+
+PPT_VIDEO_SCREEN_SIZE = (1024, 768)
+PPT_VIDEO_THUMB_SIZE = (200, 150)
+PPT_VIDEO_RENDER_SIZE = 1200
+PPT_VIDEO_MAX_FILE_BYTES = max(1, int(os.getenv("PPT_VIDEO_MAX_FILE_BYTES", str(3 * 1024 * 1024 * 1024))))
+PPT_VIDEO_MAX_SELECTED_SLIDES = max(1, int(os.getenv("PPT_VIDEO_MAX_SELECTED_SLIDES", "50")))
+PPT_VIDEO_NS = {
+    "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+}
+PPT_VIDEO_RESET_CSS = '@charset "UTF-8";html,body,div,span,object,iframe,h1,h2,h3,h4,h5,h6,p,blockquote,pre,abbr,address,cite,code,del,dfn,em,img,ins,kbd,q,samp,small,strong,sub,sup,var,b,i,dl,dt,dd,ol,ul,li,fieldset,form,label,legend,table,caption,tbody,tfoot,thead,tr,th,td,article,aside,canvas,details,figcaption,figure,footer,header,hgroup,menu,nav,section,summary,time,mark,audio,video{margin:0;padding:0;border:0;outline:0;font-size:100%;vertical-align:baseline;background:transparent}body{line-height:1}article,aside,details,figcaption,figure,footer,header,hgroup,menu,nav,section{display:block}blockquote,q{quotes:none}blockquote:before,blockquote:after,q:before,q:after{content:none}a{margin:0;padding:0;font-size:100%;vertical-align:baseline;background:transparent}ins{background-color:#ff9;color:#000;text-decoration:none}mark{background-color:#ff9;color:#000;font-style:italic;font-weight:bold}del{text-decoration:line-through}abbr[title],dfn[title]{border-bottom:1px dotted;cursor:help}table{border-collapse:collapse;border-spacing:0}hr{display:block;height:1px;border:0;border-top:1px solid #ccc;margin:1em 0;padding:0}input,select{vertical-align:middle}ul{list-style:none}ol{list-style:none}img{vertical-align:top;font-size:0;line-height:0}body,button,input,select,textarea{font-family:sans-serif}em{font-style:normal}\n'
+
+
+def _ppt_video_safe_base_name(value: str) -> str:
+    raw = normalize_space(value or "")
+    raw = re.sub(r"\.zip$", "", raw, flags=re.IGNORECASE)
+    safe = re.sub(r"[\x00-\x1f<>:\"/\\|?*]+", "_", raw).strip(" ._")
+    if not safe or safe in {".", ".."}:
+        raise ValueError("ファイル名を入力してください。")
+    return safe
+
+
+def _ppt_video_normalize_target(base_dir: str, target: str) -> str:
+    return posixpath.normpath(posixpath.join(base_dir, target)).lstrip("/")
+
+
+def _ppt_video_relationships(archive: zipfile.ZipFile, rels_path: str) -> dict[str, dict[str, str]]:
+    if rels_path not in archive.namelist():
+        return {}
+    root = ET.fromstring(archive.read(rels_path))
+    return {
+        rel.attrib.get("Id", ""): {
+            "type": rel.attrib.get("Type", ""),
+            "target": rel.attrib.get("Target", ""),
+        }
+        for rel in root
+        if rel.attrib.get("Id")
+    }
+
+
+def _ppt_video_slide_size(archive: zipfile.ZipFile) -> tuple[int, int]:
+    root = ET.fromstring(archive.read("ppt/presentation.xml"))
+    size = root.find("p:sldSz", PPT_VIDEO_NS)
+    if size is None:
+        return 12192000, 6858000
+    return int(size.attrib.get("cx", "12192000")), int(size.attrib.get("cy", "6858000"))
+
+
+def _ppt_video_ordered_slides(archive: zipfile.ZipFile) -> list[dict[str, Any]]:
+    pres = ET.fromstring(archive.read("ppt/presentation.xml"))
+    pres_rels = _ppt_video_relationships(archive, "ppt/_rels/presentation.xml.rels")
+    slides = []
+    for index, slide_id in enumerate(pres.findall(".//p:sldIdLst/p:sldId", PPT_VIDEO_NS), start=1):
+        rid = slide_id.attrib.get(f"{{{PPT_VIDEO_NS['r']}}}id", "")
+        target = pres_rels.get(rid, {}).get("target", "")
+        if not target:
+            continue
+        slide_path = _ppt_video_normalize_target("ppt", target)
+        match = re.search(r"slide(\d+)\.xml$", slide_path)
+        slides.append({
+            "page": index,
+            "slidePath": slide_path,
+            "slideNumber": int(match.group(1)) if match else index,
+            "relationshipId": rid,
+        })
+    return slides
+
+
+def _ppt_video_rel_path(slide_path: str) -> str:
+    name = posixpath.basename(slide_path)
+    return posixpath.join(posixpath.dirname(slide_path), "_rels", f"{name}.rels")
+
+
+def _ppt_video_attr_rel_id(element, local_name: str) -> str:
+    for key, value in element.attrib.items():
+        if key.endswith(f"}}{local_name}") and value.startswith("rId"):
+            return value
+    return ""
+
+
+def _ppt_video_shape_rect(pic) -> dict[str, int] | None:
+    xfrm = pic.find(".//a:xfrm", PPT_VIDEO_NS)
+    if xfrm is None:
+        return None
+    off = xfrm.find("a:off", PPT_VIDEO_NS)
+    ext = xfrm.find("a:ext", PPT_VIDEO_NS)
+    if off is None or ext is None:
+        return None
+    return {
+        "x": int(off.attrib.get("x", "0")),
+        "y": int(off.attrib.get("y", "0")),
+        "cx": int(ext.attrib.get("cx", "0")),
+        "cy": int(ext.attrib.get("cy", "0")),
+    }
+
+
+def _ppt_video_slide_videos(archive: zipfile.ZipFile, slide_path: str) -> list[dict[str, Any]]:
+    rels_path = _ppt_video_rel_path(slide_path)
+    rels = _ppt_video_relationships(archive, rels_path)
+    slide = ET.fromstring(archive.read(slide_path))
+    base_dir = posixpath.dirname(slide_path)
+    videos = []
+    seen_targets: set[str] = set()
+    for pic in slide.findall(".//p:pic", PPT_VIDEO_NS):
+        media_rel_ids: list[str] = []
+        poster_rel_id = ""
+        for element in pic.iter():
+            local = element.tag.rsplit("}", 1)[-1]
+            if local in {"videoFile", "media"}:
+                rid = _ppt_video_attr_rel_id(element, "link") or _ppt_video_attr_rel_id(element, "embed")
+                if rid:
+                    media_rel_ids.append(rid)
+            elif local == "blip" and not poster_rel_id:
+                poster_rel_id = _ppt_video_attr_rel_id(element, "embed")
+
+        media_path = ""
+        for rid in media_rel_ids:
+            rel = rels.get(rid, {})
+            target = rel.get("target", "")
+            if target and re.search(r"\.(mp4|m4v|mov)$", target, re.IGNORECASE):
+                media_path = _ppt_video_normalize_target(base_dir, target)
+                break
+        if not media_path or media_path in seen_targets:
+            continue
+        seen_targets.add(media_path)
+
+        rect = _ppt_video_shape_rect(pic)
+        if not rect:
+            continue
+        cnv = pic.find("./p:nvPicPr/p:cNvPr", PPT_VIDEO_NS)
+        poster_path = ""
+        if poster_rel_id and rels.get(poster_rel_id, {}).get("target"):
+            poster_path = _ppt_video_normalize_target(base_dir, rels[poster_rel_id]["target"])
+        videos.append({
+            "shapeId": cnv.attrib.get("id", "") if cnv is not None else "",
+            "shapeName": cnv.attrib.get("name", "") if cnv is not None else "",
+            "mediaPath": media_path,
+            "posterPath": poster_path,
+            "rect": rect,
+        })
+    return videos
+
+
+def _ppt_video_analyze_file(pptx_path: Path) -> dict[str, Any]:
+    with zipfile.ZipFile(pptx_path) as archive:
+        slide_size = _ppt_video_slide_size(archive)
+        slides = []
+        for slide in _ppt_video_ordered_slides(archive):
+            videos = _ppt_video_slide_videos(archive, slide["slidePath"])
+            if not videos:
+                continue
+            slides.append({
+                "page": slide["page"],
+                "slideNumber": slide["slideNumber"],
+                "videoCount": len(videos),
+                "videos": [
+                    {
+                        "shapeName": video["shapeName"],
+                        "mediaName": posixpath.basename(video["mediaPath"]),
+                        "rect": video["rect"],
+                    }
+                    for video in videos
+                ],
+            })
+        return {
+            "ok": True,
+            "slideSize": {"width": slide_size[0], "height": slide_size[1]},
+            "slides": slides,
+        }
+
+
+def _ppt_video_minimal_pptx(archive: zipfile.ZipFile, slide_page: int, output_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    slides = _ppt_video_ordered_slides(archive)
+    if slide_page < 1 or slide_page > len(slides):
+        raise ValueError(f"{slide_page}ページ目が見つかりません。")
+    slide_info = slides[slide_page - 1]
+    videos = _ppt_video_slide_videos(archive, slide_info["slidePath"])
+    if not videos:
+        raise ValueError(f"{slide_page}ページ目に動画が見つかりません。")
+
+    needed_paths = {slide_info["slidePath"], _ppt_video_rel_path(slide_info["slidePath"])}
+    rels = _ppt_video_relationships(archive, _ppt_video_rel_path(slide_info["slidePath"]))
+    base_dir = posixpath.dirname(slide_info["slidePath"])
+    for rel in rels.values():
+        target = rel.get("target", "")
+        if target and not re.match(r"^[a-z]+:", target, re.IGNORECASE):
+            needed_paths.add(_ppt_video_normalize_target(base_dir, target))
+
+    pres = ET.fromstring(archive.read("ppt/presentation.xml"))
+    sld_id_list = pres.find("p:sldIdLst", PPT_VIDEO_NS)
+    if sld_id_list is not None:
+        children = list(sld_id_list)
+        for child in children:
+            sld_id_list.remove(child)
+        if slide_page - 1 < len(children):
+            sld_id_list.append(children[slide_page - 1])
+    pres_xml = ET.tostring(pres, encoding="utf-8", xml_declaration=True)
+
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as out:
+        for item in archive.infolist():
+            name = item.filename
+            if name.startswith("ppt/slides/slide") and name != slide_info["slidePath"]:
+                continue
+            if name.startswith("ppt/slides/_rels/slide") and name != _ppt_video_rel_path(slide_info["slidePath"]):
+                continue
+            if name.startswith("ppt/media/") and name not in needed_paths:
+                continue
+            data = pres_xml if name == "ppt/presentation.xml" else archive.read(name)
+            out.writestr(item, data)
+    return slide_info, videos
+
+
+def _ppt_video_render_slide_image(pptx_path: Path, slide_page: int, slide_size: tuple[int, int], videos: list[dict[str, Any]]) -> tuple[bytes, tuple[int, int]]:
+    qlmanage = shutil.which("qlmanage")
+    if not qlmanage:
+        raise RuntimeError("PPTX画像化に必要な qlmanage が見つかりません。")
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="ppt-video-render-"))
+    try:
+        light_pptx = temp_dir / f"slide-{slide_page}.pptx"
+        with zipfile.ZipFile(pptx_path) as archive:
+            _ppt_video_minimal_pptx(archive, slide_page, light_pptx)
+
+        out_dir = temp_dir / "thumb"
+        out_dir.mkdir()
+        subprocess.run(
+            [qlmanage, "-t", "-s", str(PPT_VIDEO_RENDER_SIZE), "-o", str(out_dir), str(light_pptx)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        candidates = list(out_dir.glob("*.png"))
+        if not candidates:
+            raise RuntimeError("PPTXからスライド画像を生成できませんでした。")
+        with Image.open(candidates[0]) as image:
+            rendered = image.convert("RGB")
+
+        return _ppt_video_prepare_background_image(rendered, slide_size, videos)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _ppt_video_prepare_background_image(
+    image_or_bytes: Image.Image | bytes,
+    slide_size: tuple[int, int],
+    videos: list[dict[str, Any]],
+) -> tuple[bytes, tuple[int, int]]:
+    if isinstance(image_or_bytes, bytes):
+        if not image_or_bytes:
+            raise ValueError("image.pngが空です。")
+        with Image.open(io.BytesIO(image_or_bytes)) as source:
+            image = ImageOps.exif_transpose(source).convert("RGB")
+    else:
+        image = image_or_bytes.convert("RGB")
+
+    draw_image = image.copy()
+    pixels_per_emu_x = draw_image.width / slide_size[0]
+    pixels_per_emu_y = draw_image.height / slide_size[1]
+    from PIL import ImageDraw
+    painter = ImageDraw.Draw(draw_image)
+    for video in videos:
+        rect = video["rect"]
+        x = round(rect["x"] * pixels_per_emu_x)
+        y = round(rect["y"] * pixels_per_emu_y)
+        w = round(rect["cx"] * pixels_per_emu_x)
+        h = round(rect["cy"] * pixels_per_emu_y)
+        painter.rectangle([x, y, x + w, y + h], fill=(255, 255, 255))
+
+    output = io.BytesIO()
+    draw_image.save(output, format="PNG", optimize=True)
+    return output.getvalue(), draw_image.size
+
+
+def _ppt_video_css_rect(rect: dict[str, int], slide_size: tuple[int, int], image_size: tuple[int, int]) -> dict[str, int]:
+    screen_w, screen_h = PPT_VIDEO_SCREEN_SIZE
+    img_w, img_h = image_size
+    bg_scale = min(screen_w / img_w, screen_h / img_h)
+    bg_w = img_w * bg_scale
+    bg_h = img_h * bg_scale
+    bg_x = (screen_w - bg_w) / 2
+    bg_y = (screen_h - bg_h) / 2
+    x = (rect["x"] / slide_size[0]) * img_w
+    y = (rect["y"] / slide_size[1]) * img_h
+    w = (rect["cx"] / slide_size[0]) * img_w
+    h = (rect["cy"] / slide_size[1]) * img_h
+    return {
+        "left": round(bg_x + x * bg_scale),
+        "top": round(bg_y + y * bg_scale),
+        "width": round(w * bg_scale),
+        "height": round(h * bg_scale),
+    }
+
+
+def _ppt_video_thumb_bytes(image_bytes: bytes) -> bytes:
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        image = image.convert("RGB")
+        canvas = Image.new("RGB", PPT_VIDEO_THUMB_SIZE, (255, 255, 255))
+        contained = ImageOps.contain(image, PPT_VIDEO_THUMB_SIZE, Image.Resampling.LANCZOS)
+        canvas.paste(
+            contained,
+            (
+                (PPT_VIDEO_THUMB_SIZE[0] - contained.width) // 2,
+                (PPT_VIDEO_THUMB_SIZE[1] - contained.height) // 2,
+            ),
+        )
+        output = io.BytesIO()
+        canvas.save(output, format="PNG", optimize=True)
+        return output.getvalue()
+
+
+def _ppt_video_index_html(video_count: int) -> str:
+    video_tags = "\n".join(
+        f"""\t\t\t<div class="movie_area movie_area_{index}">
+\t\t\t\t<video class="movie_item" controls><source src="video/movie{index:02d}.mp4" type="video/mp4"></video>
+\t\t\t</div>"""
+        for index in range(1, video_count + 1)
+    )
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title></title>
+<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="format-detection" content="telephone=no">
+<link rel="stylesheet" type="text/css" href="css/common.css">
+<link rel="stylesheet" type="text/css" href="css/specific.css">
+</head>
+<body>
+<div id="common_screen">
+\t<section class="main_wrapper">
+\t\t<div class="content_wrapper">
+{video_tags}
+\t\t</div>
+\t</section>
+</div>
+
+<script src="js/lib/jquery-3.1.1.min.js"></script>
+<script src="js/lib/iscroll.js"></script>
+<script src="js/lib/veeva-library.js"></script>
+<script src="js/specific.js"></script>
+</body>
+</html>"""
+
+
+def _ppt_video_common_css() -> str:
+    return PPT_VIDEO_RESET_CSS + """
+body { background-color: #000; }
+
+#common_screen {
+\twidth: 1024px;
+\theight: 768px;
+\tposition: relative;
+\toverflow: hidden;
+\t-webkit-tap-highlight-color: rgba(0,0,0,0);
+}
+
+.main_wrapper {
+\twidth: 1024px;
+\theight: 768px;
+\tbackground: url(../img/image.png) no-repeat center center;
+\tbackground-size: contain;
+\tposition: relative;
+\toverflow: hidden;
+}
+
+.content_wrapper {
+\tposition: relative;
+}
+
+.movie_area {
+\tdisplay: flex;
+\tjustify-content: center;
+\talign-items: center;
+\tposition: absolute;
+}
+
+.movie_item {
+\twidth: 100%;
+\theight: 100%;
+\tobject-fit: contain;
+}
+"""
+
+
+def _ppt_video_specific_css(videos: list[dict[str, Any]], slide_size: tuple[int, int], image_size: tuple[int, int]) -> str:
+    blocks = []
+    for index, video in enumerate(videos, start=1):
+        css_rect = _ppt_video_css_rect(video["rect"], slide_size, image_size)
+        blocks.append(
+            f""".movie_area_{index} {{
+\tleft: {css_rect['left']}px;
+\ttop: {css_rect['top']}px;
+\twidth: {css_rect['width']}px;
+\theight: {css_rect['height']}px;
+}}"""
+        )
+    return "\n\n".join(blocks) + "\n"
+
+
+def _ppt_video_package_zip(
+    archive: zipfile.ZipFile,
+    *,
+    target_path: Path,
+    slide_page: int,
+    videos: list[dict[str, Any]],
+    slide_size: tuple[int, int],
+    image_bytes: bytes,
+    image_size: tuple[int, int],
+) -> None:
+    thumb_bytes = _ppt_video_thumb_bytes(image_bytes)
+    with zipfile.ZipFile(target_path, "w", compression=zipfile.ZIP_DEFLATED) as out:
+        out.writestr("css/", b"")
+        out.writestr("css/common.css", _ppt_video_common_css())
+        out.writestr("css/specific.css", _ppt_video_specific_css(videos, slide_size, image_size))
+        out.writestr("img/", b"")
+        out.writestr("img/icon_play.svg", '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><path fill="#fff" d="M24 18v28l24-14z"/></svg>')
+        out.writestr("img/image.png", image_bytes)
+        out.writestr("index.html", _ppt_video_index_html(len(videos)))
+        out.writestr("js/", b"")
+        out.writestr("js/specific.js", "const scroll = new IScroll('#common_screen', { scrollX: false, scrollY: false, preventDefault: true, tap: 'tap', click: true });\n")
+        out.writestr("js/lib/", b"")
+        out.writestr("js/lib/jquery-3.1.1.min.js", "")
+        out.writestr("js/lib/iscroll.js", "function IScroll(){ return {}; }\n")
+        out.writestr("js/lib/veeva-library.js", "")
+        out.writestr("thumb.png", thumb_bytes)
+        out.writestr("video/", b"")
+        for index, video in enumerate(videos, start=1):
+            source = video["mediaPath"]
+            info = zipfile.ZipInfo(f"video/movie{index:02d}.mp4")
+            info.compress_type = zipfile.ZIP_STORED
+            with archive.open(source) as src, out.open(info, "w") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+
+
+def _ppt_video_result_url(session_id: str, filename: str) -> str:
+    return f"/ppt-video-zip-tool/results/{session_id}/{quote(filename)}?download=1"
+
+
+def _ppt_video_generate_artifacts(
+    pptx_path: Path,
+    selected_pages: list[int],
+    package_base: str,
+    page_images: dict[int, bytes] | None = None,
+) -> dict[str, Any]:
+    safe_base = _ppt_video_safe_base_name(package_base)
+    _fragment_slide_cleanup_old_results()
+    session_id = uuid.uuid4().hex
+    result_dir = FRAGMENT_SLIDE_OUTPUT_DIR / session_id
+    result_dir.mkdir(parents=True, exist_ok=False)
+
+    try:
+        with zipfile.ZipFile(pptx_path) as archive:
+            analysis = _ppt_video_analyze_file(pptx_path)
+            available_pages = {item["page"] for item in analysis["slides"]}
+            pages = selected_pages or sorted(available_pages)
+            pages = sorted(dict.fromkeys(int(page) for page in pages))
+            if not pages:
+                raise ValueError("動画があるページが見つかりません。")
+            if len(pages) > PPT_VIDEO_MAX_SELECTED_SLIDES:
+                raise ValueError(f"一度に生成できるページ数は最大{PPT_VIDEO_MAX_SELECTED_SLIDES}件までです。")
+            invalid_pages = [page for page in pages if page not in available_pages]
+            if invalid_pages:
+                raise ValueError(f"動画がないページが選択されています: {', '.join(map(str, invalid_pages))}")
+
+            slide_size = (analysis["slideSize"]["width"], analysis["slideSize"]["height"])
+            results = []
+            for page in pages:
+                slide_info = next(item for item in _ppt_video_ordered_slides(archive) if item["page"] == page)
+                videos = _ppt_video_slide_videos(archive, slide_info["slidePath"])
+                if page_images is not None:
+                    if page not in page_images:
+                        raise ValueError(f"{page}ページ目のimage.pngをアップロードしてください。")
+                    image_bytes, image_size = _ppt_video_prepare_background_image(page_images[page], slide_size, videos)
+                else:
+                    image_bytes, image_size = _ppt_video_render_slide_image(pptx_path, page, slide_size, videos)
+                filename = f"{safe_base} {page}.zip"
+                target = result_dir / filename
+                _ppt_video_package_zip(
+                    archive,
+                    target_path=target,
+                    slide_page=page,
+                    videos=videos,
+                    slide_size=slide_size,
+                    image_bytes=image_bytes,
+                    image_size=image_size,
+                )
+                results.append({
+                    "page": page,
+                    "filename": filename,
+                    "size": target.stat().st_size,
+                    "videoCount": len(videos),
+                    "downloadUrl": _ppt_video_result_url(session_id, filename),
+                })
+
+            batch_filename = f"{safe_base}_video_packages.zip"
+            batch_path = result_dir / batch_filename
+            with zipfile.ZipFile(batch_path, "w", compression=zipfile.ZIP_STORED) as batch:
+                for item in results:
+                    batch.write(result_dir / item["filename"], item["filename"])
+
+            return {
+                "ok": True,
+                "sessionId": session_id,
+                "pageCount": len(results),
+                "batch": {
+                    "filename": batch_filename,
+                    "size": batch_path.stat().st_size,
+                    "downloadUrl": _ppt_video_result_url(session_id, batch_filename),
+                },
+                "results": results,
+            }
+    except Exception:
+        shutil.rmtree(result_dir, ignore_errors=True)
+        raise
+
+
+def _fragment_slide_generate_bundle(pdf_bytes: bytes, presentation_id: str) -> tuple[Path, int, str]:
+    safe_id = _fragment_slide_safe_presentation_id(presentation_id)
+    template_files = _fragment_slide_template_files()
+    document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        page_count = document.page_count
+        if page_count < 1:
+            raise ValueError("PDFにページがありません。")
+        if page_count > FRAGMENT_SLIDE_MAX_PAGES:
+            raise ValueError(f"PDFは最大{FRAGMENT_SLIDE_MAX_PAGES}ページまでです。")
+
+        temp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        bundle_path = Path(temp.name)
+        temp.close()
+        digits = max(3, len(str(page_count)))
+
+        try:
+            with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_STORED) as bundle:
+                for index in range(page_count):
+                    bg_bytes, poster_bytes, thumb_bytes = _fragment_slide_render_page(document[index])
+                    slide_zip = _fragment_slide_zip_bytes(
+                        template_files=template_files,
+                        bg_bytes=bg_bytes,
+                        poster_bytes=poster_bytes,
+                        thumb_bytes=thumb_bytes,
+                    )
+                    slide_name = f"{safe_id}_{index + 1:0{digits}d}.zip"
+                    bundle.writestr(slide_name, slide_zip)
+            return bundle_path, page_count, safe_id
+        except Exception:
+            delete_file_quietly(bundle_path)
+            raise
+    finally:
+        document.close()
+
+
+def _fragment_slide_result_url(session_id: str, filename: str) -> str:
+    return f"/pdf-slide-tool/results/{session_id}/{quote(filename)}?download=1"
+
+
+def _fragment_slide_cleanup_old_results() -> None:
+    cutoff = time.time() - FRAGMENT_SLIDE_RESULT_TTL_SEC
+    for path in FRAGMENT_SLIDE_OUTPUT_DIR.iterdir():
+        try:
+            if path.is_dir() and path.stat().st_mtime < cutoff:
+                shutil.rmtree(path)
+        except Exception:
+            logger.warning("Failed to clean fragment slide result: %s", path, exc_info=True)
+
+
+def _fragment_slide_generate_batch_artifacts(items: list[tuple[bytes, str]]) -> dict[str, Any]:
+    if not items:
+        raise ValueError("PDFを1件以上アップロードしてください。")
+    if len(items) > FRAGMENT_SLIDE_MAX_BATCH_FILES:
+        raise ValueError(f"PDFは一度に最大{FRAGMENT_SLIDE_MAX_BATCH_FILES}件までです。")
+
+    safe_ids = [_fragment_slide_safe_presentation_id(presentation_id) for _, presentation_id in items]
+    safe_id_counts = Counter(presentation_id.casefold() for presentation_id in safe_ids)
+    duplicate_ids = sorted({
+        presentation_id
+        for presentation_id in safe_ids
+        if safe_id_counts[presentation_id.casefold()] > 1
+    })
+    if duplicate_ids:
+        raise ValueError(f"Presentation IDが重複しています: {', '.join(duplicate_ids)}")
+
+    template_files = _fragment_slide_template_files()
+    documents = []
+    try:
+        for pdf_bytes, _ in items:
+            documents.append(fitz.open(stream=pdf_bytes, filetype="pdf"))
+
+        page_counts = [document.page_count for document in documents]
+        for index, page_count in enumerate(page_counts):
+            if page_count < 1:
+                raise ValueError(f"{index + 1}件目のPDFにページがありません。")
+            if page_count > FRAGMENT_SLIDE_MAX_PAGES:
+                raise ValueError(f"PDFは1件あたり最大{FRAGMENT_SLIDE_MAX_PAGES}ページまでです。")
+
+        total_pages = sum(page_counts)
+        if total_pages > FRAGMENT_SLIDE_MAX_BATCH_PAGES:
+            raise ValueError(f"一度に生成できる合計ページ数は最大{FRAGMENT_SLIDE_MAX_BATCH_PAGES}ページまでです。")
+
+        _fragment_slide_cleanup_old_results()
+        session_id = uuid.uuid4().hex
+        result_dir = FRAGMENT_SLIDE_OUTPUT_DIR / session_id
+        result_dir.mkdir(parents=True, exist_ok=False)
+        batch_filename = "presentation-slide-packages.zip"
+        batch_path = result_dir / batch_filename
+        individual_paths = {
+            safe_id: result_dir / f"{safe_id}.zip"
+            for safe_id in safe_ids
+        }
+
+        try:
+            with zipfile.ZipFile(batch_path, "w", compression=zipfile.ZIP_STORED) as batch_bundle:
+                for document, safe_id, page_count in zip(documents, safe_ids, page_counts):
+                    digits = max(3, len(str(page_count)))
+                    with zipfile.ZipFile(individual_paths[safe_id], "w", compression=zipfile.ZIP_STORED) as individual_bundle:
+                        for index in range(page_count):
+                            bg_bytes, poster_bytes, thumb_bytes = _fragment_slide_render_page(document[index])
+                            slide_zip = _fragment_slide_zip_bytes(
+                                template_files=template_files,
+                                bg_bytes=bg_bytes,
+                                poster_bytes=poster_bytes,
+                                thumb_bytes=thumb_bytes,
+                            )
+                            slide_name = f"{safe_id}_{index + 1:0{digits}d}.zip"
+                            individual_bundle.writestr(slide_name, slide_zip)
+                            batch_bundle.writestr(f"{safe_id}/{slide_name}", slide_zip)
+
+            results = [
+                {
+                    "presentationId": safe_id,
+                    "filename": individual_paths[safe_id].name,
+                    "pageCount": page_count,
+                    "size": individual_paths[safe_id].stat().st_size,
+                    "downloadUrl": _fragment_slide_result_url(session_id, individual_paths[safe_id].name),
+                }
+                for safe_id, page_count in zip(safe_ids, page_counts)
+            ]
+            return {
+                "ok": True,
+                "sessionId": session_id,
+                "pdfCount": len(documents),
+                "pageCount": total_pages,
+                "batch": {
+                    "filename": batch_filename,
+                    "size": batch_path.stat().st_size,
+                    "downloadUrl": _fragment_slide_result_url(session_id, batch_filename),
+                },
+                "results": results,
+            }
+        except Exception:
+            shutil.rmtree(result_dir, ignore_errors=True)
+            raise
+    finally:
+        for document in documents:
+            document.close()
+
+
+@app.post("/pdf-slide-tool/analyze")
+async def pdf_slide_tool_analyze(pdf: UploadFile = File(...)):
+    data = await pdf.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="PDFをアップロードしてください。")
+    if len(data) > FRAGMENT_SLIDE_MAX_PDF_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"PDFサイズは最大{FRAGMENT_SLIDE_MAX_PDF_BYTES // (1024 * 1024)}MBまでです。",
+        )
+
+    try:
+        titles = await asyncio.to_thread(_fragment_slide_extract_titles, data)
+    except (ValueError, fitz.FileDataError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("PDF slide title extraction failed")
+        raise HTTPException(status_code=500, detail=f"タイトル抽出に失敗しました: {exc}") from exc
+
+    return {"ok": True, "pageCount": len(titles), "titles": titles}
+
+
+@app.post("/pdf-slide-tool/generate-batch")
+async def pdf_slide_tool_generate_batch(
+    pdfs: List[UploadFile] = File(...),
+    presentationIds: str = Form(...),
+):
+    try:
+        parsed_presentation_ids = json.loads(presentationIds)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Presentation IDの形式が不正です。") from exc
+
+    if not isinstance(parsed_presentation_ids, list):
+        raise HTTPException(status_code=400, detail="Presentation IDの形式が不正です。")
+    if any(not isinstance(presentation_id, str) for presentation_id in parsed_presentation_ids):
+        raise HTTPException(status_code=400, detail="Presentation IDの形式が不正です。")
+    if len(pdfs) != len(parsed_presentation_ids):
+        raise HTTPException(status_code=400, detail="PDFとPresentation IDの件数が一致しません。")
+    if len(pdfs) > FRAGMENT_SLIDE_MAX_BATCH_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"PDFは一度に最大{FRAGMENT_SLIDE_MAX_BATCH_FILES}件までです。",
+        )
+
+    items: list[tuple[bytes, str]] = []
+    for index, (pdf, presentation_id) in enumerate(zip(pdfs, parsed_presentation_ids)):
+        data = await pdf.read()
+        if not data:
+            raise HTTPException(status_code=400, detail=f"{index + 1}件目のPDFが空です。")
+        if len(data) > FRAGMENT_SLIDE_MAX_PDF_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{index + 1}件目のPDFサイズは最大{FRAGMENT_SLIDE_MAX_PDF_BYTES // (1024 * 1024)}MBまでです。",
+            )
+        items.append((data, str(presentation_id or "")))
+
+    try:
+        result = await asyncio.to_thread(
+            _fragment_slide_generate_batch_artifacts,
+            items,
+        )
+    except (ValueError, fitz.FileDataError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("PDF slide batch ZIP generation failed")
+        raise HTTPException(status_code=500, detail=f"一括ZIP生成に失敗しました: {exc}") from exc
+
+    return JSONResponse(result)
+
+
+@app.post("/pdf-document-zip-tool/generate")
+async def pdf_document_zip_tool_generate(
+    background_tasks: BackgroundTasks,
+    pdf: UploadFile = File(...),
+    zipFilename: str = Form(...),
+):
+    data = await pdf.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="PDFをアップロードしてください。")
+    if len(data) > FRAGMENT_SLIDE_MAX_PDF_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"PDFサイズは最大{FRAGMENT_SLIDE_MAX_PDF_BYTES // (1024 * 1024)}MBまでです。",
+        )
+
+    try:
+        zip_path, page_count, safe_filename = await asyncio.to_thread(
+            _pdf_document_zip_generate,
+            data,
+            zipFilename,
+        )
+    except (ValueError, fitz.FileDataError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("PDF document ZIP generation failed")
+        raise HTTPException(status_code=500, detail=f"ZIP生成に失敗しました: {exc}") from exc
+
+    background_tasks.add_task(delete_file_quietly, zip_path)
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"{safe_filename}.zip",
+        headers={
+            "X-Page-Count": str(page_count),
+            "Access-Control-Expose-Headers": "Content-Disposition, X-Page-Count",
+        },
+    )
+
+
+@app.post("/pdf-document-zip-tool/generate-batch")
+async def pdf_document_zip_tool_generate_batch(
+    pdfs: List[UploadFile] = File(...),
+    zipFilenames: str = Form(...),
+):
+    try:
+        parsed_zip_filenames = json.loads(zipFilenames)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="ZIPファイル名の形式が不正です。") from exc
+
+    if not isinstance(parsed_zip_filenames, list):
+        raise HTTPException(status_code=400, detail="ZIPファイル名の形式が不正です。")
+    if any(not isinstance(zip_filename, str) for zip_filename in parsed_zip_filenames):
+        raise HTTPException(status_code=400, detail="ZIPファイル名の形式が不正です。")
+    if len(pdfs) != len(parsed_zip_filenames):
+        raise HTTPException(status_code=400, detail="PDFとZIPファイル名の件数が一致しません。")
+    if len(pdfs) > FRAGMENT_SLIDE_MAX_BATCH_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"PDFは一度に最大{FRAGMENT_SLIDE_MAX_BATCH_FILES}件までです。",
+        )
+
+    items: list[tuple[bytes, str]] = []
+    for index, (pdf, zip_filename) in enumerate(zip(pdfs, parsed_zip_filenames)):
+        data = await pdf.read()
+        if not data:
+            raise HTTPException(status_code=400, detail=f"{index + 1}件目のPDFが空です。")
+        if len(data) > FRAGMENT_SLIDE_MAX_PDF_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{index + 1}件目のPDFサイズは最大{FRAGMENT_SLIDE_MAX_PDF_BYTES // (1024 * 1024)}MBまでです。",
+            )
+        items.append((data, str(zip_filename or "")))
+
+    try:
+        result = await asyncio.to_thread(
+            _pdf_document_zip_generate_batch_artifacts,
+            items,
+        )
+    except (ValueError, fitz.FileDataError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("PDF document batch ZIP generation failed")
+        raise HTTPException(status_code=500, detail=f"一括ZIP生成に失敗しました: {exc}") from exc
+
+    return JSONResponse(result)
+
+
+@app.get("/pdf-document-zip-tool/results/{session_id}/{filename}")
+async def pdf_document_zip_tool_result_file(session_id: str, filename: str):
+    if not re.fullmatch(r"[a-f0-9]{32}", session_id or ""):
+        raise HTTPException(status_code=400, detail="結果IDが不正です。")
+
+    result_dir = (FRAGMENT_SLIDE_OUTPUT_DIR / session_id).resolve()
+    target = (result_dir / filename).resolve()
+    try:
+        target.relative_to(result_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="結果ファイル名が不正です。") from exc
+
+    if target.parent != result_dir or not target.is_file():
+        raise HTTPException(status_code=404, detail="結果ファイルが見つかりません。")
+    return FileResponse(
+        target,
+        media_type="application/zip",
+        filename=target.name,
+        content_disposition_type="attachment",
+    )
+
+
+@app.post("/folder-zip-tool/generate")
+async def folder_zip_tool_generate(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    relativePaths: str = Form(...),
+    zipFilename: str = Form(...),
+    mode: str = Form("auto"),
+    rootName: str = Form(""),
+):
+    try:
+        parsed_paths = json.loads(relativePaths)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="ファイルパスの形式が不正です。") from exc
+
+    if not isinstance(parsed_paths, list) or any(not isinstance(path, str) for path in parsed_paths):
+        raise HTTPException(status_code=400, detail="ファイルパスの形式が不正です。")
+    if len(files) != len(parsed_paths):
+        raise HTTPException(status_code=400, detail="ファイルとパスの件数が一致しません。")
+    if len(files) > FOLDER_ZIP_MAX_FILES:
+        raise HTTPException(status_code=400, detail=f"ファイル数は最大{FOLDER_ZIP_MAX_FILES}件までです。")
+
+    items: list[tuple[str, bytes]] = []
+    total_bytes = 0
+    for index, (upload, relative_path) in enumerate(zip(files, parsed_paths)):
+        data = await upload.read()
+        total_bytes += len(data)
+        if total_bytes > FOLDER_ZIP_MAX_TOTAL_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"合計サイズは最大{FOLDER_ZIP_MAX_TOTAL_BYTES // (1024 * 1024)}MBまでです。",
+            )
+        if not data:
+            continue
+        try:
+            cleaned_path = _folder_zip_clean_relative_path(relative_path or upload.filename or f"file-{index + 1}")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        items.append((cleaned_path, data))
+
+    try:
+        zip_path, safe_filename, resolved_mode, file_count = await asyncio.to_thread(
+            _folder_zip_artifact,
+            items,
+            zip_filename=zipFilename,
+            mode=mode,
+            root_name=rootName,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Folder ZIP generation failed")
+        raise HTTPException(status_code=500, detail=f"ZIP生成に失敗しました: {exc}") from exc
+
+    background_tasks.add_task(delete_file_quietly, zip_path)
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"{safe_filename}.zip",
+        headers={
+            "X-Zip-Mode": resolved_mode,
+            "X-File-Count": str(file_count),
+            "Access-Control-Expose-Headers": "Content-Disposition, X-Zip-Mode, X-File-Count",
+        },
+    )
+
+
+@app.post("/folder-zip-tool/generate-batch")
+async def folder_zip_tool_generate_batch(
+    files: List[UploadFile] = File(...),
+    relativePaths: str = Form(...),
+    mode: str = Form("auto"),
+    folderModes: str = Form("{}"),
+):
+    try:
+        parsed_paths = json.loads(relativePaths)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="ファイルパスの形式が不正です。") from exc
+
+    if not isinstance(parsed_paths, list) or any(not isinstance(path, str) for path in parsed_paths):
+        raise HTTPException(status_code=400, detail="ファイルパスの形式が不正です。")
+    try:
+        parsed_folder_modes = json.loads(folderModes or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="フォルダごとのZIP方法の形式が不正です。") from exc
+    if not isinstance(parsed_folder_modes, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in parsed_folder_modes.items()
+    ):
+        raise HTTPException(status_code=400, detail="フォルダごとのZIP方法の形式が不正です。")
+    if len(files) != len(parsed_paths):
+        raise HTTPException(status_code=400, detail="ファイルとパスの件数が一致しません。")
+    if len(files) > FOLDER_ZIP_MAX_FILES:
+        raise HTTPException(status_code=400, detail=f"ファイル数は最大{FOLDER_ZIP_MAX_FILES}件までです。")
+
+    items: list[tuple[str, bytes]] = []
+    total_bytes = 0
+    for index, (upload, relative_path) in enumerate(zip(files, parsed_paths)):
+        data = await upload.read()
+        total_bytes += len(data)
+        if total_bytes > FOLDER_ZIP_MAX_TOTAL_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"合計サイズは最大{FOLDER_ZIP_MAX_TOTAL_BYTES // (1024 * 1024)}MBまでです。",
+            )
+        if not data:
+            continue
+        try:
+            cleaned_path = _folder_zip_clean_relative_path(relative_path or upload.filename or f"file-{index + 1}")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        items.append((cleaned_path, data))
+
+    try:
+        result = await asyncio.to_thread(
+            _folder_zip_generate_batch_artifacts,
+            items,
+            mode=mode,
+            folder_modes=parsed_folder_modes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Folder batch ZIP generation failed")
+        raise HTTPException(status_code=500, detail=f"ZIP生成に失敗しました: {exc}") from exc
+
+    return JSONResponse(result)
+
+
+@app.get("/folder-zip-tool/results/{session_id}/{filename}")
+async def folder_zip_tool_result_file(session_id: str, filename: str):
+    if not re.fullmatch(r"[a-f0-9]{32}", session_id or ""):
+        raise HTTPException(status_code=400, detail="結果IDが不正です。")
+
+    result_dir = (FRAGMENT_SLIDE_OUTPUT_DIR / session_id).resolve()
+    target = (result_dir / filename).resolve()
+    try:
+        target.relative_to(result_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="結果ファイル名が不正です。") from exc
+
+    if target.parent != result_dir or not target.is_file():
+        raise HTTPException(status_code=404, detail="結果ファイルが見つかりません。")
+    return FileResponse(
+        target,
+        media_type="application/zip",
+        filename=target.name,
+        content_disposition_type="attachment",
+    )
+
+
+async def _ppt_video_save_upload(upload: UploadFile) -> Path:
+    if not upload.filename.lower().endswith(".pptx"):
+        raise HTTPException(status_code=400, detail="PPTXをアップロードしてください。")
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".pptx")
+    temp_path = Path(temp.name)
+    temp.close()
+    total = 0
+    try:
+        with temp_path.open("wb") as out:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > PPT_VIDEO_MAX_FILE_BYTES:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"PPTXサイズは最大{PPT_VIDEO_MAX_FILE_BYTES // (1024 * 1024)}MBまでです。",
+                    )
+                out.write(chunk)
+        if total <= 0:
+            raise HTTPException(status_code=400, detail="PPTXが空です。")
+        return temp_path
+    except Exception:
+        delete_file_quietly(temp_path)
+        raise
+
+
+@app.post("/ppt-video-zip-tool/analyze")
+async def ppt_video_zip_tool_analyze(pptx: UploadFile = File(...)):
+    pptx_path = await _ppt_video_save_upload(pptx)
+    try:
+        result = await asyncio.to_thread(_ppt_video_analyze_file, pptx_path)
+        result["packageBase"] = _ppt_video_safe_base_name(Path(pptx.filename).stem)
+        return JSONResponse(result)
+    except (ValueError, zipfile.BadZipFile) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("PPT video analyze failed")
+        raise HTTPException(status_code=500, detail=f"PPTX解析に失敗しました: {exc}") from exc
+    finally:
+        delete_file_quietly(pptx_path)
+
+
+@app.post("/ppt-video-zip-tool/generate")
+async def ppt_video_zip_tool_generate(
+    pptx: UploadFile = File(...),
+    pageImages: Optional[List[UploadFile]] = File(None),
+    selectedPages: str = Form("[]"),
+    pageImagePages: str = Form("[]"),
+    packageBase: str = Form(""),
+):
+    try:
+        parsed_pages = json.loads(selectedPages or "[]")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="選択ページの形式が不正です。") from exc
+    if not isinstance(parsed_pages, list) or any(not isinstance(page, int) for page in parsed_pages):
+        raise HTTPException(status_code=400, detail="選択ページの形式が不正です。")
+
+    try:
+        parsed_image_pages = json.loads(pageImagePages or "[]")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="image.pngページの形式が不正です。") from exc
+    if not isinstance(parsed_image_pages, list) or any(not isinstance(page, int) for page in parsed_image_pages):
+        raise HTTPException(status_code=400, detail="image.pngページの形式が不正です。")
+
+    image_uploads = pageImages or []
+    if image_uploads and len(image_uploads) != len(parsed_image_pages):
+        raise HTTPException(status_code=400, detail="image.pngとページ数の件数が一致しません。")
+
+    page_image_map: dict[int, bytes] | None = None
+    if image_uploads:
+        page_image_map = {}
+        for page, image_upload in zip(parsed_image_pages, image_uploads):
+            if page in page_image_map:
+                raise HTTPException(status_code=400, detail=f"{page}ページ目のimage.pngが重複しています。")
+            image_data = await image_upload.read()
+            if not image_data:
+                raise HTTPException(status_code=400, detail=f"{page}ページ目のimage.pngが空です。")
+            page_image_map[page] = image_data
+        missing_image_pages = [page for page in parsed_pages if page not in page_image_map]
+        if missing_image_pages:
+            raise HTTPException(
+                status_code=400,
+                detail=f"生成対象ページのimage.pngをアップロードしてください: {', '.join(map(str, missing_image_pages))}",
+            )
+
+    pptx_path = await _ppt_video_save_upload(pptx)
+    try:
+        base = packageBase or Path(pptx.filename).stem
+        result = await asyncio.to_thread(_ppt_video_generate_artifacts, pptx_path, parsed_pages, base, page_image_map)
+        return JSONResponse(result)
+    except (ValueError, zipfile.BadZipFile) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=500, detail="PPTX画像化がタイムアウトしました。") from exc
+    except Exception as exc:
+        logger.exception("PPT video ZIP generation failed")
+        raise HTTPException(status_code=500, detail=f"ZIP生成に失敗しました: {exc}") from exc
+    finally:
+        delete_file_quietly(pptx_path)
+
+
+@app.get("/ppt-video-zip-tool/results/{session_id}/{filename}")
+async def ppt_video_zip_tool_result_file(session_id: str, filename: str):
+    if not re.fullmatch(r"[a-f0-9]{32}", session_id or ""):
+        raise HTTPException(status_code=400, detail="結果IDが不正です。")
+
+    result_dir = (FRAGMENT_SLIDE_OUTPUT_DIR / session_id).resolve()
+    target = (result_dir / filename).resolve()
+    try:
+        target.relative_to(result_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="結果ファイル名が不正です。") from exc
+
+    if target.parent != result_dir or not target.is_file():
+        raise HTTPException(status_code=404, detail="結果ファイルが見つかりません。")
+    return FileResponse(
+        target,
+        media_type="application/zip",
+        filename=target.name,
+        content_disposition_type="attachment",
+    )
+
+
+@app.get("/pdf-slide-tool/results/{session_id}/{filename}")
+async def pdf_slide_tool_result_file(session_id: str, filename: str):
+    if not re.fullmatch(r"[a-f0-9]{32}", session_id or ""):
+        raise HTTPException(status_code=400, detail="結果IDが不正です。")
+
+    result_dir = (FRAGMENT_SLIDE_OUTPUT_DIR / session_id).resolve()
+    target = (result_dir / filename).resolve()
+    try:
+        target.relative_to(result_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="結果ファイル名が不正です。") from exc
+
+    if target.parent != result_dir or not target.is_file():
+        raise HTTPException(status_code=404, detail="結果ファイルが見つかりません。")
+    return FileResponse(
+        target,
+        media_type="application/zip",
+        filename=target.name,
+        content_disposition_type="attachment",
+    )
+
+
+@app.post("/pdf-slide-tool/generate")
+async def pdf_slide_tool_generate(
+    background_tasks: BackgroundTasks,
+    pdf: UploadFile = File(...),
+    presentationId: str = Form(...),
+):
+    data = await pdf.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="PDFをアップロードしてください。")
+    if len(data) > FRAGMENT_SLIDE_MAX_PDF_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"PDFサイズは最大{FRAGMENT_SLIDE_MAX_PDF_BYTES // (1024 * 1024)}MBまでです。",
+        )
+
+    try:
+        bundle_path, page_count, safe_id = await asyncio.to_thread(
+            _fragment_slide_generate_bundle,
+            data,
+            presentationId,
+        )
+    except (ValueError, fitz.FileDataError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("PDF slide ZIP generation failed")
+        raise HTTPException(status_code=500, detail=f"ZIP生成に失敗しました: {exc}") from exc
+
+    background_tasks.add_task(delete_file_quietly, bundle_path)
+    return FileResponse(
+        bundle_path,
+        media_type="application/zip",
+        filename=f"{safe_id}.zip",
+        headers={
+            "X-Page-Count": str(page_count),
+            "Access-Control-Expose-Headers": "Content-Disposition, X-Page-Count",
+        },
     )
 
 
