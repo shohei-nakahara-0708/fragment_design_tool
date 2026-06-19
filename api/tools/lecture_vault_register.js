@@ -336,6 +336,82 @@ async function withTimeout(promise, timeoutMs, label) {
       return result;
     }
 
+    async function dismissVaultOnboardingDialogs(context = '') {
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        const result = await page.evaluate(() => {
+          const visible = element => {
+            if (!element) return false;
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.visibility !== 'hidden' &&
+              style.display !== 'none' &&
+              style.opacity !== '0';
+          };
+
+          const dialogs = Array.from(document.querySelectorAll(
+            '.vv_login_msg_dialog, .vv_onboarding, .vv_login_message, .ui-dialog, [role="dialog"]'
+          ));
+          const dialog = dialogs.find(candidate => {
+            if (!visible(candidate)) return false;
+            const title = candidate.querySelector('.ui-dialog-title, [data-corgix-internal="DIALOG-TITLE-CONTENT"]')?.textContent || '';
+            const text = candidate.textContent || '';
+            const className = String(candidate.className || '');
+            return /Release Notes|Do not show this again|PromoMats today|Font\(s\) License|vv_onboarding|vv_login_message/i
+              .test([title, text, className].join(' '));
+          });
+
+          if (!dialog) return { closed: false, reason: 'not found' };
+
+          const checkbox = dialog.querySelector('input[type="checkbox"].infoCheckbox, #infoCheckbox, input[type="checkbox"]');
+          if (checkbox && !checkbox.checked && visible(checkbox)) {
+            checkbox.click();
+          }
+
+          const buttons = Array.from(dialog.querySelectorAll('a, button, [role="button"], .vv_button'));
+          const okButton = buttons.find(button => {
+            if (!visible(button)) return false;
+            const label = [
+              button.textContent || '',
+              button.getAttribute('title') || '',
+              button.getAttribute('aria-label') || '',
+              button.className || '',
+            ].join(' ');
+            return /\bOK\b|了解|閉じる|close|vv_primary|(^|\s)ok(\s|$)/i.test(label);
+          });
+
+          if (!okButton) {
+            return {
+              closed: false,
+              reason: 'ok button not found',
+              title: (dialog.querySelector('.ui-dialog-title')?.textContent || '').trim(),
+              text: (dialog.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+            };
+          }
+
+          okButton.scrollIntoView?.({ block: 'center', inline: 'center' });
+          okButton.click();
+          return {
+            closed: true,
+            title: (dialog.querySelector('.ui-dialog-title')?.textContent || '').trim(),
+            text: (dialog.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+          };
+        }).catch(err => ({ closed: false, reason: String(err) }));
+
+        if (!result.closed) {
+          if (attempt === 1 && result.reason !== 'not found') {
+            console.log(`Vault案内ダイアログの確認結果: ${JSON.stringify(result)}`);
+          }
+          return false;
+        }
+
+        console.log(`Vault案内ダイアログを閉じました${context ? ` (${context})` : ''}: ${JSON.stringify(result)}`);
+        await sleep(600);
+      }
+      return true;
+    }
+
     async function waitForElementCount(selector, minCount, timeout = NORMAL_WAIT) {
       await page.waitForFunction(
         (targetSelector, targetCount) => document.querySelectorAll(targetSelector).length >= targetCount,
@@ -673,6 +749,7 @@ async function withTimeout(promise, timeoutMs, label) {
     }
 
     async function clearAndType(selector, value, options = {}) {
+      await dismissVaultOnboardingDialogs('入力前');
       const textValue = String(value ?? '');
       const { sectionTitle = '', ...typeOptions } = options;
       const targetIndex = await getVisibleElementIndex(selector, NORMAL_WAIT, { sectionTitle });
@@ -4155,8 +4232,10 @@ async function withTimeout(promise, timeoutMs, label) {
 
         await waitForAnySelector(["#search_main_box", ".vv_username"], LONG_WAIT);
         console.log("Vaultログインが完了しました。");
+        await dismissVaultOnboardingDialogs('ログイン直後');
       } else {
         console.log("Vaultログイン済みセッションを使用します。");
+        await dismissVaultOnboardingDialogs('ログイン済みセッション');
       }
 
       let lexNoThanks = await waitForOptionalSelector(".vv-callout-content-dismiss", 5000, { visible: true });
@@ -4164,6 +4243,7 @@ async function withTimeout(promise, timeoutMs, label) {
       if (lexNoThanks) {
         await lexNoThanks.click();
       }
+      await dismissVaultOnboardingDialogs('初期表示');
 
       if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
 
@@ -4173,6 +4253,7 @@ async function withTimeout(promise, timeoutMs, label) {
         let currentUserValue = await (await currentUser.getProperty('textContent')).jsonValue();
         if (normalizeMenuText(currentUserValue) !== normalizeMenuText("Arashimaru Inc. Agency")) {
           console.log("代理アクセスユーザーへ切り替えています。");
+          await dismissVaultOnboardingDialogs('代理アクセス切替前');
           await clearAndType(ACCESSCONTROL_SELECTOR, ACCESSCONTROL);
           const delegateNavigation = page.waitForNavigation({ waitUntil: ['load', 'networkidle2'], timeout: 120000 }).catch(() => null);
           await waitAndSelectMenuItem('Arashimaru Inc. Agency arashimaru@msd.com', {
@@ -4189,6 +4270,7 @@ async function withTimeout(promise, timeoutMs, label) {
           await waitForDelegateUserSwitch("Arashimaru Inc. Agency");
           await waitForAnySelector(["#search_main_box", ".vv_username"], LONG_WAIT);
           console.log("代理アクセスユーザーへの切り替えが完了しました。");
+          await dismissVaultOnboardingDialogs('代理アクセス切替後');
         }
 
       }
