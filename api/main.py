@@ -16393,8 +16393,205 @@ def delete_file_quietly(path: Path | str) -> None:
 # =========================
 # VM取得
 # =========================
+VM_DIFF_SPREADSHEET_KEY = os.getenv("VM_DIFF_SPREADSHEET_KEY", "1hiV0Ve2cnYyrPkBuZcZIcLWeAnJ-ucNiB0P4owZpXug")
+VM_DIFF_VM_SHEET_NAME = os.getenv("VM_DIFF_VM_SHEET_NAME", "演題演者（VM）")
+VM_DIFF_VM_HEADER_ROW = max(1, int(os.getenv("VM_DIFF_VM_HEADER_ROW", "1")))
+VM_DIFF_SHEET_CACHE_TTL_SEC = max(0, int(os.getenv("VM_DIFF_SHEET_CACHE_TTL_SEC", "0")))
+VM_DIFF_USE_QUERY_LOOKUP = (os.getenv("VM_DIFF_USE_QUERY_LOOKUP") or "").strip().lower() in {"1", "true", "yes", "on"}
+VM_DIFF_QUERY_TIMEOUT_SEC = max(1, int(os.getenv("VM_DIFF_QUERY_TIMEOUT_SEC", "5")))
+VM_DIFF_INDEX_CACHE_PATH = DATA_DIR / "vm_diff_sheet_index.json"
+_VM_DIFF_INDEX_CACHE: dict[str, Any] = {
+    "expires_at": 0.0,
+    "headers": [],
+    "id_index": {},
+    "id_col": "",
+    "col_end": "A",
+    "cache_key": "",
+}
 
-def get_endai_enja_vm_rows_by_event_id(event_id: str) -> tuple[list[str], list[dict]]:
+
+def _vm_diff_quote_sheet_name(sheet_name: str) -> str:
+    return "'" + str(sheet_name or "").replace("'", "''") + "'"
+
+
+def _vm_diff_cache_key() -> str:
+    return f"{VM_DIFF_SPREADSHEET_KEY}:{VM_DIFF_VM_SHEET_NAME}:{VM_DIFF_VM_HEADER_ROW}"
+
+
+def _vm_diff_cache_payload(headers: list[str], id_index: dict[str, list[int]], id_col: str, col_end: str, now: float) -> dict[str, Any]:
+    return {
+        "cache_key": _vm_diff_cache_key(),
+        "created_at": now,
+        "expires_at": now + VM_DIFF_SHEET_CACHE_TTL_SEC,
+        "headers": headers,
+        "id_index": id_index,
+        "id_col": id_col,
+        "col_end": col_end,
+    }
+
+
+def _vm_diff_apply_index_cache(payload: dict[str, Any]) -> tuple[list[str], dict[str, list[int]], str, str] | None:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("cache_key") != _vm_diff_cache_key():
+        return None
+    if float(payload.get("expires_at") or 0) <= time.time():
+        return None
+    headers = payload.get("headers")
+    id_index = payload.get("id_index")
+    id_col = str(payload.get("id_col") or "")
+    col_end = str(payload.get("col_end") or "A")
+    if not isinstance(headers, list) or not isinstance(id_index, dict):
+        return None
+    _VM_DIFF_INDEX_CACHE.update(payload)
+    normalized_index = {
+        str(key): [int(row) for row in rows or []]
+        for key, rows in id_index.items()
+        if isinstance(rows, list)
+    }
+    return [str(header) for header in headers], normalized_index, col_end, id_col
+
+
+def _vm_diff_load_index_file_cache() -> tuple[list[str], dict[str, list[int]], str, str] | None:
+    if not VM_DIFF_SHEET_CACHE_TTL_SEC or not VM_DIFF_INDEX_CACHE_PATH.exists():
+        return None
+    try:
+        payload = json.loads(VM_DIFF_INDEX_CACHE_PATH.read_text(encoding="utf-8"))
+        return _vm_diff_apply_index_cache(payload)
+    except Exception:
+        logger.warning("Failed to load VM diff sheet index cache", exc_info=True)
+        return None
+
+
+def _vm_diff_store_index_cache(headers: list[str], id_index: dict[str, list[int]], id_col: str, col_end: str) -> None:
+    if not VM_DIFF_SHEET_CACHE_TTL_SEC:
+        return
+    payload = _vm_diff_cache_payload(headers, id_index, id_col, col_end, time.time())
+    _VM_DIFF_INDEX_CACHE.update(payload)
+    tmp_path = VM_DIFF_INDEX_CACHE_PATH.with_suffix(".tmp")
+    try:
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(VM_DIFF_INDEX_CACHE_PATH)
+    except Exception:
+        logger.warning("Failed to store VM diff sheet index cache", exc_info=True)
+
+
+def _vm_diff_gviz_json(text: str) -> dict[str, Any]:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("Google Visualization APIのレスポンス形式が不正です。")
+    return json.loads(text[start:end + 1])
+
+
+def _vm_diff_query_escape(value: str) -> str:
+    return str(value or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _vm_diff_rows_by_query(credentials, event_id: str) -> tuple[list[str], list[dict]]:
+    gc = gspread.authorize(credentials)
+    workbook = _retry_gspread(lambda: gc.open_by_key(VM_DIFF_SPREADSHEET_KEY))
+    ws = _retry_gspread(lambda: workbook.worksheet(VM_DIFF_VM_SHEET_NAME))
+    headers = make_unique(_retry_gspread(lambda: ws.row_values(VM_DIFF_VM_HEADER_ROW)))
+    if not headers:
+        return [], []
+
+    id_col_candidates = ["講演会ID", "システムID", "event_id", "Event ID"]
+    id_col = next((c for c in id_col_candidates if c in headers), "")
+    if not id_col:
+        return headers, []
+
+    id_col_letter = _col_to_a1(_find_col(headers, id_col))
+    if not credentials.valid:
+        credentials.refresh(GoogleAuthRequest())
+    query = f"select * where {id_col_letter} = '{_vm_diff_query_escape(event_id)}'"
+    response = requests.get(
+        f"https://docs.google.com/spreadsheets/d/{VM_DIFF_SPREADSHEET_KEY}/gviz/tq",
+        params={
+            "sheet": VM_DIFF_VM_SHEET_NAME,
+            "headers": str(VM_DIFF_VM_HEADER_ROW),
+            "tq": query,
+        },
+        headers={"Authorization": f"Bearer {credentials.token}"},
+        timeout=VM_DIFF_QUERY_TIMEOUT_SEC,
+    )
+    response.raise_for_status()
+    payload = _vm_diff_gviz_json(response.text)
+    if payload.get("status") != "ok":
+        errors = payload.get("errors") or []
+        raise ValueError(f"Google Visualization query failed: {errors}")
+
+    rows: list[dict] = []
+    for row_index, row in enumerate(payload.get("table", {}).get("rows") or [], start=2):
+        cells = row.get("c") or []
+        values = []
+        for cell in cells:
+            if not cell:
+                values.append("")
+            elif cell.get("f") is not None:
+                values.append(str(cell.get("f") or ""))
+            else:
+                values.append(str(cell.get("v") or ""))
+        rows.append(_rowdict(headers, values, sheet=ws.title, rownum=row_index))
+
+    return headers, rows
+
+
+def _vm_diff_get_index(workbook, ws, *, force_refresh: bool = False) -> tuple[list[str], dict[str, list[int]], str, str]:
+    now = time.time()
+    if (
+        not force_refresh
+        and
+        VM_DIFF_SHEET_CACHE_TTL_SEC
+        and _VM_DIFF_INDEX_CACHE.get("expires_at", 0) > now
+        and _VM_DIFF_INDEX_CACHE.get("headers")
+        and _VM_DIFF_INDEX_CACHE.get("cache_key") == _vm_diff_cache_key()
+    ):
+        logger.info("VM diff sheet index cache hit: memory")
+        return (
+            list(_VM_DIFF_INDEX_CACHE["headers"]),
+            dict(_VM_DIFF_INDEX_CACHE["id_index"]),
+            str(_VM_DIFF_INDEX_CACHE["col_end"] or "A"),
+            str(_VM_DIFF_INDEX_CACHE.get("id_col") or ""),
+        )
+
+    if not force_refresh:
+        file_cache = _vm_diff_load_index_file_cache()
+        if file_cache:
+            logger.info("VM diff sheet index cache hit: file")
+            return file_cache
+
+    started_at = time.time()
+    headers = make_unique(_retry_gspread(lambda: ws.row_values(VM_DIFF_VM_HEADER_ROW)))
+    if not headers:
+        return [], {}, "A", ""
+
+    id_col_candidates = ["講演会ID", "システムID", "event_id", "Event ID"]
+    id_col = next((c for c in id_col_candidates if c in headers), "")
+    col_end = _col_to_a1(len(headers))
+    if not id_col:
+        return headers, {}, col_end, ""
+
+    id_col_letter = _col_to_a1(_find_col(headers, id_col))
+    sheet_ref = _vm_diff_quote_sheet_name(ws.title)
+    start_row = VM_DIFF_VM_HEADER_ROW + 1
+    range_name = f"{sheet_ref}!{id_col_letter}{start_row}:{id_col_letter}"
+    resp = _retry_gspread(lambda: workbook.values_batch_get([range_name]))
+    value_ranges = resp.get("valueRanges") or []
+    id_values = _extract_1col(value_ranges[0] if value_ranges else {})
+    id_index = _build_id_index_from_column(id_values, start_row=start_row)
+    _vm_diff_store_index_cache(headers, id_index, id_col, col_end)
+    logger.info(
+        "VM diff sheet index rebuilt: ids=%s headers=%s elapsed=%.2fs",
+        len(id_index),
+        len(headers),
+        time.time() - started_at,
+    )
+
+    return headers, id_index, col_end, id_col
+
+
+def get_endai_enja_vm_rows_by_event_id(event_id: str, *, force_refresh: bool = False) -> tuple[list[str], list[dict]]:
     event_id = normalize_space(event_id or "")
     if not event_id:
         return [], []
@@ -16405,34 +16602,59 @@ def get_endai_enja_vm_rows_by_event_id(event_id: str) -> tuple[list[str], list[d
     ]
 
     credentials = get_gsa_credentials(scope)
+    if VM_DIFF_USE_QUERY_LOOKUP and not force_refresh and not VM_DIFF_SHEET_CACHE_TTL_SEC:
+        try:
+            query_headers, query_rows = _vm_diff_rows_by_query(credentials, event_id)
+            if query_rows:
+                logger.info("VM diff query lookup hit: event_id=%s rows=%s", event_id, len(query_rows))
+                return query_headers, query_rows
+            logger.info("VM diff query lookup returned no rows; falling back to ID-column lookup. event_id=%s", event_id)
+        except Exception as exc:
+            logger.info("VM diff query lookup failed; falling back to ID-column lookup: %s", exc)
+
     gc = gspread.authorize(credentials)
 
-    spreadsheet_key = "1hiV0Ve2cnYyrPkBuZcZIcLWeAnJ-ucNiB0P4owZpXug"
-    workbook = gc.open_by_key(spreadsheet_key)
-    ws = workbook.worksheet("演題演者（VM）")
+    started_at = time.time()
+    workbook = _retry_gspread(lambda: gc.open_by_key(VM_DIFF_SPREADSHEET_KEY))
+    ws = _retry_gspread(lambda: workbook.worksheet(VM_DIFF_VM_SHEET_NAME))
+    logger.info("VM diff workbook opened: elapsed=%.2fs", time.time() - started_at)
 
-    values = ws.get_all_values()
-    if not values or len(values) < 2:
+    index_started_at = time.time()
+    headers, id_index, col_end, id_col = _vm_diff_get_index(workbook, ws, force_refresh=force_refresh)
+    logger.info("VM diff index ready: elapsed=%.2fs", time.time() - index_started_at)
+    if not headers:
         return [], []
 
-    # header row = 1
-    headers = make_unique(values[0])
-
-    id_col_candidates = ["講演会ID", "システムID", "event_id", "Event ID"]
-    id_col = next((c for c in id_col_candidates if c in headers), None)
-    if not id_col:
+    rownums = id_index.get(event_id, [])
+    if not rownums:
+        logger.info("VM diff event_id not found in index: event_id=%s", event_id)
         return headers, []
 
+    rows_started_at = time.time()
+    sheet_ref = _vm_diff_quote_sheet_name(ws.title)
+    ranges = [f"{sheet_ref}!A{rownum}:{col_end}{rownum}" for rownum in rownums]
     rows: list[dict] = []
-    for raw in values[1:]:
-        row = {
-            headers[i]: raw[i] if i < len(raw) else ""
-            for i in range(len(headers))
-        }
-        rid = normalize_space(row.get(id_col, ""))
-        if rid == event_id:
-            rows.append(row)
+    for i in range(0, len(ranges), 100):
+        chunk_ranges = ranges[i:i + 100]
+        chunk_rownums = rownums[i:i + 100]
+        resp = _retry_gspread(lambda: workbook.values_batch_get(chunk_ranges))
+        for rownum, value_range in zip(chunk_rownums, resp.get("valueRanges") or []):
+            row_values = (value_range.get("values") or [[]])[0]
+            rows.append(_rowdict(headers, row_values, sheet=ws.title, rownum=rownum))
 
+    if id_col:
+        matched_rows = [row for row in rows if normalize_space(row.get(id_col, "")) == event_id]
+        if len(matched_rows) != len(rows) and not force_refresh and VM_DIFF_SHEET_CACHE_TTL_SEC:
+            return get_endai_enja_vm_rows_by_event_id(event_id, force_refresh=True)
+        rows = matched_rows
+
+    logger.info(
+        "VM diff row lookup complete: event_id=%s rows=%s headers=%s elapsed=%.2fs",
+        event_id,
+        len(rows),
+        len(headers),
+        time.time() - rows_started_at,
+    )
     return headers, rows
 
 
@@ -16652,19 +16874,33 @@ def extract_text_blocks_for_vm_diff(file_path: str) -> list[Any]:
 # endpoint: event_id -> VM rows
 # =========================
 @app.post("/vm-diff/by-event-id")
-async def vm_diff_by_event_id(event_id: str = Form(...)):
+async def vm_diff_by_event_id(request: Request):
+    content_type = (request.headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        body = await request.json()
+        event_id = str(body.get("event_id") or "")
+        force_refresh = bool(body.get("force_refresh"))
+    else:
+        form = await request.form()
+        event_id = str(form.get("event_id") or "")
+        force_refresh = str(form.get("force_refresh") or "").strip().lower() in {"1", "true", "yes", "on"}
+
     event_id = normalize_space(event_id or "")
     if not event_id:
         raise HTTPException(status_code=400, detail="講演会IDを入力してください。")
 
     try:
-        headers, vm_rows = get_endai_enja_vm_rows_by_event_id(event_id)
+        headers, vm_rows = get_endai_enja_vm_rows_by_event_id(event_id, force_refresh=force_refresh)
+        shaped_rows = shape_vm_rows_for_diff(vm_rows, headers)
 
         return {
             "ok": True,
             "event_id": event_id,
             "headers": headers,
-            "vm_rows": shape_vm_rows_for_diff(vm_rows, headers),
+            "vm_rows": shaped_rows,
+            "vm_row_count": len(shaped_rows),
+            "header_count": len(headers),
+            "force_refresh": force_refresh,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"VM取得に失敗しました: {e}")
@@ -16701,12 +16937,15 @@ async def extract_text_blocks_endpoint(
                 headers, vm_rows = [], []
 
         blocks = extract_text_blocks_for_vm_diff(tmp_path)
+        shaped_rows = shape_vm_rows_for_diff(vm_rows, headers)
 
         return {
             "ok": True,
             "event_id": event_id,
             "headers": headers,
-            "vm_rows": shape_vm_rows_for_diff(vm_rows, headers),
+            "vm_rows": shaped_rows,
+            "vm_row_count": len(shaped_rows),
+            "header_count": len(headers),
             "blocks": blocks_to_dicts(blocks),
         }
 

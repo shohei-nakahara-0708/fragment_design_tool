@@ -140,6 +140,33 @@ const ui = {
     fontFamily: "inherit",
     boxSizing: "border-box",
   },
+  flyerDrop: {
+    display: "grid",
+    gap: 6,
+    minHeight: 96,
+    padding: 14,
+    placeItems: "center",
+    textAlign: "center",
+    border: "1.5px dashed #cbd5e1",
+    borderRadius: 12,
+    background: "#f8fafc",
+    cursor: "pointer",
+    transition: "border-color 0.15s ease, background 0.15s ease",
+  },
+  flyerDropActive: {
+    borderColor: "#2563eb",
+    background: "#eff6ff",
+  },
+  flyerDropDisabled: {
+    opacity: 0.6,
+    cursor: "not-allowed",
+  },
+  flyerDropTitle: {
+    color: "#111827",
+    fontSize: 14,
+    fontWeight: 800,
+    overflowWrap: "anywhere",
+  },
   badge: (tone = "gray") => {
     const base = {
       display: "inline-flex",
@@ -2376,6 +2403,7 @@ function MaterialPreview({ uploadFile, selectedField, activePreviewHitKey }) {
 }
 
 export default function VmDiffPage() {
+  const flyerInputRef = useRef(null);
   const [blocks, setBlocks] = useState([]);
   const [vmRows, setVmRows] = useState([]);
   const [vmHeaders, setVmHeaders] = useState([]);
@@ -2385,7 +2413,10 @@ export default function VmDiffPage() {
   const [uploadFile, setUploadFile] = useState(null);
   const [loadingVm, setLoadingVm] = useState(false);
   const [loadingAnalyze, setLoadingAnalyze] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState("");
+  const [flyerDragOver, setFlyerDragOver] = useState(false);
   const [error, setError] = useState("");
+  const [loadStats, setLoadStats] = useState(null);
   const [manualCompareText, setManualCompareText] = useState("");
   const [activePreviewHitKey, setActivePreviewHitKey] = useState("");
 
@@ -2429,11 +2460,22 @@ export default function VmDiffPage() {
   setPinnedHeaders(DEFAULT_PINNED_HEADERS);
 
   setError("");
+  setLoadingMessage("");
+  setLoadStats(null);
 }
 
 function handleFlyerFileChange(file) {
   resetForNewFlyer();
-  setUploadFile(file || null);
+  if (!file) {
+    setUploadFile(null);
+    return;
+  }
+  if (!isSupportedFlyerFile(file)) {
+    setUploadFile(null);
+    setError("サポートされていないファイル形式です。PDFファイルをアップロードしてください。");
+    return;
+  }
+  setUploadFile(file);
 }
 
   function isSupportedFlyerFile(file) {
@@ -2450,25 +2492,54 @@ function handleFlyerFileChange(file) {
     }
 
     setLoadingVm(true);
+    setLoadingMessage("シートの講演会ID列から該当行を取得しています。");
     try {
-      const res = await fetch(`${API_BASE}/vm-diff/by-event-id`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ event_id: eventIdInput.trim() }),
+      const data = await requestVmRows(eventIdInput.trim());
+      const nextRows = Array.isArray(data?.vm_rows) ? data.vm_rows : [];
+      const nextHeaders = Array.isArray(data?.headers) ? data.headers : [];
+      setVmRows(nextRows);
+      setVmHeaders(nextHeaders);
+      setLoadStats({
+        vmRows: nextRows.length,
+        headers: nextHeaders.length,
+        blocks: blocks.length,
       });
-
-      if (!res.ok) {
-        throw new Error(await readErrorMessage(res, `VM取得に失敗しました: ${res.status}`));
-      }
-
-      const data = await res.json();
-      setVmRows(Array.isArray(data?.vm_rows) ? data.vm_rows : []);
-      setVmHeaders(Array.isArray(data?.headers) ? data.headers : []);
     } catch (e) {
       setError(e?.message || "VM取得に失敗しました。");
     } finally {
       setLoadingVm(false);
+      setLoadingMessage("");
     }
+  }
+
+  async function requestVmRows(eventId, { forceRefresh = false } = {}) {
+    const res = await fetch(`${API_BASE}/vm-diff/by-event-id`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ event_id: eventId, force_refresh: forceRefresh }),
+    });
+
+    if (!res.ok) {
+      throw new Error(await readErrorMessage(res, `VM取得に失敗しました: ${res.status}`));
+    }
+
+    return res.json();
+  }
+
+  async function requestFlyerText(file) {
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const res = await fetch(`${API_BASE}/vm-diff/extract-text-blocks`, {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!res.ok) {
+      throw new Error(await readErrorMessage(res, `案内状テキスト取得に失敗しました: ${res.status}`));
+    }
+
+    return res.json();
   }
 
   async function analyzeUploadedFlyerTextOnly() {
@@ -2485,28 +2556,44 @@ function handleFlyerFileChange(file) {
     }
 
     setLoadingAnalyze(true);
+    setLoadingVm(Boolean(eventIdInput.trim()));
+    setLoadingMessage(eventIdInput.trim() ? "PDF解析とシート取得を並列で実行しています。" : "PDFからテキストを抽出しています。");
     try {
-      const formData = new FormData();
-      formData.append("file", uploadFile);
-      formData.append("eventId", eventIdInput.trim());
+      const eventId = eventIdInput.trim();
+      const [textData, vmData] = await Promise.all([
+        requestFlyerText(uploadFile),
+        eventId ? requestVmRows(eventId) : Promise.resolve(null),
+      ]);
 
-      const res = await fetch(`${API_BASE}/vm-diff/extract-text-blocks`, {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!res.ok) {
-        throw new Error(await readErrorMessage(res, `案内状テキスト取得に失敗しました: ${res.status}`));
+      const nextBlocks = Array.isArray(textData?.blocks) ? textData.blocks : [];
+      setBlocks(nextBlocks);
+      if (vmData) {
+        const nextRows = Array.isArray(vmData?.vm_rows) ? vmData.vm_rows : [];
+        const nextHeaders = Array.isArray(vmData?.headers) ? vmData.headers : [];
+        setVmRows(nextRows);
+        setVmHeaders(nextHeaders);
+        setLoadStats({
+          vmRows: nextRows.length,
+          headers: nextHeaders.length,
+          blocks: nextBlocks.length,
+        });
+      } else {
+        const nextRows = Array.isArray(textData?.vm_rows) ? textData.vm_rows : [];
+        const nextHeaders = Array.isArray(textData?.headers) ? textData.headers : [];
+        setVmRows(nextRows);
+        setVmHeaders(nextHeaders);
+        setLoadStats({
+          vmRows: nextRows.length,
+          headers: nextHeaders.length,
+          blocks: nextBlocks.length,
+        });
       }
-
-      const data = await res.json();
-      setBlocks(Array.isArray(data?.blocks) ? data.blocks : []);
-      if (Array.isArray(data?.vm_rows)) setVmRows(data.vm_rows);
-      if (Array.isArray(data?.headers)) setVmHeaders(data.headers);
     } catch (e) {
       setError(e?.message || "案内状テキスト取得に失敗しました。");
     } finally {
       setLoadingAnalyze(false);
+      setLoadingVm(false);
+      setLoadingMessage("");
     }
   }
 
@@ -2722,24 +2809,77 @@ function handleSelectField(field, cellRef) {
                   {loadingVm ? "取得中..." : "VM行を取得"}
                 </button>
               </div> */}
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button type="button" style={ui.btn("secondary")} onClick={() => fetchVmRowsOnly()} disabled={loading}>
+                  {loadingVm ? "取得中..." : "VM行だけ取得"}
+                </button>
+              </div>
             </div>
 
             <div style={{ display: "grid", gap: 8 }}>
               <label style={ui.h3}>案内状ファイル</label>
-              <input
-                type="file"
-                accept=".pdf,application/pdf"
-                onChange={(e) => handleFlyerFileChange(e.target.files?.[0] || null)}
-              />
+              <div
+                style={{
+                  ...ui.flyerDrop,
+                  ...(flyerDragOver ? ui.flyerDropActive : null),
+                  ...(loading ? ui.flyerDropDisabled : null),
+                }}
+                role="button"
+                tabIndex={0}
+                onClick={() => {
+                  if (!loading) flyerInputRef.current?.click();
+                }}
+                onKeyDown={(event) => {
+                  if (loading) return;
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    flyerInputRef.current?.click();
+                  }
+                }}
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  if (!loading) setFlyerDragOver(true);
+                }}
+                onDragLeave={() => setFlyerDragOver(false)}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  setFlyerDragOver(false);
+                  if (!loading) handleFlyerFileChange(event.dataTransfer.files?.[0] || null);
+                }}
+              >
+                <div style={ui.flyerDropTitle}>
+                  {uploadFile ? uploadFile.name : "PDFをドラッグ&ドロップ または クリックして選択"}
+                </div>
+                <div style={ui.muted}>
+                  {uploadFile ? "別のPDFをドロップすると差し替えます。" : "テキスト抽出可能なPDFを追加してください。"}
+                </div>
+                <input
+                  ref={flyerInputRef}
+                  type="file"
+                  accept=".pdf,application/pdf"
+                  style={{ display: "none" }}
+                  onChange={(e) => {
+                    handleFlyerFileChange(e.target.files?.[0] || null);
+                    e.target.value = "";
+                  }}
+                  disabled={loading}
+                />
+              </div>
               <div style={ui.muted}>
                 対応形式はテキスト抽出可能な PDF のみです。スキャンPDF・画像PDFは対応外です。
               </div>
               <button type="button" style={ui.btn("primary")} onClick={analyzeUploadedFlyerTextOnly} disabled={loading}>
-                {loadingAnalyze ? "読込中..." : "シートを読み込む"}
+                {loadingAnalyze ? "読込中..." : "PDFとシートを読み込む"}
               </button>
+              {loadingMessage ? <div style={ui.muted}>{loadingMessage}</div> : null}
             </div>
 
             {error ? <div style={{ ...ui.muted, color: "#b00020" }}>{error}</div> : null}
+              {loadStats ? (
+              <div style={ui.muted}>
+                VM行 {loadStats.vmRows}件 / ヘッダー {loadStats.headers}件 / PDF抽出 {loadStats.blocks}件
+              </div>
+            ) : null}
           </div>
         </div>
 
@@ -2782,7 +2922,9 @@ function handleSelectField(field, cellRef) {
         {rows.length === 0 ? (
           <div style={ui.card}>
             <div style={ui.muted}>
-              左で講演会IDを取得し、右で案内状を読み込むと比較表を表示します。
+              {loadStats && eventIdInput.trim()
+                ? "指定した講演会IDのVM行が見つかりませんでした。講演会IDとシート側の値を確認してください。"
+                : "左で講演会IDを取得し、右で案内状を読み込むと比較表を表示します。"}
             </div>
           </div>
         ) : (
