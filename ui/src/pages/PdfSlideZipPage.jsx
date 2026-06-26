@@ -32,6 +32,71 @@ function pageZipBaseName(presentationId, page, pageCount) {
   return `${safeId}_${String(page || 1).padStart(digits, "0")}`;
 }
 
+function normalizeCsvName(value) {
+  return String(value || "")
+    .replace(/^\uFEFF/, "")
+    .trim()
+    .replace(/\.zip$/i, "");
+}
+
+function parseCsvRows(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    const next = text[index + 1];
+
+    if (char === '"') {
+      if (inQuotes && next === '"') {
+        field += '"';
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (char === "," && !inQuotes) {
+      row.push(field);
+      field = "";
+      continue;
+    }
+
+    if ((char === "\n" || char === "\r") && !inQuotes) {
+      if (char === "\r" && next === "\n") index += 1;
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+      continue;
+    }
+
+    field += char;
+  }
+
+  row.push(field);
+  rows.push(row);
+  return rows.filter((items) => items.some((item) => String(item || "").trim()));
+}
+
+function readCsvNames(text) {
+  const rows = parseCsvRows(text);
+  if (rows[0]?.[0]?.trim().toLowerCase().startsWith("sep=")) rows.shift();
+  if (!rows.length) throw new Error("CSVにヘッダー行がありません。");
+
+  const headers = rows[0].map((header) => normalizeCsvName(header).toLowerCase());
+  const nameIndex = headers.indexOf("name");
+  if (nameIndex < 0) throw new Error("CSVにName列がありません。");
+
+  return rows
+    .slice(1)
+    .map((row) => normalizeCsvName(row[nameIndex]))
+    .filter(Boolean);
+}
+
 function downloadUrl(value) {
   if (!value) return "";
   if (/^https?:\/\//i.test(value)) return value;
@@ -87,6 +152,7 @@ export default function PdfSlideZipPage() {
   const [copiedKey, setCopiedKey] = useState("");
   const [copyModeIndexes, setCopyModeIndexes] = useState({});
   const [openTitlePanels, setOpenTitlePanels] = useState({});
+  const [csvCheck, setCsvCheck] = useState({ fileName: "", names: null, error: "" });
   const [result, setResult] = useState(null);
 
   useEffect(() => {
@@ -292,6 +358,17 @@ export default function PdfSlideZipPage() {
     setCopyModeIndex(documentId, titles, page - 1);
   };
 
+  const handleCsvChange = async (file) => {
+    if (!file) return;
+    try {
+      const names = readCsvNames(await file.text());
+      setCsvCheck({ fileName: file.name, names, error: "" });
+      setError("");
+    } catch (err) {
+      setCsvCheck({ fileName: file.name, names: null, error: err?.message || "CSVを読み込めませんでした。" });
+    }
+  };
+
   const normalizedIds = documents.map((item) => normalizePresentationId(item.presentationId));
   const normalizedIdKeys = normalizedIds.map((id) => id.toLocaleLowerCase());
   const duplicateIds = [
@@ -307,6 +384,15 @@ export default function PdfSlideZipPage() {
     : hasInvalidId && documents.length
       ? "すべてのPDFにPresentation IDを入力してください。"
       : "";
+  const expectedPageZipNames = documents.flatMap((item) => {
+    const presentationId = normalizePresentationId(item.presentationId);
+    if (!presentationId || !item.titles.length) return [];
+    return item.titles.map((title) => pageZipBaseName(presentationId, title.page, item.titles.length));
+  });
+  const csvNameSet = csvCheck.names ? new Set(csvCheck.names) : null;
+  const missingCsvNames = csvNameSet
+    ? [...new Set(expectedPageZipNames.filter((name) => !csvNameSet.has(name)))]
+    : [];
 
   const generate = async () => {
     if (!documents.length || hasInvalidId || duplicateIds.length || generating) return;
@@ -448,6 +534,68 @@ export default function PdfSlideZipPage() {
                     </div>
                   </div>
                   <span className="lecture-tool-progress__badge">{documents.length}件</span>
+                </div>
+
+                <div className="pdf-slide-csv-check">
+                  <div className="pdf-slide-csv-check__head">
+                    <div>
+                      <h3 className="pdf-slide-csv-check__title">CSV Nameチェック</h3>
+                      <div className="lecture-tool-panel__sub">
+                        CSVのName列にページZIP名（拡張子なし）が全部あるか確認します。
+                      </div>
+                    </div>
+                    <label className="lecture-tool-button lecture-tool-button--small pdf-slide-csv-check__button">
+                      CSVを選択
+                      <input
+                        className="lecture-tool-hidden-input"
+                        type="file"
+                        accept=".csv,text/csv"
+                        onChange={(event) => {
+                          handleCsvChange(event.target.files?.[0]);
+                          event.target.value = "";
+                        }}
+                        disabled={generating}
+                      />
+                    </label>
+                  </div>
+
+                  {csvCheck.fileName ? (
+                    <div className="pdf-slide-csv-check__meta">
+                      {csvCheck.fileName}
+                      {csvCheck.names ? ` / ${csvCheck.names.length}件のName` : ""}
+                    </div>
+                  ) : null}
+
+                  {csvCheck.error ? <div className="lecture-tool-alert">{csvCheck.error}</div> : null}
+
+                  {csvNameSet && !csvCheck.error ? (
+                    totalAnalyzing ? (
+                      <div className="pdf-slide-csv-check__meta">
+                        PDFのページ解析が終わった後にNameチェックを更新します。
+                      </div>
+                    ) : !expectedPageZipNames.length ? (
+                      <div className="pdf-slide-csv-check__meta">
+                        チェック対象のページZIP名がまだありません。
+                      </div>
+                    ) : missingCsvNames.length ? (
+                      <div className="pdf-slide-csv-check__missing">
+                        <div className="pdf-slide-csv-check__missing-title">
+                          CSVのNameにないページZIP名（拡張子なし）: {missingCsvNames.length}件
+                        </div>
+                        <div className="pdf-slide-csv-check__missing-list">
+                          {missingCsvNames.map((name) => (
+                            <code className="pdf-slide-csv-check__missing-item" key={name}>
+                              {name}
+                            </code>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="pdf-slide-csv-check__ok">
+                        追加済みPDFのページZIP名はすべてCSVのNameにあります。
+                      </div>
+                    )
+                  ) : null}
                 </div>
 
                 <div className="pdf-slide-document-list">

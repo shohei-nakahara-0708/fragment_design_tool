@@ -69,6 +69,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import logging
 
+if os.name == "nt" and hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 logger = logging.getLogger(__name__)
 load_dotenv()
 _pw = None

@@ -1284,6 +1284,91 @@ body {
   padding-bottom: 0;
 }
 
+.pdf-slide-csv-check {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0 16px;
+  padding: 12px;
+  border: 1px solid rgba(37, 99, 235, 0.22);
+  border-radius: 8px;
+  background: rgba(239, 246, 255, 0.62);
+}
+
+.pdf-slide-csv-check__head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.pdf-slide-csv-check__title {
+  margin: 0;
+  color: #0f172a;
+  font-size: 13px;
+  font-weight: 950;
+  line-height: 1.4;
+}
+
+.pdf-slide-csv-check__button {
+  flex: 0 0 auto;
+  cursor: pointer;
+}
+
+.pdf-slide-csv-check__meta {
+  color: #475569;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.pdf-slide-csv-check__missing {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid rgba(220, 38, 38, 0.22);
+  border-radius: 7px;
+  background: rgba(254, 242, 242, 0.92);
+}
+
+.pdf-slide-csv-check__missing-title {
+  color: #991b1b;
+  font-size: 12px;
+  font-weight: 950;
+  line-height: 1.4;
+}
+
+.pdf-slide-csv-check__missing-list {
+  display: flex;
+  max-height: 180px;
+  gap: 6px;
+  flex-wrap: wrap;
+  overflow: auto;
+}
+
+.pdf-slide-csv-check__missing-item {
+  padding: 5px 7px;
+  border: 1px solid rgba(248, 113, 113, 0.3);
+  border-radius: 6px;
+  background: #ffffff;
+  color: #7f1d1d;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.35;
+}
+
+.pdf-slide-csv-check__ok {
+  padding: 9px 10px;
+  border: 1px solid rgba(22, 163, 74, 0.22);
+  border-radius: 7px;
+  background: rgba(240, 253, 244, 0.92);
+  color: #166534;
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.45;
+}
+
 .pdf-slide-document-list {
   margin: 0 -15px;
   border-top: 1px solid rgba(226, 232, 240, 0.95);
@@ -2235,6 +2320,15 @@ body {
 
   .pdf-slide-result {
     display: grid;
+  }
+
+  .pdf-slide-csv-check__head {
+    display: grid;
+  }
+
+  .pdf-slide-csv-check__button {
+    width: 100%;
+    justify-content: center;
   }
 
   .folder-zip-mode__buttons {
