@@ -2228,6 +2228,202 @@ body {
   padding: 6px 8px;
 }
 
+.video-thumb-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(340px, 0.7fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.video-thumb-player {
+  margin-top: 14px;
+  overflow: hidden;
+  border: 1px solid rgba(203, 213, 225, 0.95);
+  border-radius: 8px;
+  background: #020617;
+}
+
+.video-thumb-player video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #020617;
+}
+
+.video-thumb-settings {
+  display: grid;
+  gap: 14px;
+}
+
+.video-thumb-range {
+  width: 100%;
+  accent-color: #2563eb;
+}
+
+.video-thumb-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.video-thumb-specs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.video-thumb-specs div {
+  display: grid;
+  gap: 3px;
+  min-height: 58px;
+  padding: 10px;
+  border: 1px solid rgba(203, 213, 225, 0.84);
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.video-thumb-specs strong {
+  color: #0f172a;
+  font-size: 12px;
+  font-weight: 950;
+  line-height: 1.35;
+}
+
+.video-thumb-specs span {
+  color: #475569;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.video-thumb-result {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 0.55fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.video-thumb-result__preview {
+  overflow: hidden;
+  border: 1px solid rgba(15, 23, 42, 0.16);
+  border-radius: 8px;
+  background: #020617;
+  box-shadow: 0 12px 30px rgba(2, 6, 23, 0.08);
+}
+
+.video-thumb-result__preview img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: contain;
+  background: #020617;
+}
+
+.video-thumb-result__downloads {
+  display: grid;
+  gap: 8px;
+}
+
+.video-encode-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 0.82fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.video-encode-player,
+.video-encode-result__media {
+  overflow: hidden;
+  border: 1px solid rgba(203, 213, 225, 0.95);
+  border-radius: 8px;
+  background: #020617;
+}
+
+.video-encode-player {
+  margin-top: 14px;
+}
+
+.video-encode-player video,
+.video-encode-result__media video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #020617;
+}
+
+.video-encode-settings {
+  display: grid;
+  gap: 14px;
+}
+
+.video-encode-field-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.video-encode-estimate,
+.video-encode-result__stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.video-encode-metric,
+.video-encode-result__stats div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  min-height: 70px;
+  padding: 10px;
+  border: 1px solid rgba(203, 213, 225, 0.84);
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.video-encode-metric span,
+.video-encode-result__stats strong {
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 950;
+  line-height: 1.35;
+}
+
+.video-encode-metric strong,
+.video-encode-result__stats span {
+  color: #0f172a;
+  font-size: 13px;
+  font-weight: 950;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.video-encode-metric em {
+  color: #475569;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  font-style: normal;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.video-encode-result {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 0.7fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.video-encode-result__body {
+  display: grid;
+  gap: 10px;
+}
+
+.video-encode-result__alert {
+  margin-bottom: 0;
+}
+
 @media (max-width: 960px) {
   .app-shell {
     display: block;
@@ -2286,6 +2482,18 @@ body {
     grid-column: 3;
   }
 
+  .video-thumb-grid,
+  .video-thumb-result,
+  .video-encode-grid,
+  .video-encode-result {
+    grid-template-columns: 1fr;
+  }
+
+  .video-encode-estimate,
+  .video-encode-result__stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .pdf-slide-document__thumbnail {
     width: 88px;
   }
@@ -2320,6 +2528,16 @@ body {
 
   .pdf-slide-result {
     display: grid;
+  }
+
+  .video-thumb-specs {
+    grid-template-columns: 1fr;
+  }
+
+  .video-encode-field-row,
+  .video-encode-estimate,
+  .video-encode-result__stats {
+    grid-template-columns: 1fr;
   }
 
   .pdf-slide-csv-check__head {

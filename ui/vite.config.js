@@ -18,6 +18,7 @@ export default defineConfig({
       "/pdf-document-zip-tool": "http://127.0.0.1:8000",
       "/folder-zip-tool": "http://127.0.0.1:8000",
       "/ppt-video-zip-tool": "http://127.0.0.1:8000",
+      "/video-encode-tool": "http://127.0.0.1:8000",
     },
   },
 });

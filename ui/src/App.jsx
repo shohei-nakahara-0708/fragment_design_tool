@@ -10,6 +10,8 @@ import FolderZipPage from "./pages/FolderZipPage.jsx";
 import PdfDocumentZipPage from "./pages/PdfDocumentZipPage.jsx";
 import PdfSlideZipPage from "./pages/PdfSlideZipPage.jsx";
 import PptVideoZipPage from "./pages/PptVideoZipPage.jsx";
+import VideoEncodePage from "./pages/VideoEncodePage.jsx";
+import VideoThumbnailPage from "./pages/VideoThumbnailPage.jsx";
 import "./styles/shell.css";
 
 function AppShell({ children }) {
@@ -102,6 +104,26 @@ function AppShell({ children }) {
                 <span className="app-sidebar__link-main">PPT動画ZIP生成</span>
                 <span className="app-sidebar__link-sub">動画ページ抽出・ZIP生成</span>
               </NavLink>
+
+              <NavLink
+                to="/video-thumbnail"
+                className={({ isActive }) =>
+                  `app-sidebar__link${isActive ? " app-sidebar__link--active" : ""}`
+                }
+              >
+                <span className="app-sidebar__link-main">動画サムネイル作成</span>
+                <span className="app-sidebar__link-sub">指定秒数からPNG生成</span>
+              </NavLink>
+
+              <NavLink
+                to="/video-encode"
+                className={({ isActive }) =>
+                  `app-sidebar__link${isActive ? " app-sidebar__link--active" : ""}`
+                }
+              >
+                <span className="app-sidebar__link-main">動画エンコード</span>
+                <span className="app-sidebar__link-sub">目標サイズへMP4圧縮</span>
+              </NavLink>
             </div>
           </section>
         </nav>
@@ -142,6 +164,12 @@ export default function App() {
 
         {/* PPT動画ZIP生成 */}
         <Route path="/ppt-video-zip" element={<PptVideoZipPage />} />
+
+        {/* 動画サムネイル作成 */}
+        <Route path="/video-thumbnail" element={<VideoThumbnailPage />} />
+
+        {/* 動画エンコード */}
+        <Route path="/video-encode" element={<VideoEncodePage />} />
 
         {/* それ以外は一覧へ */}
         <Route path="*" element={<Navigate to="/" replace />} />

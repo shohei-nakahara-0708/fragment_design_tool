@@ -15572,6 +15572,11 @@ PPT_VIDEO_THUMB_SIZE = (200, 150)
 PPT_VIDEO_RENDER_SIZE = 1200
 PPT_VIDEO_MAX_FILE_BYTES = max(1, int(os.getenv("PPT_VIDEO_MAX_FILE_BYTES", str(3 * 1024 * 1024 * 1024))))
 PPT_VIDEO_MAX_SELECTED_SLIDES = max(1, int(os.getenv("PPT_VIDEO_MAX_SELECTED_SLIDES", "50")))
+VIDEO_ENCODE_MAX_FILE_BYTES = max(1, int(os.getenv("VIDEO_ENCODE_MAX_FILE_BYTES", str(5 * 1024 * 1024 * 1024))))
+VIDEO_ENCODE_TIMEOUT_SEC = max(60, int(os.getenv("VIDEO_ENCODE_TIMEOUT_SEC", str(2 * 60 * 60))))
+VIDEO_ENCODE_AUTO_HEIGHTS = [1080, 720, 540, 480, 360, 270, 240]
+VIDEO_ENCODE_ALLOWED_HEIGHTS = {"auto", "1080", "720", "540", "480", "360", "270", "240"}
+VIDEO_ENCODE_ALLOWED_PRESETS = {"veryfast", "faster", "fast", "medium", "slow"}
 PPT_VIDEO_NS = {
     "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
@@ -16006,6 +16011,318 @@ def _ppt_video_package_zip(
 
 def _ppt_video_result_url(session_id: str, filename: str) -> str:
     return f"/ppt-video-zip-tool/results/{session_id}/{quote(filename)}?download=1"
+
+
+def _video_encode_safe_filename(value: str) -> str:
+    raw = normalize_space(value or "")
+    raw = re.sub(r"\.(mp4|mov|m4v|webm)$", "", raw, flags=re.IGNORECASE)
+    safe = re.sub(r"[\x00-\x1f<>:\"/\\|?*]+", "_", raw).strip(" ._")
+    if not safe or safe in {".", ".."}:
+        safe = "encoded_video"
+    return safe
+
+
+def _video_encode_parse_fraction(value: str | None) -> float:
+    text = str(value or "").strip()
+    if not text or text == "0/0":
+        return 0.0
+    if "/" in text:
+        numerator, denominator = text.split("/", 1)
+        try:
+            den = float(denominator)
+            if den == 0:
+                return 0.0
+            return float(numerator) / den
+        except ValueError:
+            return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def _video_encode_probe(input_path: Path) -> dict[str, Any]:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("ffprobeが見つかりません。")
+
+    proc = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration,size,bit_rate:stream=index,codec_type,width,height,duration,bit_rate,avg_frame_rate,r_frame_rate",
+            "-of",
+            "json",
+            str(input_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "動画情報を取得できませんでした。")
+
+    payload = json.loads(proc.stdout or "{}")
+    streams = payload.get("streams") or []
+    video_stream = next((item for item in streams if item.get("codec_type") == "video"), None)
+    audio_stream = next((item for item in streams if item.get("codec_type") == "audio"), None)
+    if not video_stream:
+        raise ValueError("動画ストリームが見つかりません。")
+
+    format_info = payload.get("format") or {}
+
+    def _float_value(*values: Any) -> float:
+        for item in values:
+            try:
+                number = float(item)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number) and number > 0:
+                return number
+        return 0.0
+
+    duration = _float_value(video_stream.get("duration"), format_info.get("duration"))
+    width = int(video_stream.get("width") or 0)
+    height = int(video_stream.get("height") or 0)
+    if duration <= 0:
+        raise ValueError("動画の長さを取得できません。")
+    if width <= 0 or height <= 0:
+        raise ValueError("動画の解像度を取得できません。")
+
+    fps = _video_encode_parse_fraction(video_stream.get("avg_frame_rate")) or _video_encode_parse_fraction(video_stream.get("r_frame_rate")) or 30.0
+    if not math.isfinite(fps) or fps <= 0 or fps > 120:
+        fps = 30.0
+
+    return {
+        "duration": duration,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "size": int(format_info.get("size") or input_path.stat().st_size),
+        "bitrate": int(format_info.get("bit_rate") or video_stream.get("bit_rate") or 0),
+        "hasAudio": audio_stream is not None,
+    }
+
+
+def _video_encode_auto_audio_kbps(total_kbps: int, has_audio: bool) -> int:
+    if not has_audio:
+        return 0
+    if total_kbps < 80:
+        return max(0, total_kbps - 40)
+    if total_kbps < 160:
+        return 32
+    if total_kbps < 260:
+        return 48
+    return 64
+
+
+def _video_encode_even(value: float) -> int:
+    rounded = int(round(value))
+    return max(2, rounded - (rounded % 2))
+
+
+def _video_encode_dimensions(
+    *,
+    original_width: int,
+    original_height: int,
+    video_kbps: int,
+    fps: float,
+    max_height: str,
+) -> tuple[int, int]:
+    if original_width <= 0 or original_height <= 0:
+        raise ValueError("動画の解像度を取得できません。")
+
+    aspect = original_width / original_height
+    source_height = _video_encode_even(original_height)
+    source_width = _video_encode_even(original_width)
+
+    def _size_for_height(height: int) -> tuple[int, int]:
+        target_height = min(_video_encode_even(height), source_height)
+        return _video_encode_even(target_height * aspect), target_height
+
+    if max_height != "auto":
+        return _size_for_height(int(max_height))
+
+    fps_for_budget = max(12.0, min(float(fps or 30.0), 60.0))
+    candidates = [height for height in VIDEO_ENCODE_AUTO_HEIGHTS if height <= source_height]
+    if source_height not in candidates:
+        candidates.insert(0, source_height)
+    candidates = sorted(set(candidates), reverse=True)
+
+    for height in candidates:
+        width, candidate_height = _size_for_height(height)
+        bits_per_pixel = (video_kbps * 1000) / max(1, width * candidate_height * fps_for_budget)
+        if bits_per_pixel >= 0.02:
+            return width, candidate_height
+
+    return _size_for_height(candidates[-1] if candidates else source_height)
+
+
+def _video_encode_run(cmd: list[str], *, timeout: int) -> None:
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+    )
+    if proc.returncode != 0:
+        message = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(message[-1800:] or "ffmpegの実行に失敗しました。")
+
+
+def _video_encode_file(
+    input_path: Path,
+    *,
+    target_megabytes: float,
+    max_megabytes: float,
+    max_height: str,
+    audio_bitrate_kbps: str,
+    output_name: str,
+    preset: str,
+) -> tuple[Path, dict[str, Any]]:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpegが見つかりません。")
+    if max_height not in VIDEO_ENCODE_ALLOWED_HEIGHTS:
+        raise ValueError("最大解像度の指定が不正です。")
+    if preset not in VIDEO_ENCODE_ALLOWED_PRESETS:
+        raise ValueError("エンコード速度の指定が不正です。")
+    if target_megabytes <= 0 or target_megabytes > 1000:
+        raise ValueError("目標サイズは1MB以上1000MB以下で指定してください。")
+    if max_megabytes <= 0 or max_megabytes > 1500:
+        raise ValueError("上限サイズは1MB以上1500MB以下で指定してください。")
+
+    metadata = _video_encode_probe(input_path)
+    duration = metadata["duration"]
+    target_total_kbps = max(1, math.floor((target_megabytes * 8192 * 0.96) / duration))
+    original_total_kbps = max(1, math.floor((metadata["size"] * 8) / duration / 1000))
+    total_kbps = min(target_total_kbps, max(1, math.floor(original_total_kbps * 0.92)))
+
+    if audio_bitrate_kbps == "auto":
+        audio_kbps = _video_encode_auto_audio_kbps(total_kbps, bool(metadata["hasAudio"]))
+    else:
+        try:
+            audio_kbps = int(audio_bitrate_kbps)
+        except ValueError as exc:
+            raise ValueError("音声ビットレートの指定が不正です。") from exc
+        if audio_kbps not in {0, 24, 32, 48, 64, 96, 128}:
+            raise ValueError("音声ビットレートの指定が不正です。")
+        if not metadata["hasAudio"]:
+            audio_kbps = 0
+
+    video_kbps = total_kbps - audio_kbps
+    if video_kbps < 40:
+        raise ValueError("目標サイズが小さすぎます。目標MBを上げるか、音声ビットレートを下げてください。")
+
+    output_width, output_height = _video_encode_dimensions(
+        original_width=metadata["width"],
+        original_height=metadata["height"],
+        video_kbps=video_kbps,
+        fps=metadata["fps"],
+        max_height=max_height,
+    )
+
+    safe_name = _video_encode_safe_filename(output_name or f"{input_path.stem}_encoded")
+    output_path = DATA_DIR / f"video_encode_{uuid.uuid4().hex}.mp4"
+    passlog = DATA_DIR / f"video_encode_pass_{uuid.uuid4().hex}"
+    scale_filter = f"scale={output_width}:{output_height}"
+
+    first_pass = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+        "-vf",
+        scale_filter,
+        "-c:v",
+        "libx264",
+        "-preset",
+        preset,
+        "-b:v",
+        f"{video_kbps}k",
+        "-pass",
+        "1",
+        "-passlogfile",
+        str(passlog),
+        "-pix_fmt",
+        "yuv420p",
+        "-an",
+        "-f",
+        "mp4",
+        os.devnull,
+    ]
+
+    second_pass = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_path),
+        "-map",
+        "0:v:0",
+    ]
+    if metadata["hasAudio"] and audio_kbps > 0:
+        second_pass.extend(["-map", "0:a:0?"])
+    second_pass.extend([
+        "-vf",
+        scale_filter,
+        "-c:v",
+        "libx264",
+        "-preset",
+        preset,
+        "-b:v",
+        f"{video_kbps}k",
+        "-pass",
+        "2",
+        "-passlogfile",
+        str(passlog),
+        "-pix_fmt",
+        "yuv420p",
+    ])
+    if metadata["hasAudio"] and audio_kbps > 0:
+        second_pass.extend(["-c:a", "aac", "-b:a", f"{audio_kbps}k", "-ac", "2"])
+    else:
+        second_pass.append("-an")
+    second_pass.extend(["-movflags", "+faststart", str(output_path)])
+
+    try:
+        _video_encode_run(first_pass, timeout=VIDEO_ENCODE_TIMEOUT_SEC)
+        _video_encode_run(second_pass, timeout=VIDEO_ENCODE_TIMEOUT_SEC)
+        output_size = output_path.stat().st_size
+        return output_path, {
+            "filename": f"{safe_name}.mp4",
+            "duration": duration,
+            "originalSize": metadata["size"],
+            "originalWidth": metadata["width"],
+            "originalHeight": metadata["height"],
+            "originalBitrateKbps": round((metadata["size"] * 8) / duration / 1000),
+            "outputSize": output_size,
+            "outputWidth": output_width,
+            "outputHeight": output_height,
+            "targetMegabytes": target_megabytes,
+            "maxMegabytes": max_megabytes,
+            "totalBitrateKbps": total_kbps,
+            "videoBitrateKbps": video_kbps,
+            "audioBitrateKbps": audio_kbps,
+            "overMax": output_size > max_megabytes * 1024 * 1024,
+        }
+    except Exception:
+        delete_file_quietly(output_path)
+        raise
+    finally:
+        for path in DATA_DIR.glob(f"{passlog.name}*"):
+            delete_file_quietly(path)
 
 
 def _ppt_video_generate_artifacts(
@@ -16678,6 +16995,101 @@ async def ppt_video_zip_tool_result_file(session_id: str, filename: str):
         media_type="application/zip",
         filename=target.name,
         content_disposition_type="attachment",
+    )
+
+
+async def _video_encode_save_upload(upload: UploadFile) -> Path:
+    filename = upload.filename or ""
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".mp4", ".mov", ".m4v", ".webm", ".ogv", ".avi", ".mkv"} and not (upload.content_type or "").startswith("video/"):
+        raise HTTPException(status_code=400, detail="動画ファイルをアップロードしてください。")
+
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".mp4", dir=str(DATA_DIR))
+    temp_path = Path(temp.name)
+    temp.close()
+    total = 0
+    try:
+        with temp_path.open("wb") as out:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > VIDEO_ENCODE_MAX_FILE_BYTES:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"動画サイズは最大{VIDEO_ENCODE_MAX_FILE_BYTES // (1024 * 1024)}MBまでです。",
+                    )
+                out.write(chunk)
+        if total <= 0:
+            raise HTTPException(status_code=400, detail="動画ファイルが空です。")
+        return temp_path
+    except Exception:
+        delete_file_quietly(temp_path)
+        raise
+
+
+@app.post("/video-encode-tool/encode")
+async def video_encode_tool_encode(
+    background_tasks: BackgroundTasks,
+    video: UploadFile = File(...),
+    targetMegabytes: float = Form(50),
+    maxMegabytes: float = Form(80),
+    maxHeight: str = Form("auto"),
+    audioBitrateKbps: str = Form("auto"),
+    outputName: str = Form(""),
+    preset: str = Form("medium"),
+):
+    input_path = await _video_encode_save_upload(video)
+    try:
+        output_path, info = await asyncio.to_thread(
+            _video_encode_file,
+            input_path,
+            target_megabytes=targetMegabytes,
+            max_megabytes=maxMegabytes,
+            max_height=maxHeight,
+            audio_bitrate_kbps=audioBitrateKbps,
+            output_name=outputName or f"{Path(video.filename or 'video').stem}_encoded",
+            preset=preset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=500, detail="動画エンコードがタイムアウトしました。") from exc
+    except Exception as exc:
+        logger.exception("Video encode failed")
+        raise HTTPException(status_code=500, detail=f"動画エンコードに失敗しました: {exc}") from exc
+    finally:
+        delete_file_quietly(input_path)
+
+    background_tasks.add_task(delete_file_quietly, output_path)
+    return FileResponse(
+        output_path,
+        media_type="video/mp4",
+        filename=info["filename"],
+        content_disposition_type="attachment",
+        headers={
+            "X-Original-Size": str(info["originalSize"]),
+            "X-Output-Size": str(info["outputSize"]),
+            "X-Duration": f"{info['duration']:.3f}",
+            "X-Original-Width": str(info["originalWidth"]),
+            "X-Original-Height": str(info["originalHeight"]),
+            "X-Output-Width": str(info["outputWidth"]),
+            "X-Output-Height": str(info["outputHeight"]),
+            "X-Original-Bitrate-Kbps": str(info["originalBitrateKbps"]),
+            "X-Total-Bitrate-Kbps": str(info["totalBitrateKbps"]),
+            "X-Video-Bitrate-Kbps": str(info["videoBitrateKbps"]),
+            "X-Audio-Bitrate-Kbps": str(info["audioBitrateKbps"]),
+            "X-Target-Megabytes": str(info["targetMegabytes"]),
+            "X-Max-Megabytes": str(info["maxMegabytes"]),
+            "X-Over-Max": "1" if info["overMax"] else "0",
+            "Access-Control-Expose-Headers": (
+                "Content-Disposition, X-Original-Size, X-Output-Size, X-Duration, "
+                "X-Original-Width, X-Original-Height, X-Output-Width, X-Output-Height, "
+                "X-Original-Bitrate-Kbps, X-Total-Bitrate-Kbps, X-Video-Bitrate-Kbps, "
+                "X-Audio-Bitrate-Kbps, X-Target-Megabytes, X-Max-Megabytes, X-Over-Max"
+            ),
+        },
     )
 
 
