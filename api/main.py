@@ -118,6 +118,15 @@ AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # gpt-4o-mini → gpt-4o
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 AI_TIMEOUT = 180  # より複雑な処理に対してタイムアウトを延長
+_UPLOAD_BATCH_FAST_LOCAL = threading.local()
+
+
+def _is_upload_batch_fast_mode() -> bool:
+    return bool(getattr(_UPLOAD_BATCH_FAST_LOCAL, "enabled", False))
+
+
+def _set_upload_batch_fast_mode(enabled: bool) -> None:
+    _UPLOAD_BATCH_FAST_LOCAL.enabled = bool(enabled)
 
 # EMU -> pt (pptx uses EMU units for font size)
 EMU_PER_PT = 12700
@@ -2744,7 +2753,13 @@ def looks_like_affil_line(s: str, use_learned_cache: bool = True) -> bool:
 
     # 正解DBに登録済みの所属・施設なら即 True
     _s_ns = re.sub(r'[\s\u3000]+', '', s)
-    if use_learned_cache and _s_ns and len(_s_ns) >= 3 and _s_ns in _get_facility_name_dict_cache():
+    if (
+        use_learned_cache
+        and not _is_upload_batch_fast_mode()
+        and _s_ns
+        and len(_s_ns) >= 3
+        and _s_ns in _get_facility_name_dict_cache()
+    ):
         return True
 
     # ラベル/案内っぽいのは除外
@@ -3700,7 +3715,7 @@ def build_speaker_display(name: str, use_learned_cache: bool = True) -> str:
         return ""
 
     # ① 正解DBから学習した分割位置（最優先）
-    if use_learned_cache:
+    if use_learned_cache and not _is_upload_batch_fast_mode():
         cache = _get_speaker_display_cache()
         if core in cache:
             cached_val = cache[core]
@@ -4092,6 +4107,16 @@ def init_db():
             """).fetchone()
             if not row:
                 con.execute("ALTER TABLE correct_answers ADD COLUMN layout_hints JSONB DEFAULT '{}';")
+
+            con.execute("""
+            CREATE TABLE IF NOT EXISTS learning_cache (
+                cache_key TEXT PRIMARY KEY,
+                payload JSONB NOT NULL DEFAULT '{}',
+                correct_answers_count INTEGER NOT NULL DEFAULT 0,
+                source_max_created_at TEXT NOT NULL DEFAULT '',
+                generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """)
             con.commit()
             logger.info("Database tables initialized successfully")
         finally:
@@ -5147,7 +5172,12 @@ def is_valid_person_name(name: str, use_learned_cache: bool = True) -> bool:
 
     # 正解DBに登録済みの人名なら即 True（旧字体・珍しい姓も対応）
     _name_ns = name.replace(" ", "").replace("\u3000", "")
-    if use_learned_cache and _name_ns and _name_ns in _get_person_name_dict_cache():
+    if (
+        use_learned_cache
+        and not _is_upload_batch_fast_mode()
+        and _name_ns
+        and _name_ns in _get_person_name_dict_cache()
+    ):
         return True
     return is_valid_person_name_basic(name)
 
@@ -7362,11 +7392,8 @@ def _build_speaker_display_cache() -> dict[str, str]:
     return cache
 
 def _get_speaker_display_cache() -> dict[str, str]:
-    global _speaker_display_cache, _speaker_display_cache_loaded
-    if not _speaker_display_cache_loaded:
-        _speaker_display_cache = _build_speaker_display_cache()
-        _speaker_display_cache_loaded = True
-    return _speaker_display_cache
+    cache = _get_learning_cache_snapshot().get("speaker_display") or {}
+    return cache if isinstance(cache, dict) else {}
 
 def invalidate_speaker_display_cache():
     """save_correct_answer 後に呼ぶことで次回再構築される"""
@@ -7428,11 +7455,8 @@ def _build_affiliation_format_cache() -> dict[str, str]:
     return cache
 
 def _get_affiliation_format_cache() -> dict[str, str]:
-    global _affiliation_format_cache, _affiliation_format_cache_loaded
-    if not _affiliation_format_cache_loaded:
-        _affiliation_format_cache = _build_affiliation_format_cache()
-        _affiliation_format_cache_loaded = True
-    return _affiliation_format_cache
+    cache = _get_learning_cache_snapshot().get("affiliation_format") or {}
+    return cache if isinstance(cache, dict) else {}
 
 def invalidate_affiliation_format_cache():
     """save_correct_answer 後に呼ぶことで次回再構築される"""
@@ -7531,11 +7555,8 @@ def _build_text_role_cache() -> dict[str, dict]:
     return cache
 
 def _get_text_role_cache() -> dict[str, dict]:
-    global _text_role_cache, _text_role_cache_loaded
-    if not _text_role_cache_loaded:
-        _text_role_cache = _build_text_role_cache()
-        _text_role_cache_loaded = True
-    return _text_role_cache
+    cache = _get_learning_cache_snapshot().get("text_role") or {}
+    return cache if isinstance(cache, dict) else {}
 
 def invalidate_text_role_cache():
     global _text_role_cache_loaded
@@ -7685,7 +7706,7 @@ def _load_correct_answers() -> list[dict]:
     try:
         with db_connect() as con:
             rows = con.execute(
-                "SELECT job_id, event_title, blocks_text, keywords, correct_json, embedding, created_at "
+                "SELECT job_id, event_title, blocks_text, keywords, correct_json, embedding, layout_hints, created_at "
                 "FROM correct_answers ORDER BY created_at DESC LIMIT 500"
             ).fetchall()
         return [
@@ -7696,6 +7717,7 @@ def _load_correct_answers() -> list[dict]:
                 "keywords": r["keywords"] or [],
                 "correct_json": r["correct_json"] or {},
                 "embedding": r["embedding"],
+                "layout_hints": r.get("layout_hints") or {},
                 "created_at": str(r["created_at"]),
             }
             for r in rows
@@ -7703,6 +7725,435 @@ def _load_correct_answers() -> list[dict]:
     except Exception as e:
         print(f"[correct_answers] load error: {e}")
         return []
+
+
+LEARNING_CACHE_KEY = "correct_answers_v1"
+LEARNING_CACHE_VERSION = 1
+_learning_cache_snapshot: dict[str, Any] | None = None
+_learning_cache_loaded = False
+_learning_cache_lock = threading.Lock()
+
+
+def _empty_learning_cache_snapshot() -> dict[str, Any]:
+    return {
+        "version": LEARNING_CACHE_VERSION,
+        "generated_at": "",
+        "correct_answers_count": 0,
+        "source_max_created_at": "",
+        "speaker_display": {},
+        "affiliation_format": {},
+        "text_role": {},
+        "layout_pattern": {},
+        "person_names": [],
+        "facility_names": [],
+        "title_line_len": {},
+        "organizer_dict": [],
+        "chair_label": {},
+        "talk_count": {},
+        "datetime_newline": {},
+    }
+
+
+def _normalize_learning_cache_snapshot(payload: Any) -> dict[str, Any]:
+    base = _empty_learning_cache_snapshot()
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+    if isinstance(payload, dict):
+        for key in base.keys():
+            if key in payload:
+                base[key] = payload[key]
+    return base
+
+
+def _learning_stats(vals: list[int]) -> dict:
+    if len(vals) < 3:
+        return {}
+    vals_sorted = sorted(vals)
+    n = len(vals_sorted)
+    return {
+        "median": vals_sorted[n // 2],
+        "q25": vals_sorted[n // 4],
+        "q75": vals_sorted[3 * n // 4],
+        "count": n,
+        "above_ratio": sum(1 for v in vals if v < 0) / n,
+    }
+
+
+def _learning_float_stats(vals: list[float]) -> dict:
+    if len(vals) < 3:
+        return {}
+    vals_sorted = sorted(vals)
+    n = len(vals_sorted)
+    return {
+        "median": vals_sorted[n // 2],
+        "q25": vals_sorted[n // 4],
+        "q75": vals_sorted[3 * n // 4],
+        "count": n,
+    }
+
+
+def _build_learning_cache_snapshot(answers: list[dict] | None = None) -> dict[str, Any]:
+    answers = answers if answers is not None else _load_correct_answers()
+    snapshot = _empty_learning_cache_snapshot()
+    snapshot["generated_at"] = datetime.now(timezone.utc).isoformat()
+    snapshot["correct_answers_count"] = len(answers)
+    snapshot["source_max_created_at"] = str(answers[0].get("created_at") or "") if answers else ""
+
+    speaker_display: dict[str, str] = {}
+    affiliation_format: dict[str, str] = {}
+    person_names: set[str] = set()
+    facility_names: set[str] = set()
+    organizer_keys: set[str] = set()
+    chair_label_counts: dict[str, int] = {}
+    talk_counts: list[int] = []
+    datetime_true = 0
+    datetime_false = 0
+    talk_lens: list[int] = []
+    event_lens: list[int] = []
+
+    role_counts: dict[str, Counter] = {}
+    formatted: dict[str, str] = {}
+
+    affil_rels: list[int] = []
+    chair_affil_rels: list[int] = []
+    speaker_enja_rels: list[int] = []
+    title_rels: list[int] = []
+    event_title_font_pts: list[float] = []
+    speaker_font_pts: list[float] = []
+    talk_title_font_pts: list[float] = []
+
+    role_suffix_words = [
+        "主任教授", "教授", "准教授", "講師", "助教",
+        "病院長", "院長", "副院長", "部長", "副部長", "医長",
+        "センター長", "科長", "室長", "所長", "理事長",
+    ]
+
+    def strip_role_suffix_local(s: str) -> str:
+        s = (s or "").strip()
+        for role in role_suffix_words:
+            if s.endswith(role):
+                return s[: -len(role)].strip()
+        return s
+
+    def add_facility(raw: str) -> None:
+        raw = (raw or "").strip()
+        if not raw or raw.upper() in {"PROGRAM", "AGENDA", "SCHEDULE"}:
+            return
+        full_key = re.sub(r'[\s\u3000]+', '', raw)
+        if len(full_key) >= 3:
+            facility_names.add(full_key)
+        core = strip_role_suffix_local(raw)
+        core_key = re.sub(r'[\s\u3000]+', '', core)
+        if len(core_key) >= 3:
+            facility_names.add(core_key)
+
+    def add_text_role(value: str, role: str, min_len: int) -> None:
+        value = (value or "").strip()
+        if not value:
+            return
+        key = _text_role_key(value)
+        if key and len(key) >= min_len:
+            role_counts.setdefault(key, Counter())[role] += 1
+            formatted.setdefault(key, re.sub(r'[\n\r]+', ' ', value).strip())
+
+    def add_int_stat(values: list[int], raw: Any) -> None:
+        try:
+            values.append(int(raw))
+        except (TypeError, ValueError):
+            return
+
+    def add_float_stat(values: list[float], raw: Any) -> None:
+        try:
+            values.append(float(raw))
+        except (TypeError, ValueError):
+            return
+
+    for ans in answers:
+        cj = ans.get("correct_json") or {}
+
+        event_title = (cj.get("event_title") or "").strip()
+        add_text_role(event_title, "event_title", 4)
+        for line in (cj.get("event_title_lines") or []):
+            ln = len(re.sub(r'[\s\u3000]+', '', normalize_space(line)))
+            if ln >= 3:
+                event_lens.append(ln)
+
+        organizer = (cj.get("organizer") or "").strip()
+        if organizer:
+            full_key = re.sub(r'[\s\u3000]+', '', organizer)
+            if len(full_key) >= 4:
+                organizer_keys.add(full_key)
+            core = re.sub(r'^(主催|共催|提供|企画|運営)\s*[:：]\s*', '', organizer).strip()
+            core_key = re.sub(r'[\s\u3000]+', '', core)
+            if len(core_key) >= 4:
+                organizer_keys.add(core_key)
+
+        datetime_newline = cj.get("datetime_time_newline")
+        if datetime_newline is True:
+            datetime_true += 1
+        elif datetime_newline is False:
+            datetime_false += 1
+
+        ch = cj.get("chair") or {}
+        chair_name_key = _json_person_name_key(ch)
+        chair_disp = _json_person_display_value(ch).strip()
+        if chair_name_key and chair_disp and " " in chair_disp and chair_name_key not in speaker_display:
+            speaker_display[chair_name_key] = chair_disp
+        if chair_name_key and len(chair_name_key) >= 2:
+            person_names.add(chair_name_key)
+
+        chair_aff = (ch.get("affiliation") or "").strip()
+        if chair_aff:
+            key = _aff_cache_key(chair_aff)
+            if key and len(key) >= 4:
+                affiliation_format.setdefault(key, chair_aff)
+            if chair_name_key:
+                aff_no_name = _remove_person_names_from_affiliation(chair_aff, chair_name_key)
+                key2 = _aff_cache_key(aff_no_name)
+                if key2 and len(key2) >= 4:
+                    affiliation_format.setdefault(key2, aff_no_name)
+            add_facility(chair_aff)
+            add_text_role(chair_aff, "affiliation", 4)
+
+        chair_role = (ch.get("role") or "").strip()
+        if chair_role:
+            chair_label_counts[chair_role] = chair_label_counts.get(chair_role, 0) + 1
+        add_text_role(_json_person_name_value(ch), "person_name", 2)
+
+        talk_count = 0
+        for t in (cj.get("talks") or []):
+            if _json_is_chair_item(t):
+                role = (t.get("role") or "").strip()
+                if role:
+                    chair_label_counts[role] = chair_label_counts.get(role, 0) + 1
+            else:
+                talk_count += 1
+
+            sp = _json_person_name_key(t)
+            disp = _json_person_display_value(t).strip()
+            if sp and disp and " " in disp and sp not in speaker_display:
+                speaker_display[sp] = disp
+            if sp and len(sp) >= 2:
+                person_names.add(sp)
+            add_text_role(_json_person_name_value(t), "person_name", 2)
+
+            aff = (t.get("affiliation") or "").strip()
+            if aff:
+                key = _aff_cache_key(aff)
+                if key and len(key) >= 4:
+                    affiliation_format.setdefault(key, aff)
+                if sp:
+                    aff_no_name = _remove_person_names_from_affiliation(aff, sp)
+                    key2 = _aff_cache_key(aff_no_name)
+                    if key2 and len(key2) >= 4:
+                        affiliation_format.setdefault(key2, aff_no_name)
+                add_facility(aff)
+                add_text_role(aff, "affiliation", 4)
+
+            if not _json_is_chair_item(t):
+                title_lines = t.get("title_lines") or []
+                for line in title_lines:
+                    ln = len(re.sub(r'[\s\u3000]+', '', normalize_space(line)))
+                    if ln >= 3:
+                        talk_lens.append(ln)
+                title = " ".join(title_lines).strip() if title_lines else (t.get("title") or "").strip()
+                add_text_role(title, "talk_title", 6)
+
+        if talk_count > 0:
+            talk_counts.append(talk_count)
+
+        layout_hints = ans.get("layout_hints") or {}
+        if isinstance(layout_hints, str):
+            try:
+                layout_hints = json.loads(layout_hints)
+            except Exception:
+                layout_hints = {}
+        if isinstance(layout_hints, dict):
+            ch_hints = layout_hints.get("chair") or {}
+            if "affil_rel_to_name_y" in ch_hints:
+                add_int_stat(chair_affil_rels, ch_hints["affil_rel_to_name_y"])
+            for ich in (layout_hints.get("inline_chairs") or []):
+                if "affil_rel_to_name_y" in ich:
+                    add_int_stat(chair_affil_rels, ich["affil_rel_to_name_y"])
+            if "event_title_font_pt" in layout_hints:
+                add_float_stat(event_title_font_pts, layout_hints["event_title_font_pt"])
+            for th in (layout_hints.get("talks") or []):
+                if "affil_rel_to_speaker_y" in th:
+                    add_int_stat(affil_rels, th["affil_rel_to_speaker_y"])
+                if "speaker_rel_to_enja_y" in th:
+                    add_int_stat(speaker_enja_rels, th["speaker_rel_to_enja_y"])
+                if "title_rel_to_speaker_y" in th:
+                    add_int_stat(title_rels, th["title_rel_to_speaker_y"])
+                if "speaker_font_pt" in th:
+                    add_float_stat(speaker_font_pts, th["speaker_font_pt"])
+                if "talk_title_font_pt" in th:
+                    add_float_stat(talk_title_font_pts, th["talk_title_font_pt"])
+
+    text_role = {}
+    for key, counter in role_counts.items():
+        role, count = counter.most_common(1)[0]
+        text_role[key] = {"role": role, "count": count, "formatted": formatted.get(key, "")}
+
+    layout_pattern = {}
+    for key, vals in [
+        ("affil_rel_to_speaker_y", affil_rels),
+        ("affil_rel_to_name_y_chair", chair_affil_rels),
+        ("speaker_rel_to_enja_y", speaker_enja_rels),
+        ("title_rel_to_speaker_y", title_rels),
+    ]:
+        stats = _learning_stats(vals)
+        if stats:
+            layout_pattern[key] = stats
+    for key, vals in [
+        ("event_title_font_pt", event_title_font_pts),
+        ("speaker_font_pt", speaker_font_pts),
+        ("talk_title_font_pt", talk_title_font_pts),
+    ]:
+        stats = _learning_float_stats(vals)
+        if stats:
+            layout_pattern[key] = stats
+
+    title_line_len = {}
+    if len(talk_lens) >= 5:
+        st = sorted(talk_lens)
+        n = len(st)
+        title_line_len.update({
+            "talk_title_p90": st[min(int(n * 0.9), n - 1)],
+            "talk_title_median": st[n // 2],
+            "talk_count": n,
+        })
+    if len(event_lens) >= 3:
+        se = sorted(event_lens)
+        n = len(se)
+        title_line_len.update({
+            "event_title_p90": se[min(int(n * 0.9), n - 1)],
+            "event_title_median": se[n // 2],
+            "event_count": n,
+        })
+
+    talk_count_cache = {}
+    if len(talk_counts) >= 3:
+        counts_sorted = sorted(talk_counts)
+        n = len(counts_sorted)
+        talk_count_cache = {
+            "median": counts_sorted[n // 2],
+            "q25": counts_sorted[n // 4],
+            "q75": counts_sorted[3 * n // 4],
+            "min": counts_sorted[0],
+            "max": counts_sorted[-1],
+            "count": n,
+        }
+
+    datetime_newline = {}
+    total_dt = datetime_true + datetime_false
+    if total_dt >= 3:
+        datetime_newline = {
+            "true_count": datetime_true,
+            "false_count": datetime_false,
+            "true_ratio": datetime_true / total_dt,
+        }
+
+    for default_role in {"座長", "総合司会", "司会"}:
+        chair_label_counts.setdefault(default_role, 0)
+
+    snapshot.update({
+        "speaker_display": speaker_display,
+        "affiliation_format": affiliation_format,
+        "text_role": text_role,
+        "layout_pattern": layout_pattern,
+        "person_names": sorted(person_names),
+        "facility_names": sorted(facility_names),
+        "title_line_len": title_line_len,
+        "organizer_dict": sorted(organizer_keys),
+        "chair_label": chair_label_counts,
+        "talk_count": talk_count_cache,
+        "datetime_newline": datetime_newline,
+    })
+    print(
+        "[learning-cache] built "
+        f"answers={len(answers)} speaker_display={len(speaker_display)} "
+        f"text_role={len(text_role)} affiliation_format={len(affiliation_format)}",
+        flush=True,
+    )
+    return snapshot
+
+
+def _read_learning_cache_snapshot_from_db() -> dict[str, Any] | None:
+    try:
+        with db_connect() as con:
+            row = con.execute(
+                "SELECT payload FROM learning_cache WHERE cache_key = %s",
+                (LEARNING_CACHE_KEY,),
+            ).fetchone()
+        if not row:
+            return None
+        return _normalize_learning_cache_snapshot(row.get("payload"))
+    except Exception as e:
+        print(f"[learning-cache] read error: {e}", flush=True)
+        return None
+
+
+def _write_learning_cache_snapshot_to_db(snapshot: dict[str, Any]) -> None:
+    try:
+        with db_connect() as con:
+            con.execute(
+                """
+                INSERT INTO learning_cache (cache_key, payload, correct_answers_count, source_max_created_at, generated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (cache_key) DO UPDATE SET
+                    payload = EXCLUDED.payload,
+                    correct_answers_count = EXCLUDED.correct_answers_count,
+                    source_max_created_at = EXCLUDED.source_max_created_at,
+                    generated_at = NOW()
+                """,
+                (
+                    LEARNING_CACHE_KEY,
+                    json.dumps(snapshot, ensure_ascii=False),
+                    int(snapshot.get("correct_answers_count") or 0),
+                    str(snapshot.get("source_max_created_at") or ""),
+                ),
+            )
+            con.commit()
+    except Exception as e:
+        print(f"[learning-cache] write error: {e}", flush=True)
+
+
+def invalidate_learning_cache_snapshot() -> None:
+    global _learning_cache_snapshot, _learning_cache_loaded
+    with _learning_cache_lock:
+        _learning_cache_snapshot = None
+        _learning_cache_loaded = False
+
+
+def refresh_learning_cache_snapshot() -> dict[str, Any]:
+    snapshot = _build_learning_cache_snapshot()
+    _write_learning_cache_snapshot_to_db(snapshot)
+    global _learning_cache_snapshot, _learning_cache_loaded
+    with _learning_cache_lock:
+        _learning_cache_snapshot = snapshot
+        _learning_cache_loaded = True
+    return snapshot
+
+
+def _get_learning_cache_snapshot() -> dict[str, Any]:
+    global _learning_cache_snapshot, _learning_cache_loaded
+    if _is_upload_batch_fast_mode():
+        return _empty_learning_cache_snapshot()
+    with _learning_cache_lock:
+        if _learning_cache_loaded and _learning_cache_snapshot is not None:
+            return _learning_cache_snapshot
+
+    snapshot = _read_learning_cache_snapshot_from_db()
+    if snapshot is None:
+        snapshot = refresh_learning_cache_snapshot()
+
+    with _learning_cache_lock:
+        _learning_cache_snapshot = snapshot
+        _learning_cache_loaded = True
+    return snapshot
 
 
 def _extract_keywords(text: str) -> set[str]:
@@ -8059,11 +8510,8 @@ def _build_layout_pattern_cache() -> dict:
 
 
 def _get_layout_pattern_cache() -> dict:
-    global _layout_pattern_cache, _layout_pattern_cache_loaded
-    if not _layout_pattern_cache_loaded:
-        _layout_pattern_cache = _build_layout_pattern_cache()
-        _layout_pattern_cache_loaded = True
-    return _layout_pattern_cache or {}
+    cache = _get_learning_cache_snapshot().get("layout_pattern") or {}
+    return cache if isinstance(cache, dict) else {}
 
 
 def invalidate_layout_pattern_cache():
@@ -8101,11 +8549,8 @@ def _build_person_name_dict_cache() -> set[str]:
     return names
 
 def _get_person_name_dict_cache() -> set[str]:
-    global _person_name_dict_cache, _person_name_dict_cache_loaded
-    if not _person_name_dict_cache_loaded:
-        _person_name_dict_cache = _build_person_name_dict_cache()
-        _person_name_dict_cache_loaded = True
-    return _person_name_dict_cache or set()
+    values = _get_learning_cache_snapshot().get("person_names") or []
+    return set(values) if isinstance(values, list) else set()
 
 def invalidate_person_name_dict_cache():
     global _person_name_dict_cache_loaded
@@ -8171,11 +8616,8 @@ def _build_facility_name_dict_cache() -> set[str]:
     return keys
 
 def _get_facility_name_dict_cache() -> set[str]:
-    global _facility_name_dict_cache, _facility_name_dict_cache_loaded
-    if not _facility_name_dict_cache_loaded:
-        _facility_name_dict_cache = _build_facility_name_dict_cache()
-        _facility_name_dict_cache_loaded = True
-    return _facility_name_dict_cache or set()
+    values = _get_learning_cache_snapshot().get("facility_names") or []
+    return set(values) if isinstance(values, list) else set()
 
 def invalidate_facility_name_dict_cache():
     global _facility_name_dict_cache_loaded
@@ -8242,11 +8684,8 @@ def _build_title_line_len_cache() -> dict:
     return result
 
 def _get_title_line_len_cache() -> dict:
-    global _title_line_len_cache, _title_line_len_cache_loaded
-    if not _title_line_len_cache_loaded:
-        _title_line_len_cache = _build_title_line_len_cache()
-        _title_line_len_cache_loaded = True
-    return _title_line_len_cache or {}
+    cache = _get_learning_cache_snapshot().get("title_line_len") or {}
+    return cache if isinstance(cache, dict) else {}
 
 def invalidate_title_line_len_cache():
     global _title_line_len_cache_loaded
@@ -8283,11 +8722,8 @@ def _build_organizer_dict_cache() -> set[str]:
     return keys
 
 def _get_organizer_dict_cache() -> set[str]:
-    global _organizer_dict_cache, _organizer_dict_cache_loaded
-    if not _organizer_dict_cache_loaded:
-        _organizer_dict_cache = _build_organizer_dict_cache()
-        _organizer_dict_cache_loaded = True
-    return _organizer_dict_cache or set()
+    values = _get_learning_cache_snapshot().get("organizer_dict") or []
+    return set(values) if isinstance(values, list) else set()
 
 def invalidate_organizer_dict_cache():
     global _organizer_dict_cache_loaded
@@ -8326,11 +8762,8 @@ def _build_chair_label_cache() -> dict:
     return counts
 
 def _get_chair_label_cache() -> dict:
-    global _chair_label_cache, _chair_label_cache_loaded
-    if not _chair_label_cache_loaded:
-        _chair_label_cache = _build_chair_label_cache()
-        _chair_label_cache_loaded = True
-    return _chair_label_cache or {}
+    cache = _get_learning_cache_snapshot().get("chair_label") or {}
+    return cache if isinstance(cache, dict) else {}
 
 def _get_chair_label_words() -> list[str]:
     """出現頻度の高い順に座長ラベル語リストを返す（最低でも「座長」を含む）。"""
@@ -8376,11 +8809,8 @@ def _build_talk_count_cache() -> dict:
     return result
 
 def _get_talk_count_cache() -> dict:
-    global _talk_count_cache, _talk_count_cache_loaded
-    if not _talk_count_cache_loaded:
-        _talk_count_cache = _build_talk_count_cache()
-        _talk_count_cache_loaded = True
-    return _talk_count_cache or {}
+    cache = _get_learning_cache_snapshot().get("talk_count") or {}
+    return cache if isinstance(cache, dict) else {}
 
 def invalidate_talk_count_cache():
     global _talk_count_cache_loaded
@@ -8418,15 +8848,32 @@ def _build_datetime_newline_cache() -> dict:
     return result
 
 def _get_datetime_newline_cache() -> dict:
-    global _datetime_newline_cache, _datetime_newline_cache_loaded
-    if not _datetime_newline_cache_loaded:
-        _datetime_newline_cache = _build_datetime_newline_cache()
-        _datetime_newline_cache_loaded = True
-    return _datetime_newline_cache or {}
+    cache = _get_learning_cache_snapshot().get("datetime_newline") or {}
+    return cache if isinstance(cache, dict) else {}
 
 def invalidate_datetime_newline_cache():
     global _datetime_newline_cache_loaded
     _datetime_newline_cache_loaded = False
+
+
+def refresh_all_learning_caches_after_mutation() -> None:
+    """correct_answers 更新後に、学習キャッシュをまとめて再生成する。"""
+    invalidate_learning_cache_snapshot()
+    invalidate_speaker_display_cache()
+    invalidate_affiliation_format_cache()
+    invalidate_text_role_cache()
+    invalidate_layout_pattern_cache()
+    invalidate_person_name_dict_cache()
+    invalidate_facility_name_dict_cache()
+    invalidate_title_line_len_cache()
+    invalidate_organizer_dict_cache()
+    invalidate_chair_label_cache()
+    invalidate_talk_count_cache()
+    invalidate_datetime_newline_cache()
+    try:
+        refresh_learning_cache_snapshot()
+    except Exception as e:
+        print(f"[learning-cache] refresh after mutation error: {e}", flush=True)
 
 
 def _compute_similarity(kw_a: set[str], kw_b: set[str]) -> float:
@@ -8494,6 +8941,7 @@ def save_correct_answer(
     layout_hints = _compute_layout_hints(blocks_json or [], correct_json) if blocks_json else {}
     print(f"[correct-answer] saving job_id={job_id} event_title='{event_title[:60]}' blocks_text={len(blocks_text)} chars, embedding={'yes' if embedding else 'no'}, layout_hints={len(layout_hints)} keys")
 
+    saved_ok = False
     try:
         with db_connect() as con:
             con.execute(
@@ -8525,21 +8973,12 @@ def save_correct_answer(
                 """
             )
             con.commit()
+            saved_ok = True
     except Exception as e:
         print(f"[correct_answers] save error: {e}")
 
-    # 保存後にキャッシュを無効化（次回再構築）
-    invalidate_speaker_display_cache()
-    invalidate_affiliation_format_cache()
-    invalidate_text_role_cache()
-    invalidate_layout_pattern_cache()
-    invalidate_person_name_dict_cache()
-    invalidate_facility_name_dict_cache()
-    invalidate_title_line_len_cache()
-    invalidate_organizer_dict_cache()
-    invalidate_chair_label_cache()
-    invalidate_talk_count_cache()
-    invalidate_datetime_newline_cache()
+    if saved_ok:
+        refresh_all_learning_caches_after_mutation()
 
 
 def find_similar_correct_answers(
@@ -14461,6 +14900,8 @@ async def _upload_batch_worker_async(
     progress,
     cancel_event: threading.Event,
 ):
+    _set_upload_batch_fast_mode(True)
+
     def emit(event: str, data: dict):
         _upload_batch_heartbeat(
             session_id,
@@ -14684,6 +15125,7 @@ async def _upload_batch_worker_async(
         emit("done", {"sessionId": session_id, "count": ok_count, "results": out})
 
     finally:
+        _set_upload_batch_fast_mode(False)
         if local_browser is not None:
             try:
                 await local_browser.close()
@@ -17760,6 +18202,39 @@ async def list_correct_answers():
     }
 
 
+@app.get("/learning-cache/status")
+async def learning_cache_status():
+    """学習キャッシュスナップショットの状態確認"""
+    snapshot = _get_learning_cache_snapshot()
+    return {
+        "ok": True,
+        "version": snapshot.get("version"),
+        "generated_at": snapshot.get("generated_at", ""),
+        "correct_answers_count": snapshot.get("correct_answers_count", 0),
+        "source_max_created_at": snapshot.get("source_max_created_at", ""),
+        "sizes": {
+            "speaker_display": len(snapshot.get("speaker_display") or {}),
+            "affiliation_format": len(snapshot.get("affiliation_format") or {}),
+            "text_role": len(snapshot.get("text_role") or {}),
+            "layout_pattern": len(snapshot.get("layout_pattern") or {}),
+            "person_names": len(snapshot.get("person_names") or []),
+            "facility_names": len(snapshot.get("facility_names") or []),
+            "organizer_dict": len(snapshot.get("organizer_dict") or []),
+        },
+    }
+
+
+@app.post("/learning-cache/rebuild")
+async def rebuild_learning_cache():
+    """correct_answers から学習キャッシュスナップショットを再生成"""
+    snapshot = refresh_learning_cache_snapshot()
+    return {
+        "ok": True,
+        "generated_at": snapshot.get("generated_at", ""),
+        "correct_answers_count": snapshot.get("correct_answers_count", 0),
+    }
+
+
 @app.delete("/correct-answer/{job_id}")
 async def delete_correct_answer(job_id: str):
     """正解データを削除"""
@@ -17770,6 +18245,8 @@ async def delete_correct_answer(job_id: str):
             )
             deleted = result.rowcount
             con.commit()
+        if deleted:
+            refresh_all_learning_caches_after_mutation()
         return {"ok": True, "deleted": deleted}
     except Exception as e:
         raise HTTPException(500, f"delete failed: {e}")
