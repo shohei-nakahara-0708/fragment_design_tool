@@ -2737,14 +2737,14 @@ _TIME_RE = re.compile(
     re.VERBOSE
 )
 
-def looks_like_affil_line(s: str) -> bool:
+def looks_like_affil_line(s: str, use_learned_cache: bool = True) -> bool:
     s = _norm1(s)
     if not s:
         return False
 
     # 正解DBに登録済みの所属・施設なら即 True
     _s_ns = re.sub(r'[\s\u3000]+', '', s)
-    if _s_ns and len(_s_ns) >= 3 and _s_ns in _get_facility_name_dict_cache():
+    if use_learned_cache and _s_ns and len(_s_ns) >= 3 and _s_ns in _get_facility_name_dict_cache():
         return True
 
     # ラベル/案内っぽいのは除外
@@ -3694,19 +3694,20 @@ def add_space_to_jp_name(name: str) -> str:
 
     return core
 
-def build_speaker_display(name: str) -> str:
+def build_speaker_display(name: str, use_learned_cache: bool = True) -> str:
     core = norm_name(name)
     if not core:
         return ""
 
     # ① 正解DBから学習した分割位置（最優先）
-    cache = _get_speaker_display_cache()
-    if core in cache:
-        cached_val = cache[core]
-        # キャッシュ値の文字（スペース除去）がnameと一致する場合のみ適用
-        # 異なる場合は誤ったDB登録の可能性があるためスキップ
-        if cached_val.replace(" ", "").replace("\u3000", "") == core:
-            return cached_val
+    if use_learned_cache:
+        cache = _get_speaker_display_cache()
+        if core in cache:
+            cached_val = cache[core]
+            # キャッシュ値の文字（スペース除去）がnameと一致する場合のみ適用
+            # 異なる場合は誤ったDB登録の可能性があるためスキップ
+            if cached_val.replace(" ", "").replace("\u3000", "") == core:
+                return cached_val
 
     # ② 辞書
     v = split_name_by_dictionary(core)
@@ -4830,7 +4831,7 @@ def _normalize_organizer(s: str) -> str:
     return s
 
 
-def extract_organizer_from_blocks(blocks: List[TextBlock]) -> str:
+def extract_organizer_from_blocks(blocks: List[TextBlock], use_learned_cache: bool = True) -> str:
     lines = blocks_to_lines(blocks)
 
     # ラベル行をそのまま返す（主催/共催/提供/企画/運営）
@@ -4843,18 +4844,19 @@ def extract_organizer_from_blocks(blocks: List[TextBlock]) -> str:
             return _normalize_organizer(s)
 
     # ★ 正解DBの主催者辞書と照合（ラベルなし行でも検出）
-    org_dict = _get_organizer_dict_cache()
-    if org_dict:
-        for l in lines:
-            s = normalize_space(l)
-            s_ns = re.sub(r'[\s\u3000]+', '', s)
-            if len(s_ns) < 4:
-                continue
-            if s_ns in org_dict:
-                return _normalize_organizer(s)
-            for known in org_dict:
-                if len(known) >= 6 and known in s_ns:
+    if use_learned_cache:
+        org_dict = _get_organizer_dict_cache()
+        if org_dict:
+            for l in lines:
+                s = normalize_space(l)
+                s_ns = re.sub(r'[\s\u3000]+', '', s)
+                if len(s_ns) < 4:
+                    continue
+                if s_ns in org_dict:
                     return _normalize_organizer(s)
+                for known in org_dict:
+                    if len(known) >= 6 and known in s_ns:
+                        return _normalize_organizer(s)
 
     # fallback（会社名っぽい行）
     corp_pat = re.compile(r"(株式会社|有限会社|合同会社|Inc\.|LLC|Ltd\.|Co\.,?\s*Ltd\.|GmbH)")
@@ -5107,45 +5109,47 @@ def ensure_display_fields_in_dict(data: dict) -> dict:
     except Exception:
         return data
 
-def is_valid_person_name(name: str) -> bool:
+def is_valid_person_name_basic(name: str) -> bool:
+    """DB cache-free person-name sanity check for fast batch parsing."""
+    if not name or len(name) < 2:
+        return False
+
+    invalid_words = {
+        "男子", "女子", "学生", "医師", "看護", "患者", "症例",
+        "治療", "診断", "手術", "検査", "薬剤", "病院", "クリニック",
+        "大学", "学会", "講演", "演題", "座長", "司会", "質問", "回答",
+        "時間", "場所", "会場", "参加", "登録", "視聴", "配信",
+        "キーワード", "ポイント", "重要", "注意", "対象", "方法", "結果", "考察",
+        "14歳", "15歳", "16歳", "17歳", "18歳", "19歳", "20歳", "30歳", "40歳",
+        "年齢", "代表", "担当", "責任", "監修", "編集", "翻訳", "協力", "支援",
+    }
+
+    normalized_name = normalize_key(name).lower()
+    if normalized_name in invalid_words:
+        return False
+
+    if re.match(r'^[\d\s]+$', name):
+        return False
+
+    if len(name) > 15:
+        return False
+
+    if re.match(r'^[A-Za-z\s]{1,3}$', name):
+        return False
+
+    return True
+
+
+def is_valid_person_name(name: str, use_learned_cache: bool = True) -> bool:
     """有効な人名かどうかをチェック（トップレベル関数）"""
     if not name or len(name) < 2:
         return False
 
     # 正解DBに登録済みの人名なら即 True（旧字体・珍しい姓も対応）
     _name_ns = name.replace(" ", "").replace("\u3000", "")
-    if _name_ns and _name_ns in _get_person_name_dict_cache():
+    if use_learned_cache and _name_ns and _name_ns in _get_person_name_dict_cache():
         return True
-
-    # 明らかに人名ではない単語を除外
-    invalid_words = {
-        "男子", "女子", "学生", "医師", "看護", "患者", "症例", 
-        "治療", "診断", "手術", "検査", "薬剤", "病院", "クリニック",
-        "大学", "学会", "講演", "演題", "座長", "司会", "質問", "回答",
-        "時間", "場所", "会場", "参加", "登録", "視聴", "配信",
-        "キーワード", "ポイント", "重要", "注意", "対象", "方法", "結果", "考察",
-        "14歳", "15歳", "16歳", "17歳", "18歳", "19歳", "20歳", "30歳", "40歳",
-        "年齢", "代表", "担当", "責任", "監修", "編集", "翻訳", "協力", "支援"
-    }
-    
-    # 正規化したname（すべて小文字）で比較
-    normalized_name = normalize_key(name).lower()
-    if normalized_name in invalid_words:
-        return False
-        
-    # 数字のみの文字列は人名ではない
-    if re.match(r'^[\d\s]+$', name):
-        return False
-        
-    # 長すぎる名前は所属情報の可能性
-    if len(name) > 15:
-        return False
-        
-    # アルファベットのみの短い文字列は除外
-    if re.match(r'^[A-Za-z\s]{1,3}$', name):
-        return False
-        
-    return True
+    return is_valid_person_name_basic(name)
 
 
 def enrich_speaker_map_with_vm(
@@ -5629,7 +5633,13 @@ def _remove_person_names_from_affiliation(affiliation: str, person_name: str) ->
     
     return cleaned
 
-def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str], heading_words=None, debug=False) -> Chair:
+def extract_chair_by_blocks(
+    blocks: List[TextBlock],
+    speaker_map: Dict[str, str],
+    heading_words=None,
+    debug=False,
+    use_learned_cache: bool = True,
+) -> Chair:
     """
     「座長」ラベル近傍から座長情報を抽出する
     - 座長ラベルより上のブロックを優先検索（レイアウト修正）
@@ -5642,7 +5652,7 @@ def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
         speaker_map = {}
 
     chair_anchor = None
-    _chair_label_words = _get_chair_label_words()
+    _chair_label_words = _get_chair_label_words() if use_learned_cache else ["座長", "総合司会", "司会"]
     for b in blocks:
         b_key = normalize_key(b.text)
         if any(lbl in b_key for lbl in _chair_label_words):
@@ -5665,8 +5675,9 @@ def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
     # ① まず座長ラベル「より上」のブロックから人名らしい行を探す
     for b in sorted(above_chair, key=lambda x: -x.top):  # 上から順
         text = normalize_space(b.text)
-        print(f"[CHAIR DEBUG] 座長候補（上）: {b.text.strip()} (top: {b.top})")
-        print(f"[CHAIR DEBUG] 処理テキスト: '{text}'")
+        if debug:
+            print(f"[CHAIR DEBUG] 座長候補（上）: {b.text.strip()} (top: {b.top})")
+            print(f"[CHAIR DEBUG] 処理テキスト: '{text}'")
         for line in text.split("\n"):
             line = line.strip()
             # 「先生」付きなら前方の部分を候補に
@@ -5684,7 +5695,7 @@ def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                 if len(words) > 3:
                     last_two = " ".join(words[-2:])
                     last_two_has_aff = any(w in last_two for w in aff_words) or any(w in last_two for w in role_words)
-                    if not last_two_has_aff and is_valid_person_name(last_two):
+                    if not last_two_has_aff and is_valid_person_name(last_two, use_learned_cache=use_learned_cache):
                         name_candidate = last_two
                         affiliation_words = words[:-2]
                     else:
@@ -5706,24 +5717,27 @@ def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                 # 見出しワードやアルファベットは除外
                 if name_candidate.upper() in heading_words or re.fullmatch(r'[A-Za-z\s\.\-]+', name_candidate):
                     continue
-                print(f"[CHAIR DEBUG] 先生付き: '{name_candidate}' → is_valid_person_name={is_valid_person_name(name_candidate)}")
-                if is_valid_person_name(name_candidate):
+                if debug:
+                    print(f"[CHAIR DEBUG] 先生付き: '{name_candidate}' → is_valid_person_name={is_valid_person_name(name_candidate, use_learned_cache=use_learned_cache)}")
+                if is_valid_person_name(name_candidate, use_learned_cache=use_learned_cache):
                     key = norm_name(name_candidate)
                     aff = speaker_map.get(key, affiliation_candidate) if speaker_map else affiliation_candidate
-                    print(f"[CHAIR DEBUG] 座長選択（上・先生付き）: {key} / aff='{aff}'")
+                    if debug:
+                        print(f"[CHAIR DEBUG] 座長選択（上・先生付き）: {key} / aff='{aff}'")
                     return Chair(
                         name=key,
-                        name_display=build_speaker_display(key),
+                        name_display=build_speaker_display(key, use_learned_cache=use_learned_cache),
                         affiliation=normalize_space(aff),
                     )
             # 「先生」なしでも人名らしい行を候補に
-            elif is_valid_person_name(line):
+            elif is_valid_person_name(line, use_learned_cache=use_learned_cache):
                 key = norm_name(line)
                 aff = speaker_map.get(key, "") if speaker_map else ""
-                print(f"[CHAIR DEBUG] 座長選択（上・人名判定）: {key}")
+                if debug:
+                    print(f"[CHAIR DEBUG] 座長選択（上・人名判定）: {key}")
                 return Chair(
                     name=key,
-                    name_display=build_speaker_display(key),
+                    name_display=build_speaker_display(key, use_learned_cache=use_learned_cache),
                     affiliation=normalize_space(aff),
                 )
 
@@ -5763,7 +5777,7 @@ def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                     aff = speaker_map.get(key, fallback_aff) if speaker_map else fallback_aff
                     return Chair(
                         name=key,
-                        name_display=build_speaker_display(key),
+                        name_display=build_speaker_display(key, use_learned_cache=use_learned_cache),
                         affiliation=normalize_space(aff),
                     )
 
@@ -5778,7 +5792,7 @@ def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                     aff = speaker_map.get(key, fallback_aff) if speaker_map else fallback_aff
                     return Chair(
                         name=key,
-                        name_display=build_speaker_display(key),
+                        name_display=build_speaker_display(key, use_learned_cache=use_learned_cache),
                         affiliation=normalize_space(aff),
                     )
 
@@ -5789,7 +5803,7 @@ def extract_chair_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             if key and key in joined:
                 return Chair(
                     name=key,
-                    name_display=build_speaker_display(key),
+                    name_display=build_speaker_display(key, use_learned_cache=use_learned_cache),
                     affiliation=normalize_space(aff),
                 )
 
@@ -5977,7 +5991,14 @@ def append_role_to_affiliation(affiliation: str, role: str) -> str:
     return f"{aff} {role}".strip()
 
 
-def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str], chair: "Chair | None" = None, heading_words=None, debug=False) -> List[Talk]:
+def extract_talks_by_blocks(
+    blocks: List[TextBlock],
+    speaker_map: Dict[str, str],
+    chair: "Chair | None" = None,
+    heading_words=None,
+    debug=False,
+    use_learned_cache: bool = True,
+) -> List[Talk]:
     if heading_words is None:
         heading_words = {"PROGRAM", "P R O G R A M", "AGENDA", "SCHEDULE", "TIME TABLE", "タイムテーブル", "プログラム"}
     # debugは引数のデフォルト値False
@@ -6114,7 +6135,7 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             if "演者" in normalize_key(t):
                 cand = strip_label(["演者", "演者:", "演者："], t)
                 cand = norm_name(cand)
-                if cand and is_valid_person_name(cand):
+                if cand and is_valid_person_name(cand, use_learned_cache=use_learned_cache):
                     return cand
         # 座長エリアの人を特定して除外
         chair_area_names = set()
@@ -6161,7 +6182,7 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                 if name_match:
                     potential_name = name_match.group(1).strip()
                     # より厳密な検証を追加
-                    if (is_valid_person_name(potential_name) and 
+                    if (is_valid_person_name(potential_name, use_learned_cache=use_learned_cache) and 
                         potential_name not in chair_area_names and
                         speaker_map and potential_name in speaker_map):
                         explicit_speakers.append(norm_name(potential_name))
@@ -6200,7 +6221,7 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
         joined = normalize_key("\n".join(texts))
         for k in speaker_map.keys():
             if (k and k in joined and k not in chair_area_names and 
-                is_valid_person_name(k)):  # 追加検証
+                is_valid_person_name(k, use_learned_cache=use_learned_cache)):  # 追加検証
                 # 強化されたタイトル文脈チェック
                 if not is_speaker_in_title_context(k, texts):
                     return k
@@ -6211,7 +6232,7 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
         
         for k in speaker_map.keys():
             if (k and k not in chair_area_names and 
-                is_valid_person_name(k)):  # 追加検証
+                is_valid_person_name(k, use_learned_cache=use_learned_cache)):  # 追加検証
                 # 同様に強化されたタイトル文脈チェック
                 if not is_speaker_in_title_context(k, texts):
                     return k
@@ -6415,11 +6436,12 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             if not s:
                 return False
             # 正解DBから学習した役割を優先
-            learned = lookup_text_role(s)
-            if learned == "affiliation":
-                return True
-            if learned in ("talk_title", "event_title"):
-                return False
+            if use_learned_cache:
+                learned = lookup_text_role(s)
+                if learned == "affiliation":
+                    return True
+                if learned in ("talk_title", "event_title"):
+                    return False
             # 施設・所属・役職っぽい語が入ってたら「タイトル継続」ではない
             keywords = [
                 "大学", "病院", "センター", "研究科", "学部", "診療科", "内科", "外科",
@@ -6507,7 +6529,7 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
                         continue
                     # 人名判定（1語目＋2語目の連結 or 1語目のみ）
                     name_for_check = name_candidate.replace(' ', '')
-                    if not is_valid_person_name(name_for_check):
+                    if not is_valid_person_name(name_for_check, use_learned_cache=use_learned_cache):
                         if debug:
                             print(f"[DEBUG] Chair name '{name_candidate}' is not valid person name, skip.")
                         continue
@@ -6599,7 +6621,8 @@ def extract_talks_by_blocks(blocks: List[TextBlock], speaker_map: Dict[str, str]
             if pending_role:
                 affiliation = append_role_to_affiliation(affiliation, pending_role)
 
-            print(affiliation)
+            if debug:
+                print(affiliation, flush=True)
 
             # speaker確定（座長との重複チェックは後の処理で実行）
             # この段階では座長情報がないため、単純に演者として設定
@@ -11083,7 +11106,19 @@ def parse_blocks_to_design_json(
     warnings: List[str] = []
     confidence = 0.78
 
-    event_title_lines = extract_event_title_lines_from_blocks(blocks)
+    def _draft_log(message: str):
+        if fast_parse:
+            print(f"[upload/batch draft] {message}", flush=True)
+
+    def _draft_step(name: str, func):
+        _draft_log(f"{name} start")
+        started = time.monotonic()
+        try:
+            return func()
+        finally:
+            _draft_log(f"{name} done: {time.monotonic() - started:.2f}s")
+
+    event_title_lines = _draft_step("event_title", lambda: extract_event_title_lines_from_blocks(blocks))
     event_title = "\n".join(event_title_lines).strip()
 
     # VM に「講演会名」があれば、抽出タイトルが案内文ヘッダー等の場合に優先使用
@@ -11107,21 +11142,33 @@ def parse_blocks_to_design_json(
                 event_title_lines = [_vm_title]
                 event_title = _vm_title
 
-    print("event_title_lines:", event_title_lines)
+    print("event_title_lines:", event_title_lines, flush=True)
 
-    dt = extract_datetime_from_blocks(blocks)
-    print("datetime:", dt)
+    dt = _draft_step("datetime", lambda: extract_datetime_from_blocks(blocks))
+    print("datetime:", dt, flush=True)
 
-    org = extract_organizer_from_blocks(blocks)  # ←主催: を含めたいなら別途調整（必要なら次で直す）
+    org = _draft_step(
+        "organizer",
+        lambda: extract_organizer_from_blocks(blocks, use_learned_cache=not fast_parse),
+    )
 
     if speaker_map is None:
-        speaker_map = extract_speaker_affil_map_by_blocks(blocks, use_learned_cache=not fast_parse)
+        speaker_map = _draft_step(
+            "speaker_map",
+            lambda: extract_speaker_affil_map_by_blocks(blocks, use_learned_cache=not fast_parse),
+        )
         # VMデータがあれば、VMの医師名をblocks内で検索してspeaker_mapを強化
         if vm_rows:
-            speaker_map = enrich_speaker_map_with_vm(speaker_map, blocks, vm_rows)
-    chair = extract_chair_by_blocks(blocks, speaker_map)
+            speaker_map = _draft_step("vm_enrich", lambda: enrich_speaker_map_with_vm(speaker_map, blocks, vm_rows))
+    chair = _draft_step(
+        "chair",
+        lambda: extract_chair_by_blocks(blocks, speaker_map, use_learned_cache=not fast_parse),
+    )
 
-    talks = extract_talks_by_blocks(blocks, speaker_map, chair)
+    talks = _draft_step(
+        "talks",
+        lambda: extract_talks_by_blocks(blocks, speaker_map, chair, use_learned_cache=not fast_parse),
+    )
 
     if not event_title:
         warnings.append("missing_event_title"); confidence -= 0.2
@@ -11147,6 +11194,8 @@ def parse_blocks_to_design_json(
         warnings=sorted(set(warnings)),
         confidence=confidence,
     )
+    if fast_parse:
+        return payload
     return apply_inline_program_extraction(payload, blocks)
 
 
