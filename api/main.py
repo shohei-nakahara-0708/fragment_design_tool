@@ -7750,6 +7750,7 @@ def _empty_learning_cache_snapshot() -> dict[str, Any]:
         "chair_label": {},
         "talk_count": {},
         "datetime_newline": {},
+        "similar_answers": [],
     }
 
 
@@ -7823,6 +7824,7 @@ def _build_learning_cache_snapshot(answers: list[dict] | None = None) -> dict[st
     event_title_font_pts: list[float] = []
     speaker_font_pts: list[float] = []
     talk_title_font_pts: list[float] = []
+    similar_answers: list[dict[str, Any]] = []
 
     role_suffix_words = [
         "主任教授", "教授", "准教授", "講師", "助教",
@@ -7872,6 +7874,14 @@ def _build_learning_cache_snapshot(answers: list[dict] | None = None) -> dict[st
 
     for ans in answers:
         cj = ans.get("correct_json") or {}
+        similar_answers.append({
+            "job_id": ans.get("job_id", ""),
+            "event_title": ans.get("event_title", ""),
+            "blocks_text": ans.get("blocks_text", "") or "",
+            "keywords": ans.get("keywords") or [],
+            "correct_json": cj,
+            "created_at": ans.get("created_at", ""),
+        })
 
         event_title = (cj.get("event_title") or "").strip()
         add_text_role(event_title, "event_title", 4)
@@ -8070,6 +8080,7 @@ def _build_learning_cache_snapshot(answers: list[dict] | None = None) -> dict[st
         "chair_label": chair_label_counts,
         "talk_count": talk_count_cache,
         "datetime_newline": datetime_newline,
+        "similar_answers": similar_answers,
     })
     print(
         "[learning-cache] built "
@@ -8996,14 +9007,28 @@ def find_similar_correct_answers(
     min_similarity: float = 0.15,
 ) -> list[dict]:
     """類似する正解データを検索して返す（embedding優先、fallback: Jaccard）"""
-    answers = _load_correct_answers()
-    print(f"[correct-answer-search] loaded {len(answers)} answers, query event_title='{event_title[:60]}', blocks_text={len(blocks_text)} chars")
+    in_upload_batch = _is_upload_batch_fast_mode()
+    if in_upload_batch and bool(globals().get("UPLOAD_BATCH_LEARNING_CACHE", True)):
+        answers = _get_learning_cache_snapshot().get("similar_answers") or []
+        answers = answers if isinstance(answers, list) else []
+        source = "learning_cache"
+    else:
+        answers = _load_correct_answers()
+        source = "correct_answers"
+    print(f"[correct-answer-search] loaded {len(answers)} answers from {source}, query event_title='{event_title[:60]}', blocks_text={len(blocks_text)} chars")
     if not answers:
         return []
 
     query_text = blocks_text + " " + event_title
-    query_emb = _compute_embedding(query_text)
+    use_embedding = not (
+        in_upload_batch
+        and not bool(globals().get("UPLOAD_BATCH_CORRECT_ANSWER_EMBEDDING", False))
+    )
+    query_emb = _compute_embedding(query_text) if use_embedding else None
+    query_kw = _extract_keywords(query_text)
     query_title_ns = (event_title or "").replace(" ", "").replace("\u3000", "").replace("\n", "").lower()
+    if not use_embedding:
+        print("[correct-answer-search] embedding skipped for upload batch", flush=True)
 
     scored = []
     for ans in answers:
@@ -9013,7 +9038,6 @@ def find_similar_correct_answers(
             sim = _cosine_similarity(query_emb, ans_emb)
         else:
             # fallback: Jaccard
-            query_kw = _extract_keywords(query_text)
             ans_kw = set(ans.get("keywords", []))
             sim = _compute_similarity(query_kw, ans_kw)
 
@@ -9025,8 +9049,9 @@ def find_similar_correct_answers(
             print(f"[correct-answer-search] exact title match boost: '{ans_title[:50]}' sim→1.0")
 
         if sim >= min_similarity:
-            ans["_similarity"] = sim
-            scored.append((sim, ans))
+            ans_with_score = dict(ans)
+            ans_with_score["_similarity"] = sim
+            scored.append((sim, ans_with_score))
 
     # 同一類似度では新しいレコードを優先（created_at DESCでロード済みなので index が小さいほうが新しい）
     for idx, (sim, ans) in enumerate(scored):
@@ -14717,6 +14742,8 @@ UPLOAD_BATCH_RENDER_TIMEOUT = float(os.getenv("UPLOAD_BATCH_RENDER_TIMEOUT", "12
 UPLOAD_BATCH_MAX_PARALLEL = max(1, int(os.getenv("UPLOAD_BATCH_MAX_PARALLEL", "1")))
 UPLOAD_BATCH_LEARNING_CACHE = str(os.getenv("UPLOAD_BATCH_LEARNING_CACHE", "true")).lower() in {"1", "true", "yes", "on"}
 UPLOAD_BATCH_CORRECT_ANSWER_HINTS = str(os.getenv("UPLOAD_BATCH_CORRECT_ANSWER_HINTS") or "").lower() in {"1", "true", "yes", "on"}
+UPLOAD_BATCH_CORRECT_ANSWER_OVERLAY = str(os.getenv("UPLOAD_BATCH_CORRECT_ANSWER_OVERLAY", "true")).lower() in {"1", "true", "yes", "on"}
+UPLOAD_BATCH_CORRECT_ANSWER_EMBEDDING = str(os.getenv("UPLOAD_BATCH_CORRECT_ANSWER_EMBEDDING") or "").lower() in {"1", "true", "yes", "on"}
 UPLOAD_BATCH_LEARNED_TEXT_ROLES = str(os.getenv("UPLOAD_BATCH_LEARNED_TEXT_ROLES") or "").lower() in {"1", "true", "yes", "on"}
 UPLOAD_BATCH_LEARNED_AFFILIATION_FORMAT = str(os.getenv("UPLOAD_BATCH_LEARNED_AFFILIATION_FORMAT") or "").lower() in {"1", "true", "yes", "on"}
 UPLOAD_BATCH_AI_REFINE = str(os.getenv("UPLOAD_BATCH_AI_REFINE") or "").lower() in {"1", "true", "yes", "on"}
@@ -14808,8 +14835,18 @@ def _upload_batch_release(session_id: str) -> None:
 
 async def _run_sync_logged(label: str, fn, *args, **kwargs):
     started = time.monotonic()
+    fast_mode = _is_upload_batch_fast_mode()
+
+    def _call_with_context():
+        previous_fast_mode = _is_upload_batch_fast_mode()
+        _set_upload_batch_fast_mode(fast_mode)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _set_upload_batch_fast_mode(previous_fast_mode)
+
     try:
-        return await asyncio.to_thread(fn, *args, **kwargs)
+        return await asyncio.to_thread(_call_with_context)
     finally:
         print(f"[upload/batch timing] {label}: {time.monotonic() - started:.2f}s", flush=True)
 
@@ -14848,24 +14885,38 @@ def _upload_batch_prepare_payload(payload):
 
 
 def _upload_batch_finish_payload(payload, p: dict, vm_rows: list[dict], presence_rows: list[dict], event_id: str):
+    started_total = time.monotonic()
+    started = time.monotonic()
     payload = ensure_display_fields(payload)
+    print(f"[upload/batch timing] finish ensure_display_fields#1: {time.monotonic() - started:.2f}s", flush=True)
 
     blocks_for_overlay = []
+    started = time.monotonic()
     try:
         debug_blocks_path = p.get("debug_blocks")
         if debug_blocks_path and debug_blocks_path.exists():
             blocks_for_overlay = json.loads(debug_blocks_path.read_text(encoding="utf-8"))
     except Exception:
         pass
+    print(f"[upload/batch timing] finish read_debug_blocks: {time.monotonic() - started:.2f}s blocks={len(blocks_for_overlay)}", flush=True)
 
-    payload = apply_correct_answer_overlay(payload, blocks_for_overlay, vm_rows=vm_rows)
+    started = time.monotonic()
+    if bool(globals().get("UPLOAD_BATCH_CORRECT_ANSWER_OVERLAY", True)):
+        payload = apply_correct_answer_overlay(payload, blocks_for_overlay, vm_rows=vm_rows)
+    else:
+        print("[upload/batch finish] apply_correct_answer_overlay skipped", flush=True)
+    print(f"[upload/batch timing] finish apply_correct_answer_overlay: {time.monotonic() - started:.2f}s", flush=True)
+
+    started = time.monotonic()
     payload = ensure_display_fields(payload)
+    print(f"[upload/batch timing] finish ensure_display_fields#2: {time.monotonic() - started:.2f}s", flush=True)
     dump_titles("after apply_correct_answer_overlay", payload)
 
     payload.region = presence_rows[0].get("VP/PH/ONC", "")
     payload.unit = presence_rows[0].get("取得単位：フラグメントデザインへの内容記載", "")
     payload.event_id = event_id
 
+    started = time.monotonic()
     payload.talks = sorted(
         payload.talks or [],
         key=lambda x: (
@@ -14874,12 +14925,16 @@ def _upload_batch_finish_payload(payload, p: dict, vm_rows: list[dict], presence
             _time_start_minutes(getattr(x, "time", "")),
         )
     )
+    print(f"[upload/batch timing] finish sort_talks: {time.monotonic() - started:.2f}s", flush=True)
 
+    started = time.monotonic()
     payload_dict = (
         payload.model_dump(exclude_none=True)
         if hasattr(payload, "model_dump")
         else json.loads(payload.json(ensure_ascii=False))
     )
+    print(f"[upload/batch timing] finish dump_payload: {time.monotonic() - started:.2f}s", flush=True)
+    print(f"[upload/batch timing] finish total: {time.monotonic() - started_total:.2f}s", flush=True)
     return payload, payload_dict
 
 
@@ -18222,6 +18277,8 @@ async def learning_cache_status():
         "correct_answers_count": snapshot.get("correct_answers_count", 0),
         "source_max_created_at": snapshot.get("source_max_created_at", ""),
         "upload_batch_learning_cache": UPLOAD_BATCH_LEARNING_CACHE,
+        "upload_batch_correct_answer_overlay": UPLOAD_BATCH_CORRECT_ANSWER_OVERLAY,
+        "upload_batch_correct_answer_embedding": UPLOAD_BATCH_CORRECT_ANSWER_EMBEDDING,
         "sizes": {
             "speaker_display": len(snapshot.get("speaker_display") or {}),
             "affiliation_format": len(snapshot.get("affiliation_format") or {}),
@@ -18234,6 +18291,7 @@ async def learning_cache_status():
             "chair_label": len(snapshot.get("chair_label") or {}),
             "talk_count": len(snapshot.get("talk_count") or {}),
             "datetime_newline": len(snapshot.get("datetime_newline") or {}),
+            "similar_answers": len(snapshot.get("similar_answers") or []),
         },
     }
 
