@@ -13550,19 +13550,25 @@ async def pptx_to_json_vm_hint(
         "finalize_people_fields",
     )
 
-    _post_step(
-        "apply_learned_text_roles",
-        "学習済みテキスト役割を反映中…",
-        lambda: apply_learned_text_roles(refined),
-        "apply_learned_text_roles",
-    )
+    if phase_callback and not UPLOAD_BATCH_LEARNED_TEXT_ROLES:
+        print("[upload/batch postprocess] apply_learned_text_roles skipped", flush=True)
+    else:
+        _post_step(
+            "apply_learned_text_roles",
+            "学習済みテキスト役割を反映中…",
+            lambda: apply_learned_text_roles(refined),
+            "apply_learned_text_roles",
+        )
 
-    _post_step(
-        "apply_learned_affiliation_format",
-        "学習済み所属表記を反映中…",
-        lambda: apply_learned_affiliation_format(refined),
-        "apply_learned_affiliation_format",
-    )
+    if phase_callback and not UPLOAD_BATCH_LEARNED_AFFILIATION_FORMAT:
+        print("[upload/batch postprocess] apply_learned_affiliation_format skipped", flush=True)
+    else:
+        _post_step(
+            "apply_learned_affiliation_format",
+            "学習済み所属表記を反映中…",
+            lambda: apply_learned_affiliation_format(refined),
+            "apply_learned_affiliation_format",
+        )
 
     _post_step(
         "fill_datetime_parts",
@@ -14244,6 +14250,9 @@ UPLOAD_BATCH_ITEM_TIMEOUT = float(os.getenv("UPLOAD_BATCH_ITEM_TIMEOUT", "300"))
 UPLOAD_BATCH_RENDER_TIMEOUT = float(os.getenv("UPLOAD_BATCH_RENDER_TIMEOUT", "120"))
 UPLOAD_BATCH_MAX_PARALLEL = max(1, int(os.getenv("UPLOAD_BATCH_MAX_PARALLEL", "1")))
 UPLOAD_BATCH_CORRECT_ANSWER_HINTS = str(os.getenv("UPLOAD_BATCH_CORRECT_ANSWER_HINTS") or "").lower() in {"1", "true", "yes", "on"}
+UPLOAD_BATCH_LEARNED_TEXT_ROLES = str(os.getenv("UPLOAD_BATCH_LEARNED_TEXT_ROLES") or "").lower() in {"1", "true", "yes", "on"}
+UPLOAD_BATCH_LEARNED_AFFILIATION_FORMAT = str(os.getenv("UPLOAD_BATCH_LEARNED_AFFILIATION_FORMAT") or "").lower() in {"1", "true", "yes", "on"}
+UPLOAD_BATCH_QUEUE_TIMEOUT = float(os.getenv("UPLOAD_BATCH_QUEUE_TIMEOUT", "90"))
 UPLOAD_BATCH_SEMAPHORE = threading.Semaphore(UPLOAD_BATCH_MAX_PARALLEL)
 
 
@@ -16086,10 +16095,31 @@ async def upload_batch_stream(
         yield _sse("start", {"sessionId": session_id, "total": total})
         yield _sse("phase", {"phase": "queue", "message": "生成キューを確認中…"})
 
+        queue_started = time.monotonic()
+        next_queue_notice = queue_started + 10
         while not UPLOAD_BATCH_SEMAPHORE.acquire(blocking=False):
             if await request.is_disconnected():
                 shutil.rmtree(session_dir, ignore_errors=True)
                 return
+            elapsed = time.monotonic() - queue_started
+            if UPLOAD_BATCH_QUEUE_TIMEOUT > 0 and elapsed >= UPLOAD_BATCH_QUEUE_TIMEOUT:
+                shutil.rmtree(session_dir, ignore_errors=True)
+                message = (
+                    f"前のバッチ生成が完了しないため、{UPLOAD_BATCH_QUEUE_TIMEOUT:.0f}秒で待機を中断しました。"
+                    "少し待ってから再実行してください。"
+                )
+                print("[upload/batch queue timeout]", session_id, message, flush=True)
+                yield _sse("fatal", {"message": message})
+                return
+            if time.monotonic() >= next_queue_notice:
+                yield _sse(
+                    "phase",
+                    {
+                        "phase": "queue",
+                        "message": f"前の生成処理の終了待ちです…（{elapsed:.0f}秒）",
+                    },
+                )
+                next_queue_notice = time.monotonic() + 10
             await asyncio.sleep(0.5)
 
         progress_queue: queue.Queue = queue.Queue()
