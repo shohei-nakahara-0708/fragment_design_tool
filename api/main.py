@@ -13258,9 +13258,28 @@ async def pptx_to_json_vm_hint(
 
     if phase_callback:
         phase_callback("ai_refine", "AIで内容を整形中…")
-    print(f"[upload/batch parse] ai_refine start: {pptx_path.name}", flush=True)
-    refined = await ai_refine_json(blocks, draft, speaker_map, time_candidates, vm_rows)
-    print(f"[upload/batch parse] ai_refine done: {pptx_path.name}", flush=True)
+    if phase_callback and not UPLOAD_BATCH_AI_REFINE:
+        print(f"[upload/batch parse] ai_refine skipped: {pptx_path.name}", flush=True)
+        refined = draft
+        refined.warnings = sorted(set((refined.warnings or []) + ["ai_refine_skipped_batch"]))
+    else:
+        print(f"[upload/batch parse] ai_refine start: {pptx_path.name}", flush=True)
+        try:
+            if phase_callback:
+                refined = await asyncio.wait_for(
+                    ai_refine_json(blocks, draft, speaker_map, time_candidates, vm_rows),
+                    timeout=UPLOAD_BATCH_AI_TIMEOUT,
+                )
+            else:
+                refined = await ai_refine_json(blocks, draft, speaker_map, time_candidates, vm_rows)
+            print(f"[upload/batch parse] ai_refine done: {pptx_path.name}", flush=True)
+        except asyncio.TimeoutError:
+            print(
+                f"[upload/batch parse] ai_refine timeout after {UPLOAD_BATCH_AI_TIMEOUT:.0f}s: {pptx_path.name}",
+                flush=True,
+            )
+            refined = draft
+            refined.warnings = sorted(set((refined.warnings or []) + ["ai_refine_timeout"]))
     dump_titles("after ai_refine_json", refined)
 
     if phase_callback:
@@ -14252,8 +14271,91 @@ UPLOAD_BATCH_MAX_PARALLEL = max(1, int(os.getenv("UPLOAD_BATCH_MAX_PARALLEL", "1
 UPLOAD_BATCH_CORRECT_ANSWER_HINTS = str(os.getenv("UPLOAD_BATCH_CORRECT_ANSWER_HINTS") or "").lower() in {"1", "true", "yes", "on"}
 UPLOAD_BATCH_LEARNED_TEXT_ROLES = str(os.getenv("UPLOAD_BATCH_LEARNED_TEXT_ROLES") or "").lower() in {"1", "true", "yes", "on"}
 UPLOAD_BATCH_LEARNED_AFFILIATION_FORMAT = str(os.getenv("UPLOAD_BATCH_LEARNED_AFFILIATION_FORMAT") or "").lower() in {"1", "true", "yes", "on"}
+UPLOAD_BATCH_AI_REFINE = str(os.getenv("UPLOAD_BATCH_AI_REFINE") or "").lower() in {"1", "true", "yes", "on"}
+UPLOAD_BATCH_AI_TIMEOUT = float(os.getenv("UPLOAD_BATCH_AI_TIMEOUT", "45"))
 UPLOAD_BATCH_QUEUE_TIMEOUT = float(os.getenv("UPLOAD_BATCH_QUEUE_TIMEOUT", "90"))
-UPLOAD_BATCH_SEMAPHORE = threading.Semaphore(UPLOAD_BATCH_MAX_PARALLEL)
+UPLOAD_BATCH_STALE_TIMEOUT = float(
+    os.getenv(
+        "UPLOAD_BATCH_STALE_TIMEOUT",
+        str(max(UPLOAD_BATCH_ITEM_TIMEOUT, UPLOAD_BATCH_RENDER_TIMEOUT) + 120),
+    )
+)
+UPLOAD_BATCH_ACTIVE_LOCK = threading.Lock()
+UPLOAD_BATCH_ACTIVE: dict[str, dict[str, Any]] = {}
+
+
+def _upload_batch_active_snapshot(active: dict[str, Any], now: float) -> dict[str, Any]:
+    return {
+        "sessionId": active.get("session_id", ""),
+        "phase": active.get("phase", ""),
+        "filename": active.get("filename", ""),
+        "ageSeconds": round(now - float(active.get("started_at", now)), 1),
+        "idleSeconds": round(now - float(active.get("heartbeat_at", now)), 1),
+    }
+
+
+def _upload_batch_cleanup_stale_locked(now: float) -> list[dict[str, Any]]:
+    stale: list[dict[str, Any]] = []
+    for session_id, active in list(UPLOAD_BATCH_ACTIVE.items()):
+        thread = active.get("thread")
+        age = now - float(active.get("started_at", now))
+        thread_alive = bool(thread and thread.is_alive())
+        idle = now - float(active.get("heartbeat_at", now))
+        if thread is None and age < 5:
+            continue
+        if thread_alive and idle < UPLOAD_BATCH_STALE_TIMEOUT:
+            continue
+        stale.append(_upload_batch_active_snapshot(active, now))
+        UPLOAD_BATCH_ACTIVE.pop(session_id, None)
+    return stale
+
+
+def _upload_batch_try_acquire(session_id: str, total: int) -> tuple[bool, list[dict[str, Any]], list[dict[str, Any]]]:
+    now = time.monotonic()
+    with UPLOAD_BATCH_ACTIVE_LOCK:
+        stale = _upload_batch_cleanup_stale_locked(now)
+        if len(UPLOAD_BATCH_ACTIVE) >= UPLOAD_BATCH_MAX_PARALLEL:
+            active = [
+                _upload_batch_active_snapshot(item, now)
+                for item in UPLOAD_BATCH_ACTIVE.values()
+            ]
+            return False, active, stale
+
+        UPLOAD_BATCH_ACTIVE[session_id] = {
+            "session_id": session_id,
+            "total": total,
+            "started_at": now,
+            "heartbeat_at": now,
+            "phase": "queue_acquired",
+            "filename": "",
+            "thread": None,
+        }
+        return True, [], stale
+
+
+def _upload_batch_set_thread(session_id: str, thread: threading.Thread) -> None:
+    with UPLOAD_BATCH_ACTIVE_LOCK:
+        active = UPLOAD_BATCH_ACTIVE.get(session_id)
+        if active is not None:
+            active["thread"] = thread
+
+
+def _upload_batch_heartbeat(session_id: str, phase: str = "", filename: str = "") -> None:
+    now = time.monotonic()
+    with UPLOAD_BATCH_ACTIVE_LOCK:
+        active = UPLOAD_BATCH_ACTIVE.get(session_id)
+        if active is None:
+            return
+        active["heartbeat_at"] = now
+        if phase:
+            active["phase"] = phase
+        if filename:
+            active["filename"] = filename
+
+
+def _upload_batch_release(session_id: str) -> None:
+    with UPLOAD_BATCH_ACTIVE_LOCK:
+        UPLOAD_BATCH_ACTIVE.pop(session_id, None)
 
 
 async def _run_sync_logged(label: str, fn, *args, **kwargs):
@@ -14360,6 +14462,11 @@ async def _upload_batch_worker_async(
     cancel_event: threading.Event,
 ):
     def emit(event: str, data: dict):
+        _upload_batch_heartbeat(
+            session_id,
+            phase=str(data.get("phase") or event or ""),
+            filename=str(data.get("filename") or ""),
+        )
         progress({"event": event, **data})
         if event in {"phase", "item_start", "item_done", "fatal"}:
             print(f"[upload/batch event] {event}: {json.dumps(data, ensure_ascii=False)}", flush=True)
@@ -16097,7 +16204,24 @@ async def upload_batch_stream(
 
         queue_started = time.monotonic()
         next_queue_notice = queue_started + 10
-        while not UPLOAD_BATCH_SEMAPHORE.acquire(blocking=False):
+        while True:
+            acquired, active_batches, stale_batches = _upload_batch_try_acquire(session_id, total)
+            for stale in stale_batches:
+                print(
+                    f"[upload/batch stale lease] session={stale.get('sessionId')} "
+                    f"phase={stale.get('phase')} idle={stale.get('idleSeconds')}s",
+                    flush=True,
+                )
+                yield _sse(
+                    "phase",
+                    {
+                        "phase": "queue",
+                        "message": "停止した前回処理をキューから外しました。",
+                        "stale": stale,
+                    },
+                )
+            if acquired:
+                break
             if await request.is_disconnected():
                 shutil.rmtree(session_dir, ignore_errors=True)
                 return
@@ -16117,6 +16241,7 @@ async def upload_batch_stream(
                     {
                         "phase": "queue",
                         "message": f"前の生成処理の終了待ちです…（{elapsed:.0f}秒）",
+                        "active": active_batches,
                     },
                 )
                 next_queue_notice = time.monotonic() + 10
@@ -16142,11 +16267,12 @@ async def upload_batch_stream(
                     shutil.rmtree(session_dir, ignore_errors=True)
                 except Exception:
                     pass
-                UPLOAD_BATCH_SEMAPHORE.release()
+                _upload_batch_release(session_id)
                 progress_queue.put(None)
 
         thread = threading.Thread(target=worker, name=f"upload-batch-{session_id}", daemon=True)
         thread.start()
+        _upload_batch_set_thread(session_id, thread)
 
         completed = False
         try:
