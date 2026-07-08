@@ -13042,14 +13042,26 @@ def rebuild_talks_from_anchors(blocks: list[TextBlock], payload: DesignJSON) -> 
     return payload
 
 def dump_titles(tag, payload):
-    print(f"--- {tag} ---")
-    print(payload)
+    verbose = str(os.getenv("DESIGN_VERBOSE_DUMPS") or "").lower() in {"1", "true", "yes", "on"}
+    print(f"--- {tag} ---", flush=True)
+    if verbose:
+        print(payload, flush=True)
+    else:
+        event_title = normalize_space(getattr(payload, "event_title", "") or "")
+        talks = list(getattr(payload, "talks", []) or [])
+        print(
+            f"event_title={event_title[:80]!r} talks={len(talks)} warnings={getattr(payload, 'warnings', [])}",
+            flush=True,
+        )
     for i, t in enumerate(payload.talks or []):
-        print("idx=", i)
-        print("title=", repr(getattr(t, "title", "")))
-        print("title_lines=", getattr(t, "title_lines", []))
-        print("speaker=", repr(getattr(t, "speaker", "")))
-        print("affiliation=", repr(getattr(t, "affiliation", "")))
+        title = getattr(t, "title", "") or ""
+        title_lines = getattr(t, "title_lines", []) or []
+        affiliation = getattr(t, "affiliation", "") or ""
+        print("idx=", i, flush=True)
+        print("title=", repr(title[:160] + ("..." if len(title) > 160 else "")), flush=True)
+        print("title_lines=", [str(x)[:120] for x in title_lines[:4]], flush=True)
+        print("speaker=", repr(getattr(t, "speaker", "")), flush=True)
+        print("affiliation=", repr(affiliation[:160] + ("..." if len(affiliation) > 160 else "")), flush=True)
         
 def is_non_talk_heading(s: str) -> bool:
     s = normalize_space(s or "")
@@ -13134,6 +13146,24 @@ async def pptx_to_json_vm_hint(
     if phase_callback:
         phase_callback("postprocess", "解析結果を補正中…")
 
+    def _post_phase(name: str, message: str):
+        if phase_callback:
+            phase_callback(f"post_{name}", message)
+        print(f"[upload/batch postprocess] {name} start", flush=True)
+
+    def _post_done(name: str, started: float):
+        print(f"[upload/batch postprocess] {name} done: {time.monotonic() - started:.2f}s", flush=True)
+
+    def _post_step(name: str, message: str, func, dump_tag: str = ""):
+        nonlocal refined
+        _post_phase(name, message)
+        started = time.monotonic()
+        refined = func()
+        _post_done(name, started)
+        if dump_tag:
+            dump_titles(f"after {dump_tag}", refined)
+        return refined
+
     # AI が VM 講演会名を上書きした場合に再適用
     if vm_rows:
         _vm_title_post = ""
@@ -13185,36 +13215,83 @@ async def pptx_to_json_vm_hint(
         return bool(first_sp and first_sp == chair_name)
 
     if has_chair_shift_pattern(refined):
-        refined = rebuild_talks_from_anchors(blocks, refined)
+        _post_step(
+            "rebuild_talks_from_anchors",
+            "講演アンカーから構造を再構築中…",
+            lambda: rebuild_talks_from_anchors(blocks, refined),
+            "rebuild_talks_from_anchors",
+        )
 
 
-    refined = clean_ai_talk_titles(refined)
-    dump_titles("after clean_ai_talk_titles", refined)
+    _post_step(
+        "clean_ai_talk_titles",
+        "演題名のノイズを除去中…",
+        lambda: clean_ai_talk_titles(refined),
+        "clean_ai_talk_titles",
+    )
 
-    refined = repair_chair_from_multiline_block(refined, blocks)
-    dump_titles("after repair_chair_from_multiline_block", refined)
+    _post_step(
+        "repair_chair_from_multiline_block",
+        "座長情報を補正中…",
+        lambda: repair_chair_from_multiline_block(refined, blocks),
+        "repair_chair_from_multiline_block",
+    )
 
-    refined = clean_chair_fields(refined)
-    dump_titles("after clean_chair_fields", refined)
+    _post_step(
+        "clean_chair_fields",
+        "座長フィールドを整形中…",
+        lambda: clean_chair_fields(refined),
+        "clean_chair_fields",
+    )
 
-    refined = repair_talks_from_blocks(refined, blocks)
-    dump_titles("after repair_talks_from_blocks", refined)
+    _post_step(
+        "repair_talks_from_blocks",
+        "講演情報をブロックから補正中…",
+        lambda: repair_talks_from_blocks(refined, blocks),
+        "repair_talks_from_blocks",
+    )
 
     # 正解DBヒントによる空フィールド補完（blocks 内に実在するテキストのみ）
-    _ca_hints = compute_correct_answer_hints(blocks, refined.event_title or "")
-    refined = fill_empty_fields_from_blocks_with_hints(refined, blocks, _ca_hints)
-    dump_titles("after fill_empty_fields_from_blocks_with_hints", refined)
+    if phase_callback and not UPLOAD_BATCH_CORRECT_ANSWER_HINTS:
+        print("[upload/batch postprocess] compute_correct_answer_hints skipped", flush=True)
+    else:
+        _post_phase("compute_correct_answer_hints", "正解DBヒントを確認中…")
+        _hint_started = time.monotonic()
+        _ca_hints = compute_correct_answer_hints(blocks, refined.event_title or "")
+        _post_done("compute_correct_answer_hints", _hint_started)
+        _post_step(
+            "fill_empty_fields_from_blocks_with_hints",
+            "空欄をブロック情報で補完中…",
+            lambda: fill_empty_fields_from_blocks_with_hints(refined, blocks, _ca_hints),
+            "fill_empty_fields_from_blocks_with_hints",
+        )
 
-    refined = assign_talk_times_by_anchor(blocks, refined)
-    dump_titles("after assign_talk_times_by_anchor", refined)
+    _post_step(
+        "assign_talk_times_by_anchor",
+        "講演時間をアンカーから補正中…",
+        lambda: assign_talk_times_by_anchor(blocks, refined),
+        "assign_talk_times_by_anchor",
+    )
 
     # 近接性による時間割り当て（既存の時間をリセットしない）
-    refined = assign_talk_times_by_proximity(blocks, refined)
-    dump_titles("after assign_talk_times_by_proximity", refined)
+    _post_step(
+        "assign_talk_times_by_proximity",
+        "講演時間を近接位置から補正中…",
+        lambda: assign_talk_times_by_proximity(blocks, refined),
+        "assign_talk_times_by_proximity",
+    )
     
     # 最終手段：上位の時間による割り当て
-    refined.talks = assign_talk_times_by_nearest_upper_time(blocks, refined.talks)
-    dump_titles("after assign_talk_times_by_nearest_upper_time", refined)
+    def _assign_nearest_upper_time():
+        refined.talks = assign_talk_times_by_nearest_upper_time(blocks, refined.talks)
+        return refined
+
+    _post_step(
+        "assign_talk_times_by_nearest_upper_time",
+        "講演時間を上方候補から補正中…",
+        _assign_nearest_upper_time,
+        "assign_talk_times_by_nearest_upper_time",
+    )
 
     # 時間が割り当てられた talks を時間順にソート（演題番号順に整列）
     def _sort_talks_by_time(talks):
@@ -13231,8 +13308,16 @@ async def pptx_to_json_vm_hint(
             return sorted(talks, key=_time_sort_key)
         return talks
 
-    refined.talks = _sort_talks_by_time(list(refined.talks or []))
-    dump_titles("after sort_talks_by_time", refined)
+    def _sort_refined_talks_by_time():
+        refined.talks = _sort_talks_by_time(list(refined.talks or []))
+        return refined
+
+    _post_step(
+        "sort_talks_by_time",
+        "講演順を整列中…",
+        _sort_refined_talks_by_time,
+        "sort_talks_by_time",
+    )
 
     def _same_person(a: str, b: str) -> bool:
         return normalize_key(a or "").replace("先生", "") == normalize_key(b or "").replace("先生", "")
@@ -13278,46 +13363,99 @@ async def pptx_to_json_vm_hint(
         payload.talks = kept
         return payload
 
-    refined = drop_chair_duplicate_talks(refined)
+    _post_step(
+        "drop_chair_duplicate_talks",
+        "座長重複の講演を整理中…",
+        lambda: drop_chair_duplicate_talks(refined),
+    )
 
     vm_titles = _vm_speaker_titles(vm_rows)
-    if vm_titles:
-        refined = prune_talks_using_vm_titles(refined, vm_rows)
-    else:
-        refined = prune_talks_heuristic_only(refined)
-    dump_titles("after prune_talks", refined)
+    _post_step(
+        "prune_talks",
+        "講演候補を整理中…",
+        lambda: prune_talks_using_vm_titles(refined, vm_rows) if vm_titles else prune_talks_heuristic_only(refined),
+        "prune_talks",
+    )
 
-    refined = apply_vm_hints_from_blocks(blocks, refined, vm_rows)
-    dump_titles("after apply_vm_hints_from_blocks", refined)
+    _post_step(
+        "apply_vm_hints_from_blocks",
+        "VMヒントで講演情報を補正中…",
+        lambda: apply_vm_hints_from_blocks(blocks, refined, vm_rows),
+        "apply_vm_hints_from_blocks",
+    )
 
-    refined = fill_missing_from_vm(refined, vm_rows)
-    dump_titles("after fill_missing_from_vm", refined)
+    _post_step(
+        "fill_missing_from_vm",
+        "VM情報で不足項目を補完中…",
+        lambda: fill_missing_from_vm(refined, vm_rows),
+        "fill_missing_from_vm",
+    )
 
-    append_vm_role_to_talk_affiliation(refined, vm_rows)
-    dump_titles("after append_vm_role_to_talk_affiliation", refined)
+    def _append_vm_role():
+        append_vm_role_to_talk_affiliation(refined, vm_rows)
+        return refined
 
-    refined = fill_chair_affiliation_from_vm_hint(refined, blocks, vm_rows)
-    dump_titles("after fill_chair_affiliation_from_vm_hint", refined)
+    _post_step(
+        "append_vm_role_to_talk_affiliation",
+        "VM役割情報を所属へ反映中…",
+        _append_vm_role,
+        "append_vm_role_to_talk_affiliation",
+    )
 
-    refined = fill_chair_affiliation_from_blocks(refined, blocks)
-    dump_titles("after fill_chair_affiliation_from_blocks", refined)
+    _post_step(
+        "fill_chair_affiliation_from_vm_hint",
+        "座長所属をVMヒントから補完中…",
+        lambda: fill_chair_affiliation_from_vm_hint(refined, blocks, vm_rows),
+        "fill_chair_affiliation_from_vm_hint",
+    )
 
-    refined = normalize_speaker_display(refined)
-    dump_titles("after normalize_speaker_display", refined)
+    _post_step(
+        "fill_chair_affiliation_from_blocks",
+        "座長所属をブロックから補完中…",
+        lambda: fill_chair_affiliation_from_blocks(refined, blocks),
+        "fill_chair_affiliation_from_blocks",
+    )
 
-    refined = finalize_people_fields(refined)
-    dump_titles("after finalize_people_fields", refined)
+    _post_step(
+        "normalize_speaker_display",
+        "演者名の表示を整形中…",
+        lambda: normalize_speaker_display(refined),
+        "normalize_speaker_display",
+    )
 
-    refined = apply_learned_text_roles(refined)
-    dump_titles("after apply_learned_text_roles", refined)
+    _post_step(
+        "finalize_people_fields",
+        "人物フィールドを最終整形中…",
+        lambda: finalize_people_fields(refined),
+        "finalize_people_fields",
+    )
 
-    refined = apply_learned_affiliation_format(refined)
-    dump_titles("after apply_learned_affiliation_format", refined)
+    _post_step(
+        "apply_learned_text_roles",
+        "学習済みテキスト役割を反映中…",
+        lambda: apply_learned_text_roles(refined),
+        "apply_learned_text_roles",
+    )
 
-    refined = fill_datetime_parts(refined, blocks)
+    _post_step(
+        "apply_learned_affiliation_format",
+        "学習済み所属表記を反映中…",
+        lambda: apply_learned_affiliation_format(refined),
+        "apply_learned_affiliation_format",
+    )
 
-    refined = apply_inline_program_extraction(refined, blocks)
-    dump_titles("after apply_inline_program_extraction", refined)
+    _post_step(
+        "fill_datetime_parts",
+        "日時情報を整形中…",
+        lambda: fill_datetime_parts(refined, blocks),
+    )
+
+    _post_step(
+        "apply_inline_program_extraction",
+        "プログラム内情報を抽出中…",
+        lambda: apply_inline_program_extraction(refined, blocks),
+        "apply_inline_program_extraction",
+    )
 
     # NOTE: apply_correct_answer_overlay はバッチフロー側で
     # apply_precise_typeset_initial の「後」に呼ぶ（typeset が改行位置を上書きするため）
@@ -13985,6 +14123,7 @@ UPLOAD_BATCH_SHEET_TIMEOUT = float(os.getenv("UPLOAD_BATCH_SHEET_TIMEOUT", "90")
 UPLOAD_BATCH_ITEM_TIMEOUT = float(os.getenv("UPLOAD_BATCH_ITEM_TIMEOUT", "300"))
 UPLOAD_BATCH_RENDER_TIMEOUT = float(os.getenv("UPLOAD_BATCH_RENDER_TIMEOUT", "120"))
 UPLOAD_BATCH_MAX_PARALLEL = max(1, int(os.getenv("UPLOAD_BATCH_MAX_PARALLEL", "1")))
+UPLOAD_BATCH_CORRECT_ANSWER_HINTS = str(os.getenv("UPLOAD_BATCH_CORRECT_ANSWER_HINTS") or "").lower() in {"1", "true", "yes", "on"}
 UPLOAD_BATCH_SEMAPHORE = threading.Semaphore(UPLOAD_BATCH_MAX_PARALLEL)
 
 
