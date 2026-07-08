@@ -13101,10 +13101,21 @@ def _extract_design_blocks_for_vm_hint(pptx_path: Path, debug_blocks_path: Optio
     return blocks
 
 
-async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_blocks_path: Optional[Path] = None) -> DesignJSON:
+async def pptx_to_json_vm_hint(
+    pptx_path: Path,
+    vm_rows: List[dict],
+    debug_blocks_path: Optional[Path] = None,
+    phase_callback=None,
+) -> DesignJSON:
     """PPTX優先。VMは精度を上げるヒントとして blocks からの拾い直しにのみ使用し、欠損時のみVMで補完する。"""
+    if phase_callback:
+        phase_callback("extract_blocks", "PPTX/PDFの文字を抽出中…")
+    print(f"[upload/batch parse] extract_blocks start: {pptx_path.name}", flush=True)
     blocks = await asyncio.to_thread(_extract_design_blocks_for_vm_hint, pptx_path, debug_blocks_path)
+    print(f"[upload/batch parse] extract_blocks done: {pptx_path.name} blocks={len(blocks)}", flush=True)
 
+    if phase_callback:
+        phase_callback("parse_blocks", "抽出した文字を解析中…")
     speaker_map = extract_speaker_affil_map_by_blocks(blocks)
     # VM医師名でspeaker_mapを強化（ブロック位置ベースで所属も取得）
     speaker_map = enrich_speaker_map_with_vm(speaker_map, blocks, vm_rows)
@@ -13113,8 +13124,15 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
     draft = parse_blocks_to_design_json(blocks, vm_rows=vm_rows)
     print("draft", draft)
 
+    if phase_callback:
+        phase_callback("ai_refine", "AIで内容を整形中…")
+    print(f"[upload/batch parse] ai_refine start: {pptx_path.name}", flush=True)
     refined = await ai_refine_json(blocks, draft, speaker_map, time_candidates, vm_rows)
+    print(f"[upload/batch parse] ai_refine done: {pptx_path.name}", flush=True)
     dump_titles("after ai_refine_json", refined)
+
+    if phase_callback:
+        phase_callback("postprocess", "解析結果を補正中…")
 
     # AI が VM 講演会名を上書きした場合に再適用
     if vm_rows:
@@ -13330,16 +13348,17 @@ def trim_last_pixel(path: str):
         img.save(path, quality=100)
 
 
-async def render_png_bytes(payload: DesignJSON) -> tuple[bytes, str]:
+async def render_png_bytes(payload: DesignJSON, browser=None) -> tuple[bytes, str]:
     global _cached_template, _browser
 
     if _cached_template is None:
         _cached_template = TEMPLATE_PATH.read_text(encoding="utf-8")
 
-    if _browser is None:
+    active_browser = browser or _browser
+    if active_browser is None:
         raise RuntimeError("Playwright browser is not initialized")
 
-    context = await _browser.new_context(
+    context = await active_browser.new_context(
         viewport=BASE_VIEWPORT,
         device_scale_factor=1,
     )
@@ -13845,6 +13864,11 @@ async def root_health():
     return {"ok": True, "service": "fragment_design_tool"}
 
 
+@app.head("/")
+async def root_health_head():
+    return Response(status_code=200)
+
+
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
@@ -13961,7 +13985,7 @@ UPLOAD_BATCH_SHEET_TIMEOUT = float(os.getenv("UPLOAD_BATCH_SHEET_TIMEOUT", "90")
 UPLOAD_BATCH_ITEM_TIMEOUT = float(os.getenv("UPLOAD_BATCH_ITEM_TIMEOUT", "300"))
 UPLOAD_BATCH_RENDER_TIMEOUT = float(os.getenv("UPLOAD_BATCH_RENDER_TIMEOUT", "120"))
 UPLOAD_BATCH_MAX_PARALLEL = max(1, int(os.getenv("UPLOAD_BATCH_MAX_PARALLEL", "1")))
-UPLOAD_BATCH_SEMAPHORE = asyncio.Semaphore(UPLOAD_BATCH_MAX_PARALLEL)
+UPLOAD_BATCH_SEMAPHORE = threading.Semaphore(UPLOAD_BATCH_MAX_PARALLEL)
 
 
 async def _run_sync_logged(label: str, fn, *args, **kwargs):
@@ -13969,7 +13993,7 @@ async def _run_sync_logged(label: str, fn, *args, **kwargs):
     try:
         return await asyncio.to_thread(fn, *args, **kwargs)
     finally:
-        print(f"[upload/batch timing] {label}: {time.monotonic() - started:.2f}s")
+        print(f"[upload/batch timing] {label}: {time.monotonic() - started:.2f}s", flush=True)
 
 
 def _load_upload_batch_rows(valid_event_ids: list[str]):
@@ -14058,6 +14082,233 @@ def _upload_batch_persist_job(
         print("[upload/batch local save warning]", filename, exc)
 
     upsert_job_ok(job_id, filename, payload, session_id, event_id)
+
+
+async def _upload_batch_worker_async(
+    buffered: list[dict[str, Any]],
+    session_id: str,
+    total: int,
+    progress,
+    cancel_event: threading.Event,
+):
+    def emit(event: str, data: dict):
+        progress({"event": event, **data})
+        if event in {"phase", "item_start", "item_done", "fatal"}:
+            print(f"[upload/batch event] {event}: {json.dumps(data, ensure_ascii=False)}", flush=True)
+
+    emit("phase", {"phase": "sheet_open", "message": "スプレッドシート接続中…"})
+
+    valid_event_ids = [
+        it["eventId"]
+        for it in buffered
+        if it.get("precheck", {}).get("ok")
+    ]
+
+    emit("phase", {"phase": "batch_fetch", "message": "VM/Presence一括取得中…"})
+    try:
+        presence_rows_by_event, vm_rows_by_event, _ = await asyncio.wait_for(
+            _run_sync_logged("sheet batch fetch", _load_upload_batch_rows, valid_event_ids),
+            timeout=UPLOAD_BATCH_SHEET_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        message = f"VM/Presence取得が{UPLOAD_BATCH_SHEET_TIMEOUT:.0f}秒でタイムアウトしました。"
+        print("[upload/batch timeout] sheet batch fetch", flush=True)
+        emit("fatal", {"message": message})
+        return
+
+    emit("phase", {"phase": "browser_start", "message": "レンダリングエンジンを起動中…"})
+    local_pw = None
+    local_browser = None
+    upload_tasks = []
+    out: List[Dict[str, Any]] = []
+
+    try:
+        local_pw = await async_playwright().start()
+        local_browser = await local_pw.chromium.launch(
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+
+        emit("phase", {"phase": "processing", "message": "生成を開始します…"})
+
+        for it in buffered:
+            if cancel_event.is_set():
+                emit("cancelled", {"sessionId": session_id, "message": "バッチ生成を中断しました。"})
+                return
+
+            i = it["index"]
+            filename = it["filename"]
+            event_id = it["eventId"]
+
+            emit("item_start", {"index": i, "filename": filename, "eventId": event_id})
+
+            if not it["precheck"]["ok"]:
+                err = it["precheck"]["error"]
+                out.append({"filename": filename, "ok": False, "error": err})
+                emit("item_done", {"index": i, "filename": filename, "ok": False, "error": err})
+                continue
+
+            in_path = Path(it["in_path"])
+            presence_rows = presence_rows_by_event.get(event_id, []) or []
+            if not presence_rows:
+                out.append({"filename": filename, "ok": False, "error": "event_id_not_found"})
+                emit("item_done", {"index": i, "filename": filename, "ok": False, "error": "event_id_not_found"})
+                continue
+
+            vm_rows = vm_rows_by_event.get(event_id, []) or []
+            job_id = uuid.uuid4().hex
+            p = job_paths(job_id)
+            current_phase = "processing"
+
+            def parse_phase(phase: str, message: str):
+                nonlocal current_phase
+                current_phase = phase
+                emit("phase", {"phase": phase, "index": i, "filename": filename, "message": message})
+
+            try:
+                current_phase = "parse"
+                emit("phase", {"phase": "parse", "index": i, "filename": filename, "message": "PPTX/PDFを解析中…"})
+                payload = await asyncio.wait_for(
+                    pptx_to_json_vm_hint(
+                        in_path,
+                        vm_rows,
+                        debug_blocks_path=p.get("debug_blocks"),
+                        phase_callback=parse_phase,
+                    ),
+                    timeout=UPLOAD_BATCH_ITEM_TIMEOUT,
+                )
+
+                current_phase = "prepare"
+                emit("phase", {"phase": "prepare", "index": i, "filename": filename, "message": "生成データを整形中…"})
+                payload = await _run_sync_logged("prepare payload", _upload_batch_prepare_payload, payload)
+
+                current_phase = "typeset"
+                emit("phase", {"phase": "typeset", "index": i, "filename": filename, "message": "文字組みを調整中…"})
+                typeset_context = await local_browser.new_context(viewport=BASE_VIEWPORT)
+                typeset_page = await typeset_context.new_page()
+                try:
+                    payload = await asyncio.wait_for(
+                        apply_precise_typeset_initial(payload, page=typeset_page),
+                        timeout=UPLOAD_BATCH_RENDER_TIMEOUT,
+                    )
+                finally:
+                    await typeset_context.close()
+
+                current_phase = "finish"
+                emit("phase", {"phase": "finish", "index": i, "filename": filename, "message": "解析結果を保存用に整形中…"})
+                payload, payload_dict = await _run_sync_logged(
+                    "finish payload",
+                    _upload_batch_finish_payload,
+                    payload,
+                    p,
+                    vm_rows,
+                    presence_rows,
+                    event_id,
+                )
+
+                current_phase = "render"
+                emit("phase", {"phase": "render", "index": i, "filename": filename, "message": "プレビュー画像を生成中…"})
+                jpg_bytes, debug_html = await asyncio.wait_for(
+                    render_png_bytes(payload, browser=local_browser),
+                    timeout=UPLOAD_BATCH_RENDER_TIMEOUT,
+                )
+
+                current_phase = "persist"
+                emit("phase", {"phase": "persist", "index": i, "filename": filename, "message": "結果を保存中…"})
+                await _run_sync_logged(
+                    "persist job",
+                    _upload_batch_persist_job,
+                    p,
+                    job_id,
+                    filename,
+                    payload,
+                    payload_dict,
+                    session_id,
+                    event_id,
+                    jpg_bytes,
+                )
+
+                upload_tasks.append(asyncio.create_task(upload_all_assets_async(
+                    job_id,
+                    payload_dict=payload_dict,
+                    jpg_bytes=jpg_bytes,
+                    debug_html=debug_html,
+                    debug_blocks_path=p.get("debug_blocks"),
+                )))
+
+                out.append({
+                    "filename": filename,
+                    "jobId": job_id,
+                    "ok": True,
+                })
+                emit("item_done", {
+                    "index": i,
+                    "filename": filename,
+                    "ok": True,
+                    "jobId": job_id,
+                })
+
+            except asyncio.TimeoutError:
+                timeout_seconds = (
+                    UPLOAD_BATCH_ITEM_TIMEOUT
+                    if current_phase in {"parse", "extract_blocks", "parse_blocks", "ai_refine", "postprocess"}
+                    else UPLOAD_BATCH_RENDER_TIMEOUT
+                )
+                error = f"{current_phase}_timeout: {timeout_seconds:.0f}秒でタイムアウトしました"
+                print("[upload/batch timeout]", filename, job_id, error, flush=True)
+                out.append({
+                    "filename": filename,
+                    "jobId": job_id,
+                    "ok": False,
+                    "error": error,
+                })
+                emit("item_done", {
+                    "index": i,
+                    "filename": filename,
+                    "ok": False,
+                    "jobId": job_id,
+                    "error": error,
+                })
+
+            except Exception as e:
+                tb = traceback.format_exc()
+                print("[upload/batch error]", filename, job_id, flush=True)
+                print(tb, flush=True)
+
+                out.append({
+                    "filename": filename,
+                    "jobId": job_id,
+                    "ok": False,
+                    "error": str(e),
+                })
+                emit("item_done", {
+                    "index": i,
+                    "filename": filename,
+                    "ok": False,
+                    "jobId": job_id,
+                    "error": str(e),
+                })
+
+        if upload_tasks:
+            emit("phase", {"phase": "asset_upload", "message": "生成結果をストレージへ同期中…"})
+            results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    print("[upload/batch asset upload warning]", repr(result), flush=True)
+
+        ok_count = sum(1 for r in out if r.get("ok"))
+        emit("done", {"sessionId": session_id, "count": ok_count, "results": out})
+
+    finally:
+        if local_browser is not None:
+            try:
+                await local_browser.close()
+            except Exception as exc:
+                print("[upload/batch browser close warning]", exc, flush=True)
+        if local_pw is not None:
+            try:
+                await local_pw.stop()
+            except Exception as exc:
+                print("[upload/batch playwright stop warning]", exc, flush=True)
 
 
 def _lecture_normalize_drive_folder_id(value: str) -> str:
@@ -15511,6 +15762,7 @@ async def upload_simple_stream(
 
 @app.post("/upload/batch/stream")
 async def upload_batch_stream(
+    request: Request,
     files: List[UploadFile] = File(...),
     eventIds: List[str] = Form(...),
 ):
@@ -15564,191 +15816,57 @@ async def upload_batch_stream(
     async def gen():
         yield _sse("start", {"sessionId": session_id, "total": total})
         yield _sse("phase", {"phase": "queue", "message": "生成キューを確認中…"})
-        acquired_batch_slot = False
 
-        try:
-            await UPLOAD_BATCH_SEMAPHORE.acquire()
-            acquired_batch_slot = True
-            yield _sse("phase", {"phase": "sheet_open", "message": "スプレッドシート接続中…"})
-
-            valid_event_ids = []
-            for it in buffered:
-                if it["precheck"]["ok"]:
-                    valid_event_ids.append(it["eventId"])
-
-            yield _sse("phase", {"phase": "batch_fetch", "message": "VM/Presence一括取得中…"})
-            try:
-                presence_rows_by_event, vm_rows_by_event, _ = await asyncio.wait_for(
-                    _run_sync_logged("sheet batch fetch", _load_upload_batch_rows, valid_event_ids),
-                    timeout=UPLOAD_BATCH_SHEET_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                message = f"VM/Presence取得が{UPLOAD_BATCH_SHEET_TIMEOUT:.0f}秒でタイムアウトしました。"
-                print("[upload/batch timeout] sheet batch fetch")
-                yield _sse("fatal", {"message": message})
-                return
-
-            # （あなたの _parse_ymd / presence_rows_by_file_index / vm_rows_by_file_index のロジックは
-            #    buffered を元に組み直すのが一番安全。ここでは “生成部分” の直しだけ見せます）
-
-            yield _sse("phase", {"phase": "processing", "message": "生成を開始します…"})
-            out: List[Dict[str, Any]] = []
-
-            for it in buffered:
-                i = it["index"]
-                filename = it["filename"]
-                event_id = it["eventId"]
-
-                yield _sse("item_start", {"index": i, "filename": filename, "eventId": event_id})
-
-                if not it["precheck"]["ok"]:
-                    err = it["precheck"]["error"]
-                    out.append({"filename": filename, "ok": False, "error": err})
-                    yield _sse("item_done", {"index": i, "filename": filename, "ok": False, "error": err})
-                    continue
-
-                # ✅ もう UploadFile は触らない。退避したパスだけ使う
-                in_path = Path(it["in_path"])
-
-                # presence/vm は event_id から引く（ここはあなたの既存ロジックに合わせてOK）
-                presence_rows = presence_rows_by_event.get(event_id, []) or []
-                if not presence_rows:
-                    out.append({"filename": filename, "ok": False, "error": "event_id_not_found"})
-                    yield _sse("item_done", {"index": i, "filename": filename, "ok": False, "error": "event_id_not_found"})
-                    continue
-                vm_rows = vm_rows_by_event.get(event_id, []) or []
-
-                job_id = uuid.uuid4().hex
-                p = job_paths(job_id)
-                current_phase = "processing"
-
-                try:
-                    current_phase = "parse"
-                    yield _sse("phase", {"phase": "parse", "index": i, "filename": filename, "message": "PPTX/PDFを解析中…"})
-                    payload = await asyncio.wait_for(
-                        pptx_to_json_vm_hint(
-                            in_path,
-                            vm_rows,
-                            debug_blocks_path=p.get("debug_blocks"),
-                        ),
-                        timeout=UPLOAD_BATCH_ITEM_TIMEOUT,
-                    )
-
-                    payload = await _run_sync_logged("prepare payload", _upload_batch_prepare_payload, payload)
-
-                    current_phase = "typeset"
-                    yield _sse("phase", {"phase": "typeset", "index": i, "filename": filename, "message": "文字組みを調整中…"})
-                    payload = await asyncio.wait_for(
-                        apply_precise_typeset_initial(payload),
-                        timeout=UPLOAD_BATCH_RENDER_TIMEOUT,
-                    )
-
-                    payload, payload_dict = await _run_sync_logged(
-                        "finish payload",
-                        _upload_batch_finish_payload,
-                        payload,
-                        p,
-                        vm_rows,
-                        presence_rows,
-                        event_id,
-                    )
-
-                    current_phase = "render"
-                    yield _sse("phase", {"phase": "render", "index": i, "filename": filename, "message": "プレビュー画像を生成中…"})
-                    jpg_bytes, debug_html = await asyncio.wait_for(
-                        render_png_bytes(payload),
-                        timeout=UPLOAD_BATCH_RENDER_TIMEOUT,
-                    )
-
-                    await _run_sync_logged(
-                        "persist job",
-                        _upload_batch_persist_job,
-                        p,
-                        job_id,
-                        filename,
-                        payload,
-                        payload_dict,
-                        session_id,
-                        event_id,
-                        jpg_bytes,
-                    )
-
-                    # Storage アップロードはバックグラウンドで実行（ローカル保存済みなので遅延OK）
-                    asyncio.create_task(upload_all_assets_async(
-                        job_id,
-                        payload_dict=payload_dict,
-                        jpg_bytes=jpg_bytes,
-                        debug_html=debug_html,
-                        debug_blocks_path=p.get("debug_blocks"),
-                    ))
-
-                    out.append({
-                        "filename": filename,
-                        "jobId": job_id,
-                        "ok": True,
-                    })
-                    yield _sse("item_done", {
-                        "index": i,
-                        "filename": filename,
-                        "ok": True,
-                        "jobId": job_id,
-                    })
-
-                except asyncio.TimeoutError:
-                    timeout_seconds = (
-                        UPLOAD_BATCH_ITEM_TIMEOUT
-                        if current_phase == "parse"
-                        else UPLOAD_BATCH_RENDER_TIMEOUT
-                    )
-                    error = f"{current_phase}_timeout: {timeout_seconds:.0f}秒でタイムアウトしました"
-                    print("[upload/batch timeout]", filename, job_id, error)
-                    out.append({
-                        "filename": filename,
-                        "jobId": job_id,
-                        "ok": False,
-                        "error": error,
-                    })
-                    yield _sse("item_done", {
-                        "index": i,
-                        "filename": filename,
-                        "ok": False,
-                        "jobId": job_id,
-                        "error": error,
-                    })
-
-                except Exception as e:
-                    tb = traceback.format_exc()
-                    print("[upload/batch error]", filename, job_id)
-                    print(tb)
-
-                    out.append({
-                        "filename": filename,
-                        "jobId": job_id,
-                        "ok": False,
-                        "error": str(e),
-                    })
-                    yield _sse("item_done", {
-                        "index": i,
-                        "filename": filename,
-                        "ok": False,
-                        "jobId": job_id,
-                        "error": str(e),
-                    })
-
-            ok_count = sum(1 for r in out if r.get("ok"))
-            yield _sse("done", {"sessionId": session_id, "count": ok_count, "results": out})
-
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(tb)
-            yield _sse("fatal", {"message": str(e)})
-        finally:
-            if acquired_batch_slot:
-                UPLOAD_BATCH_SEMAPHORE.release()
-            try:
+        while not UPLOAD_BATCH_SEMAPHORE.acquire(blocking=False):
+            if await request.is_disconnected():
                 shutil.rmtree(session_dir, ignore_errors=True)
-            except Exception:
-                pass
+                return
+            await asyncio.sleep(0.5)
+
+        progress_queue: queue.Queue = queue.Queue()
+        cancel_event = threading.Event()
+
+        def worker():
+            try:
+                asyncio.run(_upload_batch_worker_async(
+                    buffered,
+                    session_id,
+                    total,
+                    progress_queue.put,
+                    cancel_event,
+                ))
+            except Exception as exc:
+                print("[upload/batch worker fatal]", traceback.format_exc(), flush=True)
+                progress_queue.put({"event": "fatal", "message": str(exc)})
+            finally:
+                try:
+                    shutil.rmtree(session_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                UPLOAD_BATCH_SEMAPHORE.release()
+                progress_queue.put(None)
+
+        thread = threading.Thread(target=worker, name=f"upload-batch-{session_id}", daemon=True)
+        thread.start()
+
+        completed = False
+        try:
+            while True:
+                try:
+                    item = await asyncio.to_thread(progress_queue.get, True, 0.5)
+                except queue.Empty:
+                    if await request.is_disconnected():
+                        cancel_event.set()
+                        break
+                    continue
+                if item is None:
+                    completed = True
+                    break
+                event_name = item.pop("event", "progress")
+                yield _sse(event_name, item)
+        finally:
+            if not completed:
+                cancel_event.set()
 
     return StreamingResponse(
         gen(),
