@@ -13080,8 +13080,7 @@ def is_non_talk_heading(s: str) -> bool:
 
     return False
 
-async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_blocks_path: Optional[Path] = None) -> DesignJSON:
-    """PPTX優先。VMは精度を上げるヒントとして blocks からの拾い直しにのみ使用し、欠損時のみVMで補完する。"""
+def _extract_design_blocks_for_vm_hint(pptx_path: Path, debug_blocks_path: Optional[Path] = None) -> List[TextBlock]:
     blocks = extract_blocks_any(pptx_path, first_only=True)
     blocks = merge_event_title_blocks_strict(blocks)
 
@@ -13098,6 +13097,13 @@ async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_block
             for b in blocks
         ]
         debug_blocks_path.write_text(json.dumps(dbg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return blocks
+
+
+async def pptx_to_json_vm_hint(pptx_path: Path, vm_rows: List[dict], debug_blocks_path: Optional[Path] = None) -> DesignJSON:
+    """PPTX優先。VMは精度を上げるヒントとして blocks からの拾い直しにのみ使用し、欠損時のみVMで補完する。"""
+    blocks = await asyncio.to_thread(_extract_design_blocks_for_vm_hint, pptx_path, debug_blocks_path)
 
     speaker_map = extract_speaker_affil_map_by_blocks(blocks)
     # VM医師名でspeaker_mapを強化（ブロック位置ベースで所属も取得）
@@ -13833,6 +13839,16 @@ app.add_middleware(
 
 app.mount("/fonts", StaticFiles(directory=str(APP_DIR / "fonts")), name="fonts")
 
+
+@app.get("/")
+async def root_health():
+    return {"ok": True, "service": "fragment_design_tool"}
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
 # データベース接続エラーのグローバルハンドラー
 @app.exception_handler(OperationalError)
 async def database_exception_handler(request: Request, exc: OperationalError):
@@ -13939,6 +13955,109 @@ async def shutdown():
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+UPLOAD_BATCH_SHEET_TIMEOUT = float(os.getenv("UPLOAD_BATCH_SHEET_TIMEOUT", "90"))
+UPLOAD_BATCH_ITEM_TIMEOUT = float(os.getenv("UPLOAD_BATCH_ITEM_TIMEOUT", "300"))
+UPLOAD_BATCH_RENDER_TIMEOUT = float(os.getenv("UPLOAD_BATCH_RENDER_TIMEOUT", "120"))
+UPLOAD_BATCH_MAX_PARALLEL = max(1, int(os.getenv("UPLOAD_BATCH_MAX_PARALLEL", "1")))
+UPLOAD_BATCH_SEMAPHORE = asyncio.Semaphore(UPLOAD_BATCH_MAX_PARALLEL)
+
+
+async def _run_sync_logged(label: str, fn, *args, **kwargs):
+    started = time.monotonic()
+    try:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    finally:
+        print(f"[upload/batch timing] {label}: {time.monotonic() - started:.2f}s")
+
+
+def _load_upload_batch_rows(valid_event_ids: list[str]):
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    credentials = get_gsa_credentials(scope)
+    gc = gspread.authorize(credentials)
+
+    spreadsheet_key = "1hiV0Ve2cnYyrPkBuZcZIcLWeAnJ-ucNiB0P4owZpXug"
+    workbook = gc.open_by_key(spreadsheet_key)
+
+    presence_sheets = ["VM(GWET)", "VM(例外)", "VM(本社)"]
+    ws_map = _retry_gspread(lambda: {ws.title: ws for ws in workbook.worksheets()})
+    return batch_fetch_system_and_vm_rows(
+        workbook,
+        ws_map=ws_map,
+        event_ids=valid_event_ids,
+        presence_sheets=presence_sheets,
+        presence_header_row=2,
+        presence_id_col="システムID",
+        vm_sheet="演題演者（VM）",
+        vm_header_row=1,
+        vm_id_col_candidates=["講演会ID"],
+        col_end="Z",
+    )
+
+
+def _upload_batch_prepare_payload(payload):
+    payload = normalize_for_render(payload)
+    payload = post_format_design_initial(payload)
+    return payload
+
+
+def _upload_batch_finish_payload(payload, p: dict, vm_rows: list[dict], presence_rows: list[dict], event_id: str):
+    payload = ensure_display_fields(payload)
+
+    blocks_for_overlay = []
+    try:
+        debug_blocks_path = p.get("debug_blocks")
+        if debug_blocks_path and debug_blocks_path.exists():
+            blocks_for_overlay = json.loads(debug_blocks_path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+
+    payload = apply_correct_answer_overlay(payload, blocks_for_overlay, vm_rows=vm_rows)
+    payload = ensure_display_fields(payload)
+    dump_titles("after apply_correct_answer_overlay", payload)
+
+    payload.region = presence_rows[0].get("VP/PH/ONC", "")
+    payload.unit = presence_rows[0].get("取得単位：フラグメントデザインへの内容記載", "")
+    payload.event_id = event_id
+
+    payload.talks = sorted(
+        payload.talks or [],
+        key=lambda x: (
+            getattr(x, "program_index", 10**9),
+            getattr(x, "_talk_index", 10**9),
+            _time_start_minutes(getattr(x, "time", "")),
+        )
+    )
+
+    payload_dict = (
+        payload.model_dump(exclude_none=True)
+        if hasattr(payload, "model_dump")
+        else json.loads(payload.json(ensure_ascii=False))
+    )
+    return payload, payload_dict
+
+
+def _upload_batch_persist_job(
+    p: dict,
+    job_id: str,
+    filename: str,
+    payload,
+    payload_dict: dict,
+    session_id: str,
+    event_id: str,
+    jpg_bytes: bytes,
+):
+    try:
+        p["json"].write_text(json.dumps(payload_dict, ensure_ascii=False), encoding="utf-8")
+        p["jpg"].write_bytes(jpg_bytes)
+    except Exception as exc:
+        print("[upload/batch local save warning]", filename, exc)
+
+    upsert_job_ok(job_id, filename, payload, session_id, event_id)
 
 
 def _lecture_normalize_drive_folder_id(value: str) -> str:
@@ -15444,48 +15563,30 @@ async def upload_batch_stream(
 
     async def gen():
         yield _sse("start", {"sessionId": session_id, "total": total})
+        yield _sse("phase", {"phase": "queue", "message": "生成キューを確認中…"})
+        acquired_batch_slot = False
 
         try:
+            await UPLOAD_BATCH_SEMAPHORE.acquire()
+            acquired_batch_slot = True
             yield _sse("phase", {"phase": "sheet_open", "message": "スプレッドシート接続中…"})
-            # ---- Spreadsheet open (once) ----
-            scope = [
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive",
-            ]
-            credentials = get_gsa_credentials(scope)
-            gc = gspread.authorize(credentials)
-
-            SPREADSHEET_KEY = "1hiV0Ve2cnYyrPkBuZcZIcLWeAnJ-ucNiB0P4owZpXug"
-            workbook = gc.open_by_key(SPREADSHEET_KEY)
-
-            PRESENCE_SHEETS = ["VM(GWET)", "VM(例外)", "VM(本社)"]
-            VM_SHEET = "演題演者（VM）"
-            PRESENCE_HEADER_ROW = 2
-            VM_HEADER_ROW = 1
-            PRESENCE_ID_COL = "システムID"
-
-            yield _sse("phase", {"phase": "precheck", "message": "事前チェック中…"})
 
             valid_event_ids = []
             for it in buffered:
                 if it["precheck"]["ok"]:
                     valid_event_ids.append(it["eventId"])
 
-            ws_map = _retry_gspread(lambda: {ws.title: ws for ws in workbook.worksheets()})
-
             yield _sse("phase", {"phase": "batch_fetch", "message": "VM/Presence一括取得中…"})
-            presence_rows_by_event, vm_rows_by_event, _ = batch_fetch_system_and_vm_rows(
-                workbook,
-                ws_map=ws_map,
-                event_ids=valid_event_ids,
-                presence_sheets=PRESENCE_SHEETS,
-                presence_header_row=PRESENCE_HEADER_ROW,
-                presence_id_col=PRESENCE_ID_COL,
-                vm_sheet=VM_SHEET,
-                vm_header_row=VM_HEADER_ROW,
-                vm_id_col_candidates=["講演会ID"],
-                col_end="Z",
-            )
+            try:
+                presence_rows_by_event, vm_rows_by_event, _ = await asyncio.wait_for(
+                    _run_sync_logged("sheet batch fetch", _load_upload_batch_rows, valid_event_ids),
+                    timeout=UPLOAD_BATCH_SHEET_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                message = f"VM/Presence取得が{UPLOAD_BATCH_SHEET_TIMEOUT:.0f}秒でタイムアウトしました。"
+                print("[upload/batch timeout] sheet batch fetch")
+                yield _sse("fatal", {"message": message})
+                return
 
             # （あなたの _parse_ymd / presence_rows_by_file_index / vm_rows_by_file_index のロジックは
             #    buffered を元に組み直すのが一番安全。ここでは “生成部分” の直しだけ見せます）
@@ -15519,60 +15620,58 @@ async def upload_batch_stream(
 
                 job_id = uuid.uuid4().hex
                 p = job_paths(job_id)
+                current_phase = "processing"
 
                 try:
-                    payload = await pptx_to_json_vm_hint(
-                        in_path,
+                    current_phase = "parse"
+                    yield _sse("phase", {"phase": "parse", "index": i, "filename": filename, "message": "PPTX/PDFを解析中…"})
+                    payload = await asyncio.wait_for(
+                        pptx_to_json_vm_hint(
+                            in_path,
+                            vm_rows,
+                            debug_blocks_path=p.get("debug_blocks"),
+                        ),
+                        timeout=UPLOAD_BATCH_ITEM_TIMEOUT,
+                    )
+
+                    payload = await _run_sync_logged("prepare payload", _upload_batch_prepare_payload, payload)
+
+                    current_phase = "typeset"
+                    yield _sse("phase", {"phase": "typeset", "index": i, "filename": filename, "message": "文字組みを調整中…"})
+                    payload = await asyncio.wait_for(
+                        apply_precise_typeset_initial(payload),
+                        timeout=UPLOAD_BATCH_RENDER_TIMEOUT,
+                    )
+
+                    payload, payload_dict = await _run_sync_logged(
+                        "finish payload",
+                        _upload_batch_finish_payload,
+                        payload,
+                        p,
                         vm_rows,
-                        debug_blocks_path=p.get("debug_blocks"),
-                    )
-                    payload = normalize_for_render(payload)
-                    payload = post_format_design_initial(payload)
-                    payload = await apply_precise_typeset_initial(payload)
-                    payload = ensure_display_fields(payload)
-
-                    # 正解DBで後処理の上書きを復元（typeset後に適用して改行位置を保持）
-                    _blocks_for_overlay = []
-                    try:
-                        _dbp = p.get("debug_blocks")
-                        if _dbp and _dbp.exists():
-                            _raw = json.loads(_dbp.read_text(encoding="utf-8"))
-                            _blocks_for_overlay = _raw  # list[dict] – overlay は dict 対応済み
-                    except Exception:
-                        pass
-                    payload = apply_correct_answer_overlay(payload, _blocks_for_overlay, vm_rows=vm_rows)
-                    payload = ensure_display_fields(payload)
-                    dump_titles("after apply_correct_answer_overlay", payload)
-
-                    payload.region = presence_rows[0].get("VP/PH/ONC", "")
-                    payload.unit = presence_rows[0].get("取得単位：フラグメントデザインへの内容記載", "")
-                    payload.event_id = event_id
-
-                    payload.talks = sorted(
-                        payload.talks or [],
-                        key=lambda x: (
-                            getattr(x, "program_index", 10**9),
-                            getattr(x, "_talk_index", 10**9),
-                            _time_start_minutes(getattr(x, "time", "")),
-                        )
+                        presence_rows,
+                        event_id,
                     )
 
-                    payload_dict = (
-                        payload.model_dump(exclude_none=True)
-                        if hasattr(payload, "model_dump")
-                        else json.loads(payload.json(ensure_ascii=False))
+                    current_phase = "render"
+                    yield _sse("phase", {"phase": "render", "index": i, "filename": filename, "message": "プレビュー画像を生成中…"})
+                    jpg_bytes, debug_html = await asyncio.wait_for(
+                        render_png_bytes(payload),
+                        timeout=UPLOAD_BATCH_RENDER_TIMEOUT,
                     )
 
-                    jpg_bytes, debug_html = await render_png_bytes(payload)
-
-                    # ローカルにJSON・JPGを保存（一覧/編集画面の高速化）
-                    try:
-                        p["json"].write_text(json.dumps(payload_dict, ensure_ascii=False), encoding="utf-8")
-                        p["jpg"].write_bytes(jpg_bytes)
-                    except Exception:
-                        pass
-
-                    upsert_job_ok(job_id, filename, payload, session_id, event_id)
+                    await _run_sync_logged(
+                        "persist job",
+                        _upload_batch_persist_job,
+                        p,
+                        job_id,
+                        filename,
+                        payload,
+                        payload_dict,
+                        session_id,
+                        event_id,
+                        jpg_bytes,
+                    )
 
                     # Storage アップロードはバックグラウンドで実行（ローカル保存済みなので遅延OK）
                     asyncio.create_task(upload_all_assets_async(
@@ -15593,6 +15692,28 @@ async def upload_batch_stream(
                         "filename": filename,
                         "ok": True,
                         "jobId": job_id,
+                    })
+
+                except asyncio.TimeoutError:
+                    timeout_seconds = (
+                        UPLOAD_BATCH_ITEM_TIMEOUT
+                        if current_phase == "parse"
+                        else UPLOAD_BATCH_RENDER_TIMEOUT
+                    )
+                    error = f"{current_phase}_timeout: {timeout_seconds:.0f}秒でタイムアウトしました"
+                    print("[upload/batch timeout]", filename, job_id, error)
+                    out.append({
+                        "filename": filename,
+                        "jobId": job_id,
+                        "ok": False,
+                        "error": error,
+                    })
+                    yield _sse("item_done", {
+                        "index": i,
+                        "filename": filename,
+                        "ok": False,
+                        "jobId": job_id,
+                        "error": error,
                     })
 
                 except Exception as e:
@@ -15622,6 +15743,8 @@ async def upload_batch_stream(
             print(tb)
             yield _sse("fatal", {"message": str(e)})
         finally:
+            if acquired_batch_slot:
+                UPLOAD_BATCH_SEMAPHORE.release()
             try:
                 shutil.rmtree(session_dir, ignore_errors=True)
             except Exception:
