@@ -2755,7 +2755,6 @@ def looks_like_affil_line(s: str, use_learned_cache: bool = True) -> bool:
     _s_ns = re.sub(r'[\s\u3000]+', '', s)
     if (
         use_learned_cache
-        and not _is_upload_batch_fast_mode()
         and _s_ns
         and len(_s_ns) >= 3
         and _s_ns in _get_facility_name_dict_cache()
@@ -3715,7 +3714,7 @@ def build_speaker_display(name: str, use_learned_cache: bool = True) -> str:
         return ""
 
     # ① 正解DBから学習した分割位置（最優先）
-    if use_learned_cache and not _is_upload_batch_fast_mode():
+    if use_learned_cache:
         cache = _get_speaker_display_cache()
         if core in cache:
             cached_val = cache[core]
@@ -5174,7 +5173,6 @@ def is_valid_person_name(name: str, use_learned_cache: bool = True) -> bool:
     _name_ns = name.replace(" ", "").replace("\u3000", "")
     if (
         use_learned_cache
-        and not _is_upload_batch_fast_mode()
         and _name_ns
         and _name_ns in _get_person_name_dict_cache()
     ):
@@ -7731,6 +7729,7 @@ LEARNING_CACHE_KEY = "correct_answers_v1"
 LEARNING_CACHE_VERSION = 1
 _learning_cache_snapshot: dict[str, Any] | None = None
 _learning_cache_loaded = False
+_learning_cache_batch_missing_logged = False
 _learning_cache_lock = threading.Lock()
 
 
@@ -8122,25 +8121,28 @@ def _write_learning_cache_snapshot_to_db(snapshot: dict[str, Any]) -> None:
 
 
 def invalidate_learning_cache_snapshot() -> None:
-    global _learning_cache_snapshot, _learning_cache_loaded
+    global _learning_cache_snapshot, _learning_cache_loaded, _learning_cache_batch_missing_logged
     with _learning_cache_lock:
         _learning_cache_snapshot = None
         _learning_cache_loaded = False
+        _learning_cache_batch_missing_logged = False
 
 
 def refresh_learning_cache_snapshot() -> dict[str, Any]:
     snapshot = _build_learning_cache_snapshot()
     _write_learning_cache_snapshot_to_db(snapshot)
-    global _learning_cache_snapshot, _learning_cache_loaded
+    global _learning_cache_snapshot, _learning_cache_loaded, _learning_cache_batch_missing_logged
     with _learning_cache_lock:
         _learning_cache_snapshot = snapshot
         _learning_cache_loaded = True
+        _learning_cache_batch_missing_logged = False
     return snapshot
 
 
 def _get_learning_cache_snapshot() -> dict[str, Any]:
-    global _learning_cache_snapshot, _learning_cache_loaded
-    if _is_upload_batch_fast_mode():
+    global _learning_cache_snapshot, _learning_cache_loaded, _learning_cache_batch_missing_logged
+    in_upload_batch = _is_upload_batch_fast_mode()
+    if in_upload_batch and not UPLOAD_BATCH_LEARNING_CACHE:
         return _empty_learning_cache_snapshot()
     with _learning_cache_lock:
         if _learning_cache_loaded and _learning_cache_snapshot is not None:
@@ -8148,6 +8150,12 @@ def _get_learning_cache_snapshot() -> dict[str, Any]:
 
     snapshot = _read_learning_cache_snapshot_from_db()
     if snapshot is None:
+        if in_upload_batch:
+            with _learning_cache_lock:
+                if not _learning_cache_batch_missing_logged:
+                    print("[learning-cache] snapshot missing; skip rebuild during upload batch", flush=True)
+                    _learning_cache_batch_missing_logged = True
+            return _empty_learning_cache_snapshot()
         snapshot = refresh_learning_cache_snapshot()
 
     with _learning_cache_lock:
@@ -14707,6 +14715,7 @@ UPLOAD_BATCH_SHEET_TIMEOUT = float(os.getenv("UPLOAD_BATCH_SHEET_TIMEOUT", "90")
 UPLOAD_BATCH_ITEM_TIMEOUT = float(os.getenv("UPLOAD_BATCH_ITEM_TIMEOUT", "300"))
 UPLOAD_BATCH_RENDER_TIMEOUT = float(os.getenv("UPLOAD_BATCH_RENDER_TIMEOUT", "120"))
 UPLOAD_BATCH_MAX_PARALLEL = max(1, int(os.getenv("UPLOAD_BATCH_MAX_PARALLEL", "1")))
+UPLOAD_BATCH_LEARNING_CACHE = str(os.getenv("UPLOAD_BATCH_LEARNING_CACHE", "true")).lower() in {"1", "true", "yes", "on"}
 UPLOAD_BATCH_CORRECT_ANSWER_HINTS = str(os.getenv("UPLOAD_BATCH_CORRECT_ANSWER_HINTS") or "").lower() in {"1", "true", "yes", "on"}
 UPLOAD_BATCH_LEARNED_TEXT_ROLES = str(os.getenv("UPLOAD_BATCH_LEARNED_TEXT_ROLES") or "").lower() in {"1", "true", "yes", "on"}
 UPLOAD_BATCH_LEARNED_AFFILIATION_FORMAT = str(os.getenv("UPLOAD_BATCH_LEARNED_AFFILIATION_FORMAT") or "").lower() in {"1", "true", "yes", "on"}
@@ -18212,6 +18221,7 @@ async def learning_cache_status():
         "generated_at": snapshot.get("generated_at", ""),
         "correct_answers_count": snapshot.get("correct_answers_count", 0),
         "source_max_created_at": snapshot.get("source_max_created_at", ""),
+        "upload_batch_learning_cache": UPLOAD_BATCH_LEARNING_CACHE,
         "sizes": {
             "speaker_display": len(snapshot.get("speaker_display") or {}),
             "affiliation_format": len(snapshot.get("affiliation_format") or {}),
@@ -18220,6 +18230,10 @@ async def learning_cache_status():
             "person_names": len(snapshot.get("person_names") or []),
             "facility_names": len(snapshot.get("facility_names") or []),
             "organizer_dict": len(snapshot.get("organizer_dict") or []),
+            "title_line_len": len(snapshot.get("title_line_len") or {}),
+            "chair_label": len(snapshot.get("chair_label") or {}),
+            "talk_count": len(snapshot.get("talk_count") or {}),
+            "datetime_newline": len(snapshot.get("datetime_newline") or {}),
         },
     }
 
