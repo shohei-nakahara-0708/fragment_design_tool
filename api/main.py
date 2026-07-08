@@ -5302,8 +5302,23 @@ def enrich_speaker_map_with_vm(
     return speaker_map
 
 
-def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, str]:
+def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock], use_learned_cache: bool = True) -> Dict[str, str]:
     mp: Dict[str, str] = {}
+
+    def _is_valid_person_name_basic(name: str) -> bool:
+        name = normalize_space(name or "")
+        compact = name.replace(" ", "").replace("\u3000", "")
+        if len(compact) < 2 or len(compact) > 15:
+            return False
+        if re.match(r'^[\d\s]+$', name):
+            return False
+        invalid_words = {
+            "男子", "女子", "学生", "医師", "看護", "患者", "症例",
+            "治療", "診断", "手術", "検査", "薬剤", "病院", "クリニック",
+            "大学", "学会", "講演", "演題", "座長", "司会", "質問", "回答",
+            "時間", "場所", "会場", "参加", "登録", "視聴", "配信",
+        }
+        return normalize_key(name).lower() not in invalid_words
 
     # ① 同一ブロック内（先生 + 所属）優先（既存のまま）
     for b in blocks:
@@ -5318,11 +5333,12 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
         if not s:
             return False
         # 正解DBから学習した役割を優先
-        learned = lookup_text_role(s)
-        if learned == "affiliation":
-            return True
-        if learned in ("person_name", "event_title", "talk_title"):
-            return False
+        if use_learned_cache:
+            learned = lookup_text_role(s)
+            if learned == "affiliation":
+                return True
+            if learned in ("person_name", "event_title", "talk_title"):
+                return False
         if s.startswith("※"):
             return False
         if "先生" in s:
@@ -5363,7 +5379,13 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
         key = norm_name(raw)
         
         # 人名として有効かチェック
-        if not key or not is_valid_person_name(key):
+        if not key:
+            continue
+        if use_learned_cache:
+            valid_person = is_valid_person_name(key)
+        else:
+            valid_person = _is_valid_person_name_basic(key)
+        if not valid_person:
             continue
             
         mp.setdefault(key, "")  # ★所属が見つからなくてもキーだけ作る（後段の照合が安定）
@@ -5392,8 +5414,10 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
             continue
 
         # ★ レイアウトパターンキャッシュから「上方向」を検索（学習済みパターンが上を示す場合）
-        lp_cache = _get_layout_pattern_cache()
-        lp_affil = lp_cache.get("affil_rel_to_speaker_y", {})
+        lp_affil = {}
+        if use_learned_cache:
+            lp_cache = _get_layout_pattern_cache()
+            lp_affil = lp_cache.get("affil_rel_to_speaker_y", {})
         if lp_affil.get("above_ratio", 0) > 0.3 and lp_affil.get("count", 0) >= 3:
             above = []
             x0a = nb.left - 400000
@@ -5467,7 +5491,7 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
             mp[key] = cand[0][1]
 
     # ★ 正解DBの人名辞書で「先生なし」ブロックも候補に追加
-    person_dict = _get_person_name_dict_cache()
+    person_dict = _get_person_name_dict_cache() if use_learned_cache else {}
     if person_dict:
         for b in ordered:
             if "先生" in b.text:
@@ -5500,7 +5524,7 @@ def extract_speaker_affil_map_by_blocks(blocks: List[TextBlock]) -> Dict[str, st
                     break
 
     # ★ 学習済み所属フォーマットを適用（スペース位置の正規化）
-    aff_cache = _get_affiliation_format_cache()
+    aff_cache = _get_affiliation_format_cache() if use_learned_cache else {}
     if aff_cache:
         for name_key, aff_val in mp.items():
             if not aff_val:
@@ -11050,7 +11074,12 @@ def repair_chair_from_multiline_block(payload: DesignJSON, blocks: list[TextBloc
     return payload
 
 # ---------------- Parse (Rule + AI) ----------------
-def parse_blocks_to_design_json(blocks: List[TextBlock], vm_rows: Optional[List[dict]] = None) -> DesignJSON:
+def parse_blocks_to_design_json(
+    blocks: List[TextBlock],
+    vm_rows: Optional[List[dict]] = None,
+    speaker_map: Optional[Dict[str, str]] = None,
+    fast_parse: bool = False,
+) -> DesignJSON:
     warnings: List[str] = []
     confidence = 0.78
 
@@ -11085,10 +11114,11 @@ def parse_blocks_to_design_json(blocks: List[TextBlock], vm_rows: Optional[List[
 
     org = extract_organizer_from_blocks(blocks)  # ←主催: を含めたいなら別途調整（必要なら次で直す）
 
-    speaker_map = extract_speaker_affil_map_by_blocks(blocks)
-    # VMデータがあれば、VMの医師名をblocks内で検索してspeaker_mapを強化
-    if vm_rows:
-        speaker_map = enrich_speaker_map_with_vm(speaker_map, blocks, vm_rows)
+    if speaker_map is None:
+        speaker_map = extract_speaker_affil_map_by_blocks(blocks, use_learned_cache=not fast_parse)
+        # VMデータがあれば、VMの医師名をblocks内で検索してspeaker_mapを強化
+        if vm_rows:
+            speaker_map = enrich_speaker_map_with_vm(speaker_map, blocks, vm_rows)
     chair = extract_chair_by_blocks(blocks, speaker_map)
 
     talks = extract_talks_by_blocks(blocks, speaker_map, chair)
@@ -13128,13 +13158,54 @@ async def pptx_to_json_vm_hint(
 
     if phase_callback:
         phase_callback("parse_blocks", "抽出した文字を解析中…")
-    speaker_map = extract_speaker_affil_map_by_blocks(blocks)
-    # VM医師名でspeaker_mapを強化（ブロック位置ベースで所属も取得）
-    speaker_map = enrich_speaker_map_with_vm(speaker_map, blocks, vm_rows)
-    time_candidates = extract_time_candidates_from_blocks(blocks)
+    if phase_callback:
+        phase_callback("speaker_map", "演者・所属候補を抽出中…")
+    print(f"[upload/batch parse] speaker_map start: {pptx_path.name}", flush=True)
+    speaker_map = await _run_sync_logged(
+        "parse speaker_map",
+        extract_speaker_affil_map_by_blocks,
+        blocks,
+        not bool(phase_callback),
+    )
+    print(f"[upload/batch parse] speaker_map done: {pptx_path.name} entries={len(speaker_map)}", flush=True)
 
-    draft = parse_blocks_to_design_json(blocks, vm_rows=vm_rows)
-    print("draft", draft)
+    # VM医師名でspeaker_mapを強化（ブロック位置ベースで所属も取得）
+    if phase_callback:
+        phase_callback("vm_enrich", "VM情報で演者候補を補強中…")
+    print(f"[upload/batch parse] vm_enrich start: {pptx_path.name}", flush=True)
+    speaker_map = await _run_sync_logged(
+        "parse vm_enrich",
+        enrich_speaker_map_with_vm,
+        speaker_map,
+        blocks,
+        vm_rows,
+    )
+    print(f"[upload/batch parse] vm_enrich done: {pptx_path.name} entries={len(speaker_map)}", flush=True)
+
+    if phase_callback:
+        phase_callback("time_candidates", "時間候補を抽出中…")
+    print(f"[upload/batch parse] time_candidates start: {pptx_path.name}", flush=True)
+    time_candidates = await _run_sync_logged(
+        "parse time_candidates",
+        extract_time_candidates_from_blocks,
+        blocks,
+    )
+    print(f"[upload/batch parse] time_candidates done: {pptx_path.name} count={len(time_candidates)}", flush=True)
+
+    if phase_callback:
+        phase_callback("draft_parse", "初期解析結果を作成中…")
+    print(f"[upload/batch parse] draft_parse start: {pptx_path.name}", flush=True)
+    draft = await _run_sync_logged(
+        "parse draft",
+        parse_blocks_to_design_json,
+        blocks,
+        vm_rows,
+        speaker_map,
+        bool(phase_callback),
+    )
+    print(f"[upload/batch parse] draft_parse done: {pptx_path.name} talks={len(draft.talks or [])}", flush=True)
+    if str(os.getenv("DESIGN_VERBOSE_DUMPS") or "").lower() in {"1", "true", "yes", "on"}:
+        print("draft", draft, flush=True)
 
     if phase_callback:
         phase_callback("ai_refine", "AIで内容を整形中…")
@@ -14389,7 +14460,17 @@ async def _upload_batch_worker_async(
             except asyncio.TimeoutError:
                 timeout_seconds = (
                     UPLOAD_BATCH_ITEM_TIMEOUT
-                    if current_phase in {"parse", "extract_blocks", "parse_blocks", "ai_refine", "postprocess"}
+                    if current_phase in {
+                        "parse",
+                        "extract_blocks",
+                        "parse_blocks",
+                        "speaker_map",
+                        "vm_enrich",
+                        "time_candidates",
+                        "draft_parse",
+                        "ai_refine",
+                        "postprocess",
+                    }
                     else UPLOAD_BATCH_RENDER_TIMEOUT
                 )
                 error = f"{current_phase}_timeout: {timeout_seconds:.0f}秒でタイムアウトしました"
