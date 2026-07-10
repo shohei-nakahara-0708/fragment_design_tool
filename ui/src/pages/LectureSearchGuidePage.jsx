@@ -5,8 +5,8 @@ const TARGET_WIDTH = 2048;
 const FALLBACK_VAULT_ACCOUNTS = [
   "mika.hirawatari@msd.com",
   "maika.mori@msd.com",
-  "yura.fukuhara@msd.com",
-  "hidenori.sonohata@msd.com",
+  // "yura.fukuhara@msd.com",
+  // "hidenori.sonohata@msd.com",
   "Hayato.Seto@vv-agency.com",
 ];
 

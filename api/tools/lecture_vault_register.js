@@ -33,6 +33,10 @@ function loadGoogleCredentials() {
   return JSON.parse(fs.readFileSync(credentialPath, 'utf8'));
 }
 
+function cleanCredentialValue(value) {
+  return value == null ? '' : String(value).trim();
+}
+
 async function withTimeout(promise, timeoutMs, label) {
   let timer;
   try {
@@ -57,7 +61,12 @@ async function withTimeout(promise, timeoutMs, label) {
 
   const input = await readStdinJson();
   const rawPackages = Array.isArray(input.packages) ? input.packages : [input];
-  const LOGIN_USER = String(input.vaultAccount || rawPackages[0]?.vaultAccount || '').trim();
+  const selectedVaultUser = String(input.vaultAccount || rawPackages[0]?.vaultAccount || '').trim();
+  const DIRECT_VAULT_USER = "Hayato.Seto@vv-agency.com";
+  const IS_DIRECT_VAULT_USER = selectedVaultUser === DIRECT_VAULT_USER;
+  let LOGIN_USER = selectedVaultUser;
+  let SSO_LOGIN_USER = '';
+  let LOGIN_PASS = '';
   const packages = rawPackages.map((item, index) => {
     const rowCategory = Array.isArray(item.rows)
       ? item.rows.map(row => String(row?.category || '').trim()).find(value => value.includes('修正')) ||
@@ -71,7 +80,7 @@ async function withTimeout(promise, timeoutMs, label) {
       absoluteZipPath: String(item.absoluteZipPath || '').trim(),
       mediaFileName: String(item.mediaFileName || item.presentationName || `package_${index + 1}`).trim(),
     };
-    if (!packageInput.presentationName || !packageInput.presentationId || !packageInput.product || !packageInput.absoluteZipPath || !LOGIN_USER) {
+    if (!packageInput.presentationName || !packageInput.presentationId || !packageInput.product || !packageInput.absoluteZipPath || !selectedVaultUser) {
       throw new Error(`Vault登録入力が不足しています: ${packageInput.mediaFileName}`);
     }
     if (!fs.existsSync(packageInput.absoluteZipPath)) {
@@ -80,7 +89,7 @@ async function withTimeout(promise, timeoutMs, label) {
     return packageInput;
   });
 
-  console.log(`Vault登録ランナーを開始します。対象 ${packages.length} 件 / アカウント: ${LOGIN_USER}`);
+  console.log(`Vault登録ランナーを開始します。対象 ${packages.length} 件 / アカウント: ${selectedVaultUser}`);
 
   const creds2 = loadGoogleCredentials();
   console.log("Google認証情報を読み込みました。");
@@ -102,17 +111,37 @@ async function withTimeout(promise, timeoutMs, label) {
   await doc2.loadInfo();
 
 
-  let logPass
-
-  if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
+  if (!IS_DIRECT_VAULT_USER) {
 
     const sheet2 = doc2.sheetsByTitle["MSD"];
     const rows2 = await sheet2.getRows();
 
     let shiftRow = rows2.find(row =>
-      row.アカウント名 === LOGIN_USER && row.環境 === '本番/UAT' && row.サービス === 'Vault(iDetail)');
+      row.アカウント名 === selectedVaultUser && row.環境 === '本番/UAT' && row.サービス === 'Vault(iDetail)');
 
-    logPass = shiftRow.パスワード;
+    if (!shiftRow) {
+      console.log(red + `${selectedVaultUser} のアカウント情報が見つかりませんでした。` + reset);
+      throw new Error(`${selectedVaultUser} のアカウント情報が見つかりませんでした。`);
+    }
+
+    const newAccountName = cleanCredentialValue(shiftRow.新アカウント名);
+    const signOnName = cleanCredentialValue(shiftRow.SignOn名);
+    const signOnPassword = cleanCredentialValue(shiftRow.SignOnパスワード);
+
+    LOGIN_USER = newAccountName || selectedVaultUser;
+    SSO_LOGIN_USER = signOnName;
+    LOGIN_PASS = signOnPassword || cleanCredentialValue(shiftRow.パスワード);
+
+    const missingLoginItems = [];
+    if (!LOGIN_USER) missingLoginItems.push('LOGIN_USER');
+    if (!SSO_LOGIN_USER) missingLoginItems.push('SSO_LOGIN_USER');
+    if (!LOGIN_PASS) missingLoginItems.push('LOGIN_PASS');
+
+    if (missingLoginItems.length > 0) {
+      console.log(red + `ログイン情報が不足しています: ${missingLoginItems.join(', ')}` + reset);
+      console.log(red + 'アカウント管理表の「新アカウント名」「SignOn名」「SignOnパスワード」を確認してください。' + reset);
+      throw new Error(`ログイン情報が不足しています: ${missingLoginItems.join(', ')}`);
+    }
 
   } else {
 
@@ -120,18 +149,21 @@ async function withTimeout(promise, timeoutMs, label) {
     const rows2 = await sheet2.getRows();
 
     let shiftRow = rows2.find(row =>
-      row.アカウント名 === LOGIN_USER && row.メーカー === 'Vault');
+      row.アカウント名 === selectedVaultUser && row.メーカー === 'Vault');
 
-    logPass = shiftRow.パスワード;
+    if (!shiftRow) {
+      console.log(red + `${selectedVaultUser} のアカウント情報が見つかりませんでした。` + reset);
+      throw new Error(`${selectedVaultUser} のアカウント情報が見つかりませんでした。`);
+    }
+
+    LOGIN_PASS = cleanCredentialValue(shiftRow.パスワード);
 
   }
-
-  const LOGIN_PASS = logPass;
 
   if (!LOGIN_PASS) {
     throw new Error(`Vaultアカウントのパスワードが見つかりません: ${LOGIN_USER}`);
   }
-  console.log("Vaultパスワードを取得しました。");
+  console.log("Vaultログイン情報を取得しました。");
 
 
 
@@ -175,7 +207,7 @@ async function withTimeout(promise, timeoutMs, label) {
         presentationName: packageInput.presentationName,
         presentationId: packageInput.presentationId,
         category: packageInput.category,
-        vaultAccount: LOGIN_USER,
+        vaultAccount: selectedVaultUser,
       };
       let vaultResult;
       try {
@@ -225,7 +257,7 @@ async function withTimeout(promise, timeoutMs, label) {
 
   await new Promise(resolve => process.stdout.write(JSON.stringify({
     results,
-    vaultAccount: LOGIN_USER,
+    vaultAccount: selectedVaultUser,
   }, null, 2), resolve));
   process.exit(0);
   return;
@@ -240,6 +272,9 @@ async function withTimeout(promise, timeoutMs, label) {
     const LOGIN_PASS_SELECTOR = 'input[type=password]';
     const LOGIN_CONTINUE_SELECTOR = 'button[name=continue]';
     const LOGIN_SUBMIT_SELECTOR = 'button[name=login]';
+    const SSO_USER_SELECTOR = '#username';
+    const SSO_PASS_SELECTOR = '#password';
+    const SSO_SUBMIT_SELECTOR = '#signOnButton';
 
     const CREATE_SUBMIT_SELECTOR = 'button[tooltip=Create]';
     const PLACEHOLDER_SUBMIT_SELECTOR = 'li[data-value=Placeholder]';
@@ -4200,7 +4235,7 @@ async function withTimeout(promise, timeoutMs, label) {
       await page.setDefaultTimeout(90000); // 全体のデフォルトタイムアウトを90秒に
 
       let tUrl
-      if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
+      if (!IS_DIRECT_VAULT_USER) {
         tUrl = 'https://msd-promomats-ghh.veevavault.com';
       } else {
         tUrl = 'https://vvagency-arashimaru.veevavault.com';
@@ -4217,18 +4252,34 @@ async function withTimeout(promise, timeoutMs, label) {
         console.log(`Vaultへログインしています: ${LOGIN_USER}`);
         await page.type(LOGIN_USER_SELECTOR, LOGIN_USER);
 
-        await Promise.all([
+        if (!IS_DIRECT_VAULT_USER) {
+          await Promise.all([
+            page.waitForSelector(SSO_SUBMIT_SELECTOR),
+            page.click(LOGIN_CONTINUE_SELECTOR),
+          ]);
 
-          page.waitForSelector(LOGIN_SUBMIT_SELECTOR),
-          page.click(LOGIN_CONTINUE_SELECTOR),
-        ]);
+          await page.waitForSelector(SSO_USER_SELECTOR);
+          await page.waitForSelector(SSO_PASS_SELECTOR);
+          await page.type(SSO_USER_SELECTOR, SSO_LOGIN_USER);
+          await page.type(SSO_PASS_SELECTOR, LOGIN_PASS);
 
-        await page.type(LOGIN_PASS_SELECTOR, LOGIN_PASS);
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: ['load', 'networkidle2'], timeout: 120000 }).catch(() => null),
+            page.click(SSO_SUBMIT_SELECTOR),
+          ]);
+        } else {
+          await Promise.all([
+            page.waitForSelector(LOGIN_SUBMIT_SELECTOR),
+            page.click(LOGIN_CONTINUE_SELECTOR),
+          ]);
 
-        await Promise.all([
-          page.waitForNavigation({ waitUntil: ['load', 'networkidle2'], timeout: 120000 }).catch(() => null),
-          page.click(LOGIN_SUBMIT_SELECTOR),
-        ]);
+          await page.type(LOGIN_PASS_SELECTOR, LOGIN_PASS);
+
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: ['load', 'networkidle2'], timeout: 120000 }).catch(() => null),
+            page.click(LOGIN_SUBMIT_SELECTOR),
+          ]);
+        }
 
         await waitForAnySelector(["#search_main_box", ".vv_username"], LONG_WAIT);
         console.log("Vaultログインが完了しました。");
@@ -4245,7 +4296,7 @@ async function withTimeout(promise, timeoutMs, label) {
       }
       await dismissVaultOnboardingDialogs('初期表示');
 
-      if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
+      if (!IS_DIRECT_VAULT_USER) {
 
         await page.waitForSelector(".vv_username", { timeout: LONG_WAIT });
         let currentUser = await page.$(".vv_username");
@@ -4404,7 +4455,7 @@ async function withTimeout(promise, timeoutMs, label) {
         await typeAndSelectMenuItem(COUNTRY_SELECTOR, COUNTRY);
         await clearAndType(NAME_SELECTOR, NAME);
 
-        if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
+        if (!IS_DIRECT_VAULT_USER) {
           console.log(`Productを選択しています: ${PRODUCT}`);
           await typeAndSelectMenuItem(PRODUCT_SELECTOR, PRODUCT, {
             label: 'Product',
@@ -4516,7 +4567,7 @@ async function withTimeout(promise, timeoutMs, label) {
         console.log("スライド基本情報を入力しています。");
         await clearAndType(NAME_SELECTOR, NAME);
 
-        if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
+        if (!IS_DIRECT_VAULT_USER) {
           console.log("スライドの言語とDisable Actionsを設定しています。");
           await typeAndSelectMenuItem(LANGUAGE_SELECTOR, LANGUAGE, {
             label: 'スライド Language',
@@ -4569,14 +4620,14 @@ async function withTimeout(promise, timeoutMs, label) {
         console.log("Shared Resourceを紐付けています: MSD_ONC_TOOL_SHARED");
         await addSharedResource("MSD_ONC_TOOL_SHARED");
 
-        if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
+        if (!IS_DIRECT_VAULT_USER) {
           console.log("スライドのステータスをStagedへ変更しています。");
           await changeDocumentStatusToStaged();
         }
 
 
         await page.goto(binderURL, DCL);
-        if (LOGIN_USER !== "Hayato.Seto@vv-agency.com") {
+        if (!IS_DIRECT_VAULT_USER) {
           console.log("BinderのステータスをStagedへ変更しています。");
           await changeDocumentStatusToStaged();
         }

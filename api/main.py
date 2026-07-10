@@ -15236,7 +15236,7 @@ LECTURE_TOOL_VAULT_ACCOUNTS = [
     for account in (
         os.getenv(
             "LECTURE_TOOL_VAULT_ACCOUNTS",
-            "mika.hirawatari@msd.com,maika.mori@msd.com,yura.fukuhara@msd.com,hidenori.sonohata@msd.com,Hayato.Seto@vv-agency.com",
+            "mika.hirawatari@msd.com,maika.mori@msd.com,Hayato.Seto@vv-agency.com",
         )
     ).split(",")
     if account.strip()
