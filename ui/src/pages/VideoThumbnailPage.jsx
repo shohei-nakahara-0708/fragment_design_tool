@@ -42,6 +42,40 @@ function canvasToBlob(canvas) {
   });
 }
 
+function createCanvas(width, height) {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  return canvas;
+}
+
+function configureHighQualityScale(ctx) {
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+}
+
+function resizeCanvas(source, width, height) {
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext("2d");
+  configureHighQualityScale(ctx);
+  ctx.drawImage(source, 0, 0, width, height);
+  return canvas;
+}
+
+function downscaleCanvas(source, targetWidth, targetHeight) {
+  let current = source;
+  let width = current.width;
+  let height = current.height;
+
+  while (width / 2 > targetWidth && height / 2 > targetHeight) {
+    width = Math.max(targetWidth, Math.round(width / 2));
+    height = Math.max(targetHeight, Math.round(height / 2));
+    current = resizeCanvas(current, width, height);
+  }
+
+  return resizeCanvas(current, targetWidth, targetHeight);
+}
+
 function waitForSeek(video, targetSeconds) {
   const duration = Number.isFinite(video.duration) ? video.duration : targetSeconds;
   const maxTarget = duration > 0.05 ? duration - 0.05 : duration;
@@ -113,6 +147,7 @@ function drawVideoCover(ctx, video, x, y, width, height) {
     sy = (sourceHeight - sh) / 2;
   }
 
+  configureHighQualityScale(ctx);
   ctx.drawImage(video, sx, sy, sw, sh, x, y, width, height);
 }
 
@@ -120,9 +155,7 @@ async function createThumbnailImages(video, seconds) {
   video.pause();
   await waitForSeek(video, seconds);
 
-  const posterCanvas = document.createElement("canvas");
-  posterCanvas.width = POSTER_SIZE.width;
-  posterCanvas.height = POSTER_SIZE.height;
+  const posterCanvas = createCanvas(POSTER_SIZE.width, POSTER_SIZE.height);
   const posterCtx = posterCanvas.getContext("2d");
   const frameHeight = POSTER_SIZE.width / FRAME_RATIO;
   const frameY = (POSTER_SIZE.height - frameHeight) / 2;
@@ -131,12 +164,7 @@ async function createThumbnailImages(video, seconds) {
   posterCtx.fillRect(0, 0, POSTER_SIZE.width, POSTER_SIZE.height);
   drawVideoCover(posterCtx, video, 0, frameY, POSTER_SIZE.width, frameHeight);
 
-  const thumbCanvas = document.createElement("canvas");
-  thumbCanvas.width = THUMB_SIZE.width;
-  thumbCanvas.height = THUMB_SIZE.height;
-  const thumbCtx = thumbCanvas.getContext("2d");
-  thumbCtx.imageSmoothingQuality = "high";
-  thumbCtx.drawImage(posterCanvas, 0, 0, THUMB_SIZE.width, THUMB_SIZE.height);
+  const thumbCanvas = downscaleCanvas(posterCanvas, THUMB_SIZE.width, THUMB_SIZE.height);
 
   const [posterBlob, thumbBlob] = await Promise.all([
     canvasToBlob(posterCanvas),
