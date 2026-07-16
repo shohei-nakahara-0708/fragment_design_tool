@@ -75,6 +75,8 @@ DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "30"))  # 接続タイ�
 DB_QUERY_TIMEOUT = int(os.getenv("DB_QUERY_TIMEOUT", "60"))      # クエリタイムアウト（秒）
 DB_RETRY_ATTEMPTS = int(os.getenv("DB_RETRY_ATTEMPTS", "3"))     # リトライ回数
 DB_RETRY_DELAY = float(os.getenv("DB_RETRY_DELAY", "2.0"))        # リトライ間隔（秒）
+DB_POOL_MAX_SIZE = max(1, int(os.getenv("DB_POOL_MAX_SIZE", "3")))
+DB_POOL_WAIT_TIMEOUT = float(os.getenv("DB_POOL_WAIT_TIMEOUT", "15"))
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -3927,9 +3929,14 @@ def row_to_job_item(r) -> Dict[str, Any]:
 
 
 
-# ---------------- Database Connection with Retry ----------------
+# ---------------- Database Connection with Retry / Local Pool ----------------
 
-def db_connect():
+_DB_POOL_IDLE: queue.LifoQueue = queue.LifoQueue(maxsize=DB_POOL_MAX_SIZE)
+_DB_POOL_LOCK = threading.Lock()
+_DB_POOL_OPEN_CONNECTIONS = 0
+
+
+def _open_db_connection():
     """
     PostgreSQL接続をタイムアウト設定とリトライ機構付きで行う
     """
@@ -3984,6 +3991,186 @@ def db_connect():
                 time.sleep(delay)
             else:
                 raise
+
+
+def _connection_is_closed(conn) -> bool:
+    return bool(getattr(conn, "closed", False))
+
+
+def _decrement_open_connection_count() -> None:
+    global _DB_POOL_OPEN_CONNECTIONS
+    with _DB_POOL_LOCK:
+        _DB_POOL_OPEN_CONNECTIONS = max(0, _DB_POOL_OPEN_CONNECTIONS - 1)
+
+
+def _discard_db_connection(conn, *, close: bool = True) -> None:
+    if close:
+        try:
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error closing discarded database connection: {e}")
+    _decrement_open_connection_count()
+
+
+def _acquire_db_connection():
+    global _DB_POOL_OPEN_CONNECTIONS
+
+    deadline = time.monotonic() + DB_POOL_WAIT_TIMEOUT
+
+    while True:
+        try:
+            conn = _DB_POOL_IDLE.get_nowait()
+        except queue.Empty:
+            conn = None
+
+        if conn is not None:
+            if _connection_is_closed(conn):
+                _discard_db_connection(conn, close=False)
+                continue
+            return conn
+
+        should_open = False
+        with _DB_POOL_LOCK:
+            if _DB_POOL_OPEN_CONNECTIONS < DB_POOL_MAX_SIZE:
+                _DB_POOL_OPEN_CONNECTIONS += 1
+                should_open = True
+
+        if should_open:
+            try:
+                return _open_db_connection()
+            except Exception:
+                _decrement_open_connection_count()
+                raise
+
+        timeout = deadline - time.monotonic()
+        if timeout <= 0:
+            raise OperationalError(
+                f"Timed out waiting for a database connection from the local pool "
+                f"(DB_POOL_MAX_SIZE={DB_POOL_MAX_SIZE})."
+            )
+
+        try:
+            conn = _DB_POOL_IDLE.get(timeout=timeout)
+        except queue.Empty:
+            raise OperationalError(
+                f"Timed out waiting for a database connection from the local pool "
+                f"(DB_POOL_MAX_SIZE={DB_POOL_MAX_SIZE})."
+            )
+
+        if _connection_is_closed(conn):
+            _discard_db_connection(conn, close=False)
+            continue
+        return conn
+
+
+def _release_db_connection(conn) -> None:
+    if _connection_is_closed(conn):
+        _discard_db_connection(conn, close=False)
+        return
+
+    try:
+        _DB_POOL_IDLE.put_nowait(conn)
+    except queue.Full:
+        _discard_db_connection(conn, close=True)
+
+
+class PooledDBConnection:
+    def __init__(self):
+        self._conn = None
+        self._closed = False
+
+    def _ensure_connection(self):
+        if self._closed:
+            raise OperationalError("Database connection context is already closed")
+        if self._conn is None:
+            self._conn = _acquire_db_connection()
+        return self._conn
+
+    def __enter__(self):
+        return self._ensure_connection()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        conn = self._conn
+        self._conn = None
+        self._closed = True
+
+        if conn is None:
+            return False
+
+        try:
+            if exc_type is None:
+                conn.commit()
+            else:
+                conn.rollback()
+        except Exception as e:
+            logger.error(f"Error during database connection cleanup: {e}")
+            _discard_db_connection(conn, close=True)
+            return False
+
+        if exc_type is not None and issubclass(exc_type, OperationalError):
+            _discard_db_connection(conn, close=True)
+        else:
+            _release_db_connection(conn)
+
+        return False
+
+    def execute(self, *args, **kwargs):
+        return self._ensure_connection().execute(*args, **kwargs)
+
+    def cursor(self, *args, **kwargs):
+        return self._ensure_connection().cursor(*args, **kwargs)
+
+    def commit(self):
+        return self._ensure_connection().commit()
+
+    def rollback(self):
+        return self._ensure_connection().rollback()
+
+    def close(self):
+        conn = self._conn
+        self._conn = None
+        self._closed = True
+
+        if conn is None:
+            return
+
+        try:
+            conn.rollback()
+        except Exception as e:
+            logger.error(f"Error rolling back database connection before release: {e}")
+            _discard_db_connection(conn, close=True)
+            return
+
+        _release_db_connection(conn)
+
+    def __getattr__(self, name: str):
+        return getattr(self._ensure_connection(), name)
+
+
+def db_connect():
+    return PooledDBConnection()
+
+
+def close_db_pool():
+    global _DB_POOL_OPEN_CONNECTIONS
+
+    closed = 0
+    while True:
+        try:
+            conn = _DB_POOL_IDLE.get_nowait()
+        except queue.Empty:
+            break
+
+        try:
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error closing pooled database connection: {e}")
+        finally:
+            closed += 1
+
+    if closed:
+        with _DB_POOL_LOCK:
+            _DB_POOL_OPEN_CONNECTIONS = max(0, _DB_POOL_OPEN_CONNECTIONS - closed)
 
 def safe_db_operation(operation_func, *args, **kwargs):
     """
@@ -14714,6 +14901,8 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     global _browser, _pw
+
+    close_db_pool()
 
     try:
         if _browser is not None:
