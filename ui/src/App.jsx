@@ -6,6 +6,9 @@ import UploadPage from "./pages/UploadPage.jsx";
 import JobEditorPage from "./pages/JobEditorPage.jsx";
 import DiffPage from "./pages/DiffPage.jsx";
 import LectureSearchGuidePage from "./pages/LectureSearchGuidePage.jsx";
+import StampMailToolPage from "./pages/StampMailToolPage.jsx";
+import BannerMailToolPage from "./pages/BannerMailToolPage.jsx";
+import CslLectureToolPage from "./pages/CslLectureToolPage.jsx";
 import "./styles/shell.css";
 
 function AppShell({ children }) {
@@ -45,6 +48,36 @@ function AppShell({ children }) {
             <span className="app-sidebar__link-main">講演会検索案内ツール</span>
             <span className="app-sidebar__link-sub">ZIP生成・Vault登録</span>
           </NavLink>
+
+          <NavLink
+            to="/stamp-mail-tool"
+            className={({ isActive }) =>
+              `app-sidebar__link${isActive ? " app-sidebar__link--active" : ""} sidebar__link--none`
+            }
+          >
+            <span className="app-sidebar__link-main">CSLスタンプメール生成</span>
+            <span className="app-sidebar__link-sub">HTML・images.zip生成</span>
+          </NavLink>
+
+          <NavLink
+            to="/banner-mail-tool"
+            className={({ isActive }) =>
+              `app-sidebar__link${isActive ? " app-sidebar__link--active" : ""} sidebar__link--none`
+            }
+          >
+            <span className="app-sidebar__link-main">CSLバナーメール生成</span>
+            <span className="app-sidebar__link-sub">bannerタブ・images.zip生成</span>
+          </NavLink>
+
+          <NavLink
+            to="/csl-lecture-tool"
+            className={({ isActive }) =>
+              `app-sidebar__link${isActive ? " app-sidebar__link--active" : ""} sidebar__link--none`
+            }
+          >
+            <span className="app-sidebar__link-main">CSL講演会ツール生成</span>
+            <span className="app-sidebar__link-sub">講演会ツールタブ・ZIP生成</span>
+          </NavLink>
         </nav>
       </aside>
 
@@ -71,6 +104,15 @@ export default function App() {
 
         {/* 講演会検索案内ツール */}
         <Route path="/lecture-search-guide" element={<LectureSearchGuidePage />} />
+
+        {/* CSLスタンプメール生成 */}
+        <Route path="/stamp-mail-tool" element={<StampMailToolPage />} />
+
+        {/* CSLバナーメール生成 */}
+        <Route path="/banner-mail-tool" element={<BannerMailToolPage />} />
+
+        {/* CSL講演会ツール生成 */}
+        <Route path="/csl-lecture-tool" element={<CslLectureToolPage />} />
 
         {/* それ以外は一覧へ */}
         <Route path="*" element={<Navigate to="/" replace />} />

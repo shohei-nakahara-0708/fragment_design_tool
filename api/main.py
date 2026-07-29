@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import html as html_lib
 import json
 import os, subprocess
 import re
@@ -16640,6 +16641,1570 @@ async def lecture_tool_result_file(session_id: str, rel_path: str, request: Requ
             content_disposition_type="attachment",
         )
     return FileResponse(target, media_type=media_type)
+
+
+STAMP_MAIL_SPREADSHEET_KEY = os.getenv(
+    "STAMP_MAIL_SPREADSHEET_KEY",
+    "1krCx1Our-q498lGeDi6V9SxFnZ_qWWKjc-wnMdoD8BY",
+)
+STAMP_MAIL_SHEET_NAME = os.getenv("STAMP_MAIL_SHEET_NAME", "stamp")
+STAMP_MAIL_SHEET_GID = int(os.getenv("STAMP_MAIL_SHEET_GID", "0"))
+STAMP_MAIL_OUTPUT_DIR = DATA_DIR / "stamp_mail"
+STAMP_MAIL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+STAMP_MAIL_BANNER_FILENAME = "banner01.png"
+STAMP_MAIL_BANNER_WIDTH = 1200
+STAMP_MAIL_IMAGE_DIRNAME = "CSL_images"
+STAMP_MAIL_IMAGES_ZIP_FILENAME = "CSL_images.zip"
+STAMP_MAIL_TEMPLATE_PATH = APP_DIR / "stamp_mail_template.html"
+STAMP_MAIL_ASSET_IMAGE_DIR = APP_DIR / "stamp_mail_assets" / STAMP_MAIL_IMAGE_DIRNAME
+STAMP_MAIL_STAMPIMG_DIRNAME = "stampImg"
+STAMP_MAIL_STAMPIMG_ASSET_DIR = APP_DIR / "stamp_mail_assets" / STAMP_MAIL_STAMPIMG_DIRNAME
+STAMP_MAIL_STAMPIMG_HEADER_PATH = STAMP_MAIL_STAMPIMG_ASSET_DIR / "header.png"
+STAMP_MAIL_STAMPIMG_FOOTER_PATH = STAMP_MAIL_STAMPIMG_ASSET_DIR / "footer.png"
+STAMP_MAIL_FIXED_IMAGE_FILENAMES = [
+    "01.png",
+    "outline_check_circle_outline_white_48dp.png",
+]
+
+STAMP_MAIL_COLUMN_ALIASES = {
+    "event_code": ["イベントコード", "イベント code", "event_code", "eventCode", "Event Code", "コード"],
+    "template_name": ["テンプレート名", "テンプレート名列", "HTML名", "html名", "HTMLファイル名", "template_name", "template"],
+    "destination_url": ["遷移先URL", "URL", "リンク先URL", "遷移先url", "destination_url", "url"],
+    "detail_group": ["Detail Group", "Detail Group列", "DetailGroup", "detail_group", "ディテールグループ"],
+    "product": ["製品", "製品列", "製品名", "Product", "Product列", "product", "プロダクト"],
+    "end_date": ["End Date", "End Date列", "EndDate", "end_date", "終了日", "終了日付"],
+    "release_date": ["Release Date", "ReleaseDate", "release_date", "リリース日", "開始日", "Start Date", "StartDate"],
+    "request_date": ["依頼日", "依頼日列", "request_date", "Request Date", "RequestDate"],
+    "response_type": ["対応区分", "対応区分列", "response_type", "Response Type", "ResponseType"],
+    "vault_id": ["vaultID", "Vault ID", "VaultID", "vault_id", "vault id"],
+}
+
+
+def _stamp_mail_spreadsheet_url() -> str:
+    return f"https://docs.google.com/spreadsheets/d/{STAMP_MAIL_SPREADSHEET_KEY}/edit?gid={STAMP_MAIL_SHEET_GID}"
+
+
+def _stamp_mail_open_spreadsheet_and_worksheet():
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    credentials = get_gsa_credentials(scope)
+    gc = gspread.authorize(credentials)
+    workbook = _retry_gspread(lambda: gc.open_by_key(STAMP_MAIL_SPREADSHEET_KEY))
+    worksheets = _retry_gspread(lambda: workbook.worksheets())
+
+    for ws in worksheets:
+        if normalize_space(getattr(ws, "title", "")).lower() == STAMP_MAIL_SHEET_NAME.lower():
+            return workbook, ws
+
+    for ws in worksheets:
+        if int(getattr(ws, "id", -1)) == STAMP_MAIL_SHEET_GID:
+            return workbook, ws
+
+    raise RuntimeError(f"stampタブ（name={STAMP_MAIL_SHEET_NAME}, gid={STAMP_MAIL_SHEET_GID}）が見つかりません。")
+
+
+def _stamp_mail_pick_column(headers: list[str], field: str) -> str:
+    normalized = {_lecture_header_key(h): h for h in headers}
+    for alias in STAMP_MAIL_COLUMN_ALIASES[field]:
+        hit = normalized.get(_lecture_header_key(alias))
+        if hit:
+            return hit
+    return ""
+
+
+def _stamp_mail_find_header(values: list[list[str]]) -> tuple[int, list[str], dict[str, str]]:
+    for idx, row in enumerate(values[:20], start=1):
+        headers = make_unique(row)
+        columns = {
+            field: _stamp_mail_pick_column(headers, field)
+            for field in STAMP_MAIL_COLUMN_ALIASES.keys()
+        }
+        if columns["event_code"] and columns["template_name"] and columns["destination_url"]:
+            return idx, headers, columns
+    raise RuntimeError("必要な列（イベントコード、テンプレート名、遷移先URL）が見つかりません。")
+
+
+def _stamp_mail_filename_key(value: str) -> str:
+    name = Path(normalize_space(value or "")).name
+    stem = Path(name).stem if Path(name).suffix else name
+    return re.sub(r"[\s\u3000]+", "", stem).lower()
+
+
+def _csl_product_lookup_key(value: str) -> str:
+    return re.sub(r"[\s\u3000\-_‐‑‒–—―ー－]+", "", normalize_space(value or "")).lower()
+
+
+CSL_PRODUCT_CANONICAL_NAMES = {
+    _csl_product_lookup_key("Berinert SC"): "Berinert SC",
+}
+
+
+def _csl_normalize_product_name(value: str) -> str:
+    text = normalize_space(value or "")
+    return CSL_PRODUCT_CANONICAL_NAMES.get(_csl_product_lookup_key(text), text)
+
+
+def _stamp_mail_safe_filename(value: str, fallback: str, *, suffix: str = "") -> str:
+    text = normalize_space(value or "")
+    text = re.sub(r'[\\/:*?"<>|]+', "_", text)
+    text = text.strip(" ._")
+    if not text:
+        text = fallback
+    if suffix and not text.lower().endswith(suffix.lower()):
+        text = f"{text}{suffix}"
+    return text
+
+
+def _stamp_mail_fetch_sheet_rows() -> dict[str, Any]:
+    workbook, ws = _stamp_mail_open_spreadsheet_and_worksheet()
+    values = _retry_gspread(lambda: ws.get_all_values())
+    if not values:
+        return {
+            "spreadsheetTitle": getattr(workbook, "title", ""),
+            "spreadsheetUrl": _stamp_mail_spreadsheet_url(),
+            "sheetTitle": ws.title,
+            "sheetGid": getattr(ws, "id", STAMP_MAIL_SHEET_GID),
+            "headerRow": 0,
+            "columns": {},
+            "rows": [],
+        }
+
+    header_row, headers, columns = _stamp_mail_find_header(values)
+    rows: list[dict[str, Any]] = []
+    for row_number, raw in enumerate(values[header_row:], start=header_row + 1):
+        data = {headers[i]: raw[i] if i < len(raw) else "" for i in range(len(headers))}
+        event_code = _lecture_sheet_text(data.get(columns["event_code"], ""))
+        template_name = _lecture_sheet_text(data.get(columns["template_name"], ""))
+        destination_url = _lecture_sheet_text(data.get(columns["destination_url"], ""))
+        detail_group = _lecture_sheet_text(data.get(columns.get("detail_group") or "", ""))
+        product = _csl_normalize_product_name(_lecture_sheet_text(data.get(columns.get("product") or "", "")))
+        end_date = _lecture_sheet_text(data.get(columns.get("end_date") or "", ""))
+        release_date = _lecture_sheet_text(data.get(columns.get("release_date") or "", ""))
+        request_date = _lecture_sheet_text(data.get(columns.get("request_date") or "", ""))
+        response_type = _lecture_sheet_text(data.get(columns.get("response_type") or "", ""))
+        vault_id = _lecture_sheet_text(data.get(columns.get("vault_id") or "", ""))
+        if not (event_code or template_name or destination_url):
+            continue
+        rows.append(
+            {
+                "id": str(row_number),
+                "rowNumber": row_number,
+                "eventCode": event_code,
+                "eventCodeKey": _stamp_mail_filename_key(event_code),
+                "templateName": template_name,
+                "templateKey": _stamp_mail_filename_key(template_name),
+                "destinationUrl": destination_url,
+                "detailGroup": detail_group,
+                "product": product,
+                "endDate": end_date,
+                "releaseDate": release_date,
+                "requestDate": request_date,
+                "responseType": response_type,
+                "vaultId": vault_id,
+                "raw": data,
+            }
+        )
+
+    return {
+        "spreadsheetTitle": getattr(workbook, "title", ""),
+        "spreadsheetUrl": _stamp_mail_spreadsheet_url(),
+        "sheetTitle": ws.title,
+        "sheetGid": getattr(ws, "id", STAMP_MAIL_SHEET_GID),
+        "headerRow": header_row,
+        "columns": columns,
+        "rows": rows,
+    }
+
+
+def _stamp_mail_session_root(session_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}", session_id or ""):
+        raise HTTPException(status_code=400, detail="invalid session id")
+    return STAMP_MAIL_OUTPUT_DIR / session_id
+
+
+def _stamp_mail_result_url(session_id: str, rel_path: str) -> str:
+    encoded = "/".join(quote(part) for part in rel_path.split("/"))
+    return f"/stamp-mail-tool/results/{session_id}/{encoded}"
+
+
+def _stamp_mail_result_files(session_id: str, limit: int = 300) -> list[dict[str, Any]]:
+    result_dir = _stamp_mail_session_root(session_id) / "result"
+    if not result_dir.exists():
+        return []
+
+    files: list[dict[str, Any]] = []
+    for path in result_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        files.append(
+            {
+                "path": path.relative_to(result_dir).as_posix(),
+                "name": path.name,
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            }
+        )
+    files.sort(key=lambda item: item["modified"], reverse=True)
+    return files[:limit]
+
+
+def _stamp_mail_unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    for index in range(2, 1000):
+        candidate = parent / f"{stem}-{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"同名ファイルが多すぎます: {path.name}")
+
+
+def _mail_form_bool(values: Optional[List[str]], index: int) -> bool:
+    if not values or index >= len(values):
+        return False
+    return normalize_space(values[index]).lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _mail_render_pdf_image(data: bytes, target_width: int, merge_pages: bool) -> tuple[Image.Image, int]:
+    doc = fitz.open(stream=data, filetype="pdf")
+    rendered_pages: list[Image.Image] = []
+    try:
+        if doc.page_count < 1:
+            raise RuntimeError("PDFにページがありません。")
+        page_count = doc.page_count if merge_pages else 1
+        for page_index in range(page_count):
+            page = doc.load_page(page_index)
+            page_width = float(page.rect.width)
+            if page_width <= 0:
+                raise RuntimeError("PDFページ幅を取得できません。")
+            zoom = target_width / page_width
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            with Image.open(io.BytesIO(pix.tobytes("png"))) as page_img:
+                rendered_pages.append(page_img.convert("RGB").copy())
+    finally:
+        doc.close()
+
+    if len(rendered_pages) == 1:
+        return rendered_pages[0], len(rendered_pages)
+
+    canvas_width = max(page.width for page in rendered_pages)
+    canvas_height = sum(page.height for page in rendered_pages)
+    canvas = Image.new("RGB", (canvas_width, canvas_height), "white")
+    y = 0
+    for page in rendered_pages:
+        x = max(0, (canvas_width - page.width) // 2)
+        canvas.paste(page, (x, y))
+        y += page.height
+    return canvas, len(rendered_pages)
+
+
+def _stamp_mail_save_png_from_image(data: bytes) -> tuple[bytes, dict[str, int]]:
+    with Image.open(io.BytesIO(data)) as img:
+        img = ImageOps.exif_transpose(img)
+        original_width, original_height = img.size
+        if original_width <= 0:
+            raise RuntimeError("画像の幅を取得できません。")
+        target_width = min(STAMP_MAIL_BANNER_WIDTH, original_width)
+        next_height = max(1, round(original_height * (target_width / original_width)))
+        img = img.convert("RGB")
+        if img.size != (target_width, next_height):
+            img = img.resize((target_width, next_height), Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, format="PNG", optimize=True)
+        data_out = out.getvalue()
+        return data_out, {
+            "originalWidth": original_width,
+            "originalHeight": original_height,
+            "width": target_width,
+            "height": next_height,
+            "bytes": len(data_out),
+        }
+
+
+def _stamp_mail_save_png_from_pdf(data: bytes, merge_pages: bool = False) -> tuple[bytes, dict[str, int]]:
+    img, page_count = _mail_render_pdf_image(data, STAMP_MAIL_BANNER_WIDTH, merge_pages)
+    out = io.BytesIO()
+    img.save(out, format="PNG", optimize=True)
+    data_out = out.getvalue()
+    return data_out, {
+        "originalWidth": img.width,
+        "originalHeight": img.height,
+        "width": img.width,
+        "height": img.height,
+        "bytes": len(data_out),
+        "pageCount": page_count,
+        "mergedPages": bool(merge_pages and page_count > 1),
+    }
+
+
+def _stamp_mail_upload_to_banner_png(upload: UploadFile, data: bytes, merge_pdf_pages: bool = False) -> tuple[bytes, dict[str, int]]:
+    filename = upload.filename or ""
+    suffix = Path(filename).suffix.lower()
+    content_type = (upload.content_type or "").lower()
+    if suffix == ".pdf" or content_type == "application/pdf":
+        return _stamp_mail_save_png_from_pdf(data, merge_pdf_pages)
+    try:
+        return _stamp_mail_save_png_from_image(data)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"{filename or 'upload'}: 画像またはPDFとして読み込めません。") from exc
+
+
+def _stamp_mail_html(destination_url: str) -> str:
+    if not STAMP_MAIL_TEMPLATE_PATH.exists():
+        raise RuntimeError(f"スタンプメールテンプレートが見つかりません: {STAMP_MAIL_TEMPLATE_PATH}")
+    template = STAMP_MAIL_TEMPLATE_PATH.read_text(encoding="utf-8")
+    escaped_url = (
+        (destination_url or "")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    return re.sub(
+        r"https://pro\.csl-info\.com/seminar/mi-[^\"<\s]+",
+        escaped_url,
+        template,
+    )
+
+
+def _stamp_mail_copy_fixed_assets(images_dir: Path) -> None:
+    for filename in STAMP_MAIL_FIXED_IMAGE_FILENAMES:
+        source = STAMP_MAIL_ASSET_IMAGE_DIR / filename
+        if not source.is_file():
+            raise RuntimeError(f"スタンプメール固定画像が見つかりません: {source}")
+        shutil.copy2(source, images_dir / filename)
+
+
+def _stamp_mail_flatten_image(img: Image.Image) -> Image.Image:
+    img = ImageOps.exif_transpose(img)
+    if img.mode in {"RGBA", "LA"} or "transparency" in img.info:
+        rgba = img.convert("RGBA")
+        background = Image.new("RGB", rgba.size, "white")
+        background.paste(rgba, mask=rgba.getchannel("A"))
+        return background
+    return img.convert("RGB")
+
+
+def _stamp_mail_compose_stamp_img(banner_path: Path, output_path: Path) -> dict[str, int]:
+    for required in [STAMP_MAIL_STAMPIMG_HEADER_PATH, STAMP_MAIL_STAMPIMG_FOOTER_PATH, banner_path]:
+        if not required.is_file():
+            raise RuntimeError(f"stampImg生成用画像が見つかりません: {required}")
+
+    with Image.open(STAMP_MAIL_STAMPIMG_HEADER_PATH) as header_src, \
+            Image.open(banner_path) as banner_src, \
+            Image.open(STAMP_MAIL_STAMPIMG_FOOTER_PATH) as footer_src:
+        header = _stamp_mail_flatten_image(header_src)
+        banner = _stamp_mail_flatten_image(banner_src)
+        footer = _stamp_mail_flatten_image(footer_src)
+
+        canvas_width = max(header.width, banner.width, footer.width)
+        canvas_height = header.height + banner.height + footer.height
+        canvas = Image.new("RGB", (canvas_width, canvas_height), "white")
+        y = 0
+        for part in [header, banner, footer]:
+            x = max(0, (canvas_width - part.width) // 2)
+            canvas.paste(part, (x, y))
+            y += part.height
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        canvas.save(output_path, format="PNG", optimize=True)
+        return {
+            "width": canvas_width,
+            "height": canvas_height,
+            "bytes": output_path.stat().st_size,
+        }
+
+
+def _stamp_mail_write_package(
+    result_root: Path,
+    session_id: str,
+    row: dict[str, Any],
+    upload_filename: str,
+    banner_png: bytes,
+    image_info: dict[str, int],
+) -> dict[str, Any]:
+    template_name = row.get("templateName") or Path(upload_filename).stem or "stamp-mail"
+    html_filename = _stamp_mail_safe_filename(template_name, "stamp-mail", suffix=".html")
+    base_name = Path(html_filename).stem or "stamp-mail"
+    package_dir = _stamp_mail_unique_path(result_root / base_name)
+    package_dir.mkdir(parents=True, exist_ok=True)
+    images_dir = package_dir / STAMP_MAIL_IMAGE_DIRNAME
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    html_path = package_dir / html_filename
+    banner_path = images_dir / STAMP_MAIL_BANNER_FILENAME
+    images_zip_path = package_dir / STAMP_MAIL_IMAGES_ZIP_FILENAME
+    outer_zip_path = _stamp_mail_unique_path(result_root / f"{base_name}.zip")
+
+    html_path.write_text(_stamp_mail_html(row.get("destinationUrl") or ""), encoding="utf-8")
+    _stamp_mail_copy_fixed_assets(images_dir)
+    banner_path.write_bytes(banner_png)
+
+    with zipfile.ZipFile(images_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(images_dir.iterdir()):
+            if path.is_file():
+                zf.write(path, f"{STAMP_MAIL_IMAGE_DIRNAME}/{path.name}")
+
+    with zipfile.ZipFile(outer_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.write(html_path, html_filename)
+        zf.write(images_zip_path, STAMP_MAIL_IMAGES_ZIP_FILENAME)
+
+    html_rel = html_path.relative_to(result_root).as_posix()
+    image_rel = banner_path.relative_to(result_root).as_posix()
+    images_zip_rel = images_zip_path.relative_to(result_root).as_posix()
+    zip_rel = outer_zip_path.relative_to(result_root).as_posix()
+    return {
+        "templateName": template_name,
+        "htmlFilename": html_filename,
+        "destinationUrl": row.get("destinationUrl") or "",
+        "rowNumber": row.get("rowNumber"),
+        "eventCode": row.get("eventCode") or "",
+        "eventCodeKey": row.get("eventCodeKey") or "",
+        "detailGroup": row.get("detailGroup") or "",
+        "product": row.get("product") or "",
+        "endDate": row.get("endDate") or "",
+        "releaseDate": row.get("releaseDate") or "",
+        "requestDate": row.get("requestDate") or "",
+        "responseType": row.get("responseType") or "",
+        "vaultId": row.get("vaultId") or "",
+        "sourceFilename": upload_filename,
+        "bannerFilename": STAMP_MAIL_BANNER_FILENAME,
+        "imageInfo": image_info,
+        "path": package_dir.relative_to(result_root).as_posix(),
+        "htmlPath": html_rel,
+        "imagePath": image_rel,
+        "imagesZipPath": images_zip_rel,
+        "zipPath": zip_rel,
+        "htmlUrl": _stamp_mail_result_url(session_id, html_rel),
+        "imageUrl": _stamp_mail_result_url(session_id, image_rel),
+        "imagesZipUrl": _stamp_mail_result_url(session_id, images_zip_rel),
+        "zipUrl": _stamp_mail_result_url(session_id, zip_rel),
+    }
+
+
+@app.get("/stamp-mail-tool/sheet-rows")
+async def stamp_mail_tool_sheet_rows():
+    try:
+        sheet = _stamp_mail_fetch_sheet_rows()
+        return JSONResponse({"ok": True, **sheet})
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"spreadsheet fetch failed: {exc}") from exc
+
+
+@app.post("/stamp-mail-tool/generate")
+async def stamp_mail_tool_generate(
+    files: List[UploadFile] = File(...),
+    rowIds: List[str] = Form(...),
+    mergePdfPages: Optional[List[str]] = Form(None),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="画像またはPDFをアップロードしてください。")
+    if len(files) != len(rowIds):
+        raise HTTPException(status_code=400, detail="ファイル数と選択行数が一致しません。")
+
+    sheet = _stamp_mail_fetch_sheet_rows()
+    rows_by_id = {row["id"]: row for row in sheet["rows"]}
+    session_id = new_session_id()
+    result_root = _stamp_mail_session_root(session_id) / "result"
+    result_root.mkdir(parents=True, exist_ok=True)
+    packages: list[dict[str, Any]] = []
+
+    for idx, upload in enumerate(files):
+        row_id = normalize_space(rowIds[idx])
+        row = rows_by_id.get(row_id)
+        filename = upload.filename or f"upload_{idx + 1}"
+        if not row:
+            raise HTTPException(status_code=400, detail=f"{filename}: スプレッドシート行が選択されていません。")
+        if not row.get("templateName"):
+            raise HTTPException(status_code=400, detail=f"{filename}: テンプレート名が空です。")
+        if not row.get("destinationUrl"):
+            raise HTTPException(status_code=400, detail=f"{filename}: 遷移先URLが空です。")
+
+        data = await upload.read()
+        banner_png, image_info = _stamp_mail_upload_to_banner_png(
+            upload,
+            data,
+            merge_pdf_pages=_mail_form_bool(mergePdfPages, idx),
+        )
+        packages.append(
+            _stamp_mail_write_package(
+                result_root,
+                session_id,
+                row,
+                filename,
+                banner_png,
+                image_info,
+            )
+        )
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "sessionId": session_id,
+            "bannerWidth": STAMP_MAIL_BANNER_WIDTH,
+            "bannerFilename": STAMP_MAIL_BANNER_FILENAME,
+            "packages": packages,
+        }
+    )
+
+
+@app.get("/stamp-mail-tool/stamp-img/{session_id}/{filename}")
+async def stamp_mail_tool_stamp_img(session_id: str, filename: str, request: Request, packagePath: str = ""):
+    if not re.fullmatch(r"tool[0-9A-Za-z_-]+\.png", filename or ""):
+        raise HTTPException(status_code=400, detail="invalid stampImg filename")
+
+    result_dir = (_stamp_mail_session_root(session_id) / "result").resolve()
+    package_rel = normalize_space(packagePath)
+    if not package_rel:
+        raise HTTPException(status_code=400, detail="packagePath is required")
+
+    package_dir = (result_dir / package_rel).resolve()
+    try:
+        package_dir.relative_to(result_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid package path") from exc
+
+    banner_path = package_dir / STAMP_MAIL_IMAGE_DIRNAME / STAMP_MAIL_BANNER_FILENAME
+    output_path = package_dir / STAMP_MAIL_STAMPIMG_DIRNAME / filename
+    if not banner_path.is_file():
+        raise HTTPException(status_code=404, detail="banner01.png not found")
+
+    try:
+        _stamp_mail_compose_stamp_img(banner_path, output_path)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    force_download = str(request.query_params.get("download") or "").lower() in {"1", "true", "yes"}
+    if force_download:
+        return FileResponse(
+            output_path,
+            media_type="image/png",
+            filename=filename,
+            content_disposition_type="attachment",
+        )
+    return FileResponse(output_path, media_type="image/png")
+
+
+@app.get("/stamp-mail-tool/results/{session_id}/{rel_path:path}")
+async def stamp_mail_tool_result_file(session_id: str, rel_path: str, request: Request):
+    result_dir = (_stamp_mail_session_root(session_id) / "result").resolve()
+    target = (result_dir / rel_path).resolve()
+
+    try:
+        target.relative_to(result_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid result path") from exc
+
+    if target == result_dir:
+        raise HTTPException(status_code=400, detail="invalid result path")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="result file not found")
+
+    media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    force_download = str(request.query_params.get("download") or "").lower() in {"1", "true", "yes"}
+    if force_download:
+        return FileResponse(
+            target,
+            media_type=media_type,
+            filename=target.name,
+            content_disposition_type="attachment",
+        )
+    return FileResponse(target, media_type=media_type)
+
+
+BANNER_MAIL_SPREADSHEET_KEY = os.getenv(
+    "BANNER_MAIL_SPREADSHEET_KEY",
+    STAMP_MAIL_SPREADSHEET_KEY,
+)
+BANNER_MAIL_SHEET_NAME = os.getenv("BANNER_MAIL_SHEET_NAME", "banner")
+BANNER_MAIL_SHEET_GID = int(os.getenv("BANNER_MAIL_SHEET_GID", "0"))
+BANNER_MAIL_OUTPUT_DIR = DATA_DIR / "banner_mail"
+BANNER_MAIL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+BANNER_MAIL_IMAGE_DIRNAME = "images"
+BANNER_MAIL_BANNER_FILENAME = "banner.jpg"
+BANNER_MAIL_IMAGES_ZIP_FILENAME = "images.zip"
+BANNER_MAIL_BANNER_WIDTH = 1200
+BANNER_MAIL_IMAGE_QUALITY = int(os.getenv("BANNER_MAIL_IMAGE_QUALITY", "92"))
+BANNER_MAIL_TEMPLATE_PATH = APP_DIR / "banner_mail_template.html"
+BANNER_MAIL_EVENT_CODE_RE = re.compile(r"\bE\s*[-‐‑‒–—―ー－]?\s*(\d{3,6})\b", re.IGNORECASE)
+
+BANNER_MAIL_COLUMN_ALIASES = {
+    "name": ["Name", "name", "NAME", "名称", "名前"],
+    "destination_url": ["遷移先URL", "URL", "リンク先URL", "遷移先url", "destination_url", "url"],
+    "detail_group": ["Detail Group", "Detail Group列", "DetailGroup", "detail_group", "ディテールグループ"],
+    "product": ["製品", "製品列", "製品名", "Product", "Product列", "product", "プロダクト"],
+    "end_date": ["End Date", "End Date列", "EndDate", "end_date", "終了日", "終了日付"],
+    "description": ["説明(Description)", "説明（Description）", "Description", "description", "説明"],
+    "expiration_date": ["Expiration Date 失効希望日", "Expiration Date\n失効希望日", "Expiration Date", "ExpirationDate", "失効希望日"],
+    "mail_category": ["メールツールカテゴリー", "メールツール カテゴリー", "メールツール\nカテゴリー", "カテゴリー", "category"],
+    "request_date": ["依頼日", "依頼日列", "request_date", "Request Date", "RequestDate"],
+    "response_type": ["種別", "対応区分", "対応区分列", "response_type", "Response Type", "ResponseType"],
+    "vault_id": ["vaultID", "Vault ID", "VaultID", "vault_id", "vault id"],
+}
+
+
+def _banner_mail_spreadsheet_url() -> str:
+    return f"https://docs.google.com/spreadsheets/d/{BANNER_MAIL_SPREADSHEET_KEY}/edit?gid={BANNER_MAIL_SHEET_GID}"
+
+
+def _banner_mail_open_spreadsheet_and_worksheet():
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    credentials = get_gsa_credentials(scope)
+    gc = gspread.authorize(credentials)
+    workbook = _retry_gspread(lambda: gc.open_by_key(BANNER_MAIL_SPREADSHEET_KEY))
+    worksheets = _retry_gspread(lambda: workbook.worksheets())
+
+    for ws in worksheets:
+        if normalize_space(getattr(ws, "title", "")).lower() == BANNER_MAIL_SHEET_NAME.lower():
+            return workbook, ws
+
+    for ws in worksheets:
+        if int(getattr(ws, "id", -1)) == BANNER_MAIL_SHEET_GID:
+            return workbook, ws
+
+    raise RuntimeError(f"bannerタブ（name={BANNER_MAIL_SHEET_NAME}, gid={BANNER_MAIL_SHEET_GID}）が見つかりません。")
+
+
+def _banner_mail_pick_column(headers: list[str], field: str) -> str:
+    normalized = {_lecture_header_key(h): h for h in headers}
+    for alias in BANNER_MAIL_COLUMN_ALIASES[field]:
+        hit = normalized.get(_lecture_header_key(alias))
+        if hit:
+            return hit
+    return ""
+
+
+def _banner_mail_find_header(values: list[list[str]]) -> tuple[int, list[str], dict[str, str]]:
+    for idx, row in enumerate(values[:20], start=1):
+        headers = make_unique(row)
+        columns = {
+            field: _banner_mail_pick_column(headers, field)
+            for field in BANNER_MAIL_COLUMN_ALIASES.keys()
+        }
+        if columns["name"] and columns["destination_url"]:
+            return idx, headers, columns
+    raise RuntimeError("必要な列（Name、遷移先URL）が見つかりません。")
+
+
+def _banner_mail_event_code(value: str) -> str:
+    match = BANNER_MAIL_EVENT_CODE_RE.search(value or "")
+    return f"E-{match.group(1)}" if match else ""
+
+
+def _banner_mail_fetch_sheet_rows() -> dict[str, Any]:
+    workbook, ws = _banner_mail_open_spreadsheet_and_worksheet()
+    values = _retry_gspread(lambda: ws.get_all_values())
+    if not values:
+        return {
+            "spreadsheetTitle": getattr(workbook, "title", ""),
+            "spreadsheetUrl": _banner_mail_spreadsheet_url(),
+            "sheetTitle": ws.title,
+            "sheetGid": getattr(ws, "id", BANNER_MAIL_SHEET_GID),
+            "headerRow": 0,
+            "columns": {},
+            "rows": [],
+        }
+
+    header_row, headers, columns = _banner_mail_find_header(values)
+    rows: list[dict[str, Any]] = []
+    for row_number, raw in enumerate(values[header_row:], start=header_row + 1):
+        data = {headers[i]: raw[i] if i < len(raw) else "" for i in range(len(headers))}
+        name = _lecture_sheet_text(data.get(columns["name"], ""))
+        destination_url = _lecture_sheet_text(data.get(columns["destination_url"], ""))
+        detail_group = _lecture_sheet_text(data.get(columns.get("detail_group") or "", ""))
+        product = _csl_normalize_product_name(_lecture_sheet_text(data.get(columns.get("product") or "", "")))
+        end_date = _lecture_sheet_text(data.get(columns.get("end_date") or "", ""))
+        description = _lecture_sheet_text(data.get(columns.get("description") or "", ""))
+        expiration_date = _lecture_sheet_text(data.get(columns.get("expiration_date") or "", ""))
+        mail_category = _lecture_sheet_text(data.get(columns.get("mail_category") or "", ""))
+        request_date = _lecture_sheet_text(data.get(columns.get("request_date") or "", ""))
+        response_type = _lecture_sheet_text(data.get(columns.get("response_type") or "", ""))
+        vault_id = _lecture_sheet_text(data.get(columns.get("vault_id") or "", ""))
+        if not (name or destination_url):
+            continue
+        event_code = _banner_mail_event_code(name)
+        rows.append(
+            {
+                "id": str(row_number),
+                "rowNumber": row_number,
+                "name": name,
+                "nameKey": _stamp_mail_filename_key(name),
+                "eventCode": event_code,
+                "eventCodeKey": _stamp_mail_filename_key(event_code),
+                "templateName": name,
+                "templateKey": _stamp_mail_filename_key(name),
+                "destinationUrl": destination_url,
+                "detailGroup": detail_group,
+                "product": product,
+                "endDate": end_date,
+                "description": description,
+                "expirationDate": expiration_date,
+                "mailCategory": mail_category,
+                "requestDate": request_date,
+                "responseType": response_type,
+                "vaultId": vault_id,
+                "raw": data,
+            }
+        )
+
+    return {
+        "spreadsheetTitle": getattr(workbook, "title", ""),
+        "spreadsheetUrl": _banner_mail_spreadsheet_url(),
+        "sheetTitle": ws.title,
+        "sheetGid": getattr(ws, "id", BANNER_MAIL_SHEET_GID),
+        "headerRow": header_row,
+        "columns": columns,
+        "rows": rows,
+    }
+
+
+def _banner_mail_session_root(session_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}", session_id or ""):
+        raise HTTPException(status_code=400, detail="invalid session id")
+    return BANNER_MAIL_OUTPUT_DIR / session_id
+
+
+def _banner_mail_result_url(session_id: str, rel_path: str) -> str:
+    encoded = "/".join(quote(part) for part in rel_path.split("/"))
+    return f"/banner-mail-tool/results/{session_id}/{encoded}"
+
+
+def _banner_mail_html(destination_url: str) -> str:
+    if not BANNER_MAIL_TEMPLATE_PATH.exists():
+        raise RuntimeError(f"バナーメールテンプレートが見つかりません: {BANNER_MAIL_TEMPLATE_PATH}")
+    template = BANNER_MAIL_TEMPLATE_PATH.read_text(encoding="utf-8")
+    escaped_url = (
+        (destination_url or "")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    return re.sub(
+        r"https://pro\.csl-info\.com/seminar/mi-[^\"<\s]+",
+        escaped_url,
+        template,
+    )
+
+
+def _banner_mail_save_jpg_from_image(data: bytes) -> tuple[bytes, dict[str, int]]:
+    with Image.open(io.BytesIO(data)) as img:
+        img = ImageOps.exif_transpose(img)
+        original_width, original_height = img.size
+        if original_width <= 0:
+            raise RuntimeError("画像の幅を取得できません。")
+        target_width = min(BANNER_MAIL_BANNER_WIDTH, original_width)
+        next_height = max(1, round(original_height * (target_width / original_width)))
+        img = _stamp_mail_flatten_image(img)
+        if img.size != (target_width, next_height):
+            img = img.resize((target_width, next_height), Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=BANNER_MAIL_IMAGE_QUALITY, optimize=True, progressive=True)
+        data_out = out.getvalue()
+        return data_out, {
+            "originalWidth": original_width,
+            "originalHeight": original_height,
+            "width": target_width,
+            "height": next_height,
+            "bytes": len(data_out),
+        }
+
+
+def _banner_mail_save_jpg_from_pdf(data: bytes, merge_pages: bool = False) -> tuple[bytes, dict[str, int]]:
+    img, page_count = _mail_render_pdf_image(data, BANNER_MAIL_BANNER_WIDTH, merge_pages)
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=BANNER_MAIL_IMAGE_QUALITY, optimize=True, progressive=True)
+    data_out = out.getvalue()
+    return data_out, {
+        "originalWidth": img.width,
+        "originalHeight": img.height,
+        "width": img.width,
+        "height": img.height,
+        "bytes": len(data_out),
+        "pageCount": page_count,
+        "mergedPages": bool(merge_pages and page_count > 1),
+    }
+
+
+def _banner_mail_upload_to_banner_jpg(upload: UploadFile, data: bytes, merge_pdf_pages: bool = False) -> tuple[bytes, dict[str, int]]:
+    filename = upload.filename or ""
+    suffix = Path(filename).suffix.lower()
+    content_type = (upload.content_type or "").lower()
+    if suffix == ".pdf" or content_type == "application/pdf":
+        return _banner_mail_save_jpg_from_pdf(data, merge_pdf_pages)
+    try:
+        return _banner_mail_save_jpg_from_image(data)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"{filename or 'upload'}: 画像またはPDFとして読み込めません。") from exc
+
+
+def _banner_mail_write_package(
+    result_root: Path,
+    session_id: str,
+    row: dict[str, Any],
+    upload_filename: str,
+    banner_jpg: bytes,
+    image_info: dict[str, int],
+) -> dict[str, Any]:
+    template_name = row.get("name") or Path(upload_filename).stem or "banner-mail"
+    html_filename = _stamp_mail_safe_filename(template_name, "banner-mail", suffix=".html")
+    base_name = Path(html_filename).stem or "banner-mail"
+    package_dir = _stamp_mail_unique_path(result_root / base_name)
+    package_dir.mkdir(parents=True, exist_ok=True)
+    images_dir = package_dir / BANNER_MAIL_IMAGE_DIRNAME
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    html_path = package_dir / html_filename
+    banner_path = images_dir / BANNER_MAIL_BANNER_FILENAME
+    images_zip_path = package_dir / BANNER_MAIL_IMAGES_ZIP_FILENAME
+    outer_zip_path = _stamp_mail_unique_path(result_root / f"{base_name}.zip")
+
+    html_path.write_text(_banner_mail_html(row.get("destinationUrl") or ""), encoding="utf-8")
+    banner_path.write_bytes(banner_jpg)
+
+    with zipfile.ZipFile(images_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.write(banner_path, f"{BANNER_MAIL_IMAGE_DIRNAME}/{BANNER_MAIL_BANNER_FILENAME}")
+
+    with zipfile.ZipFile(outer_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.write(html_path, html_filename)
+        zf.write(images_zip_path, BANNER_MAIL_IMAGES_ZIP_FILENAME)
+
+    html_rel = html_path.relative_to(result_root).as_posix()
+    image_rel = banner_path.relative_to(result_root).as_posix()
+    images_zip_rel = images_zip_path.relative_to(result_root).as_posix()
+    zip_rel = outer_zip_path.relative_to(result_root).as_posix()
+    return {
+        "name": row.get("name") or "",
+        "templateName": template_name,
+        "htmlFilename": html_filename,
+        "destinationUrl": row.get("destinationUrl") or "",
+        "rowNumber": row.get("rowNumber"),
+        "eventCode": row.get("eventCode") or "",
+        "eventCodeKey": row.get("eventCodeKey") or "",
+        "detailGroup": row.get("detailGroup") or "",
+        "product": row.get("product") or "",
+        "endDate": row.get("endDate") or "",
+        "description": row.get("description") or "",
+        "expirationDate": row.get("expirationDate") or "",
+        "mailCategory": row.get("mailCategory") or "",
+        "requestDate": row.get("requestDate") or "",
+        "responseType": row.get("responseType") or "",
+        "vaultId": row.get("vaultId") or "",
+        "sourceFilename": upload_filename,
+        "bannerFilename": BANNER_MAIL_BANNER_FILENAME,
+        "imageInfo": image_info,
+        "path": package_dir.relative_to(result_root).as_posix(),
+        "htmlPath": html_rel,
+        "imagePath": image_rel,
+        "imagesZipPath": images_zip_rel,
+        "zipPath": zip_rel,
+        "htmlUrl": _banner_mail_result_url(session_id, html_rel),
+        "imageUrl": _banner_mail_result_url(session_id, image_rel),
+        "imagesZipUrl": _banner_mail_result_url(session_id, images_zip_rel),
+        "zipUrl": _banner_mail_result_url(session_id, zip_rel),
+    }
+
+
+@app.get("/banner-mail-tool/sheet-rows")
+async def banner_mail_tool_sheet_rows():
+    try:
+        sheet = _banner_mail_fetch_sheet_rows()
+        return JSONResponse({"ok": True, **sheet})
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"spreadsheet fetch failed: {exc}") from exc
+
+
+@app.post("/banner-mail-tool/generate")
+async def banner_mail_tool_generate(
+    files: List[UploadFile] = File(...),
+    rowIds: List[str] = Form(...),
+    mergePdfPages: Optional[List[str]] = Form(None),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="画像またはPDFをアップロードしてください。")
+    if len(files) != len(rowIds):
+        raise HTTPException(status_code=400, detail="ファイル数と選択行数が一致しません。")
+
+    sheet = _banner_mail_fetch_sheet_rows()
+    rows_by_id = {row["id"]: row for row in sheet["rows"]}
+    session_id = new_session_id()
+    result_root = _banner_mail_session_root(session_id) / "result"
+    result_root.mkdir(parents=True, exist_ok=True)
+    packages: list[dict[str, Any]] = []
+
+    for idx, upload in enumerate(files):
+        row_id = normalize_space(rowIds[idx])
+        row = rows_by_id.get(row_id)
+        filename = upload.filename or f"upload_{idx + 1}"
+        if not row:
+            raise HTTPException(status_code=400, detail=f"{filename}: スプレッドシート行が選択されていません。")
+        if not row.get("name"):
+            raise HTTPException(status_code=400, detail=f"{filename}: Nameが空です。")
+        if not row.get("destinationUrl"):
+            raise HTTPException(status_code=400, detail=f"{filename}: 遷移先URLが空です。")
+
+        data = await upload.read()
+        banner_jpg, image_info = _banner_mail_upload_to_banner_jpg(
+            upload,
+            data,
+            merge_pdf_pages=_mail_form_bool(mergePdfPages, idx),
+        )
+        packages.append(
+            _banner_mail_write_package(
+                result_root,
+                session_id,
+                row,
+                filename,
+                banner_jpg,
+                image_info,
+            )
+        )
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "sessionId": session_id,
+            "bannerWidth": BANNER_MAIL_BANNER_WIDTH,
+            "bannerFilename": BANNER_MAIL_BANNER_FILENAME,
+            "packages": packages,
+        }
+    )
+
+
+@app.get("/banner-mail-tool/results/{session_id}/{rel_path:path}")
+async def banner_mail_tool_result_file(session_id: str, rel_path: str, request: Request):
+    result_dir = (_banner_mail_session_root(session_id) / "result").resolve()
+    target = (result_dir / rel_path).resolve()
+
+    try:
+        target.relative_to(result_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid result path") from exc
+
+    if target == result_dir:
+        raise HTTPException(status_code=400, detail="invalid result path")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="result file not found")
+
+    media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    force_download = str(request.query_params.get("download") or "").lower() in {"1", "true", "yes"}
+    if force_download:
+        return FileResponse(
+            target,
+            media_type=media_type,
+            filename=target.name,
+            content_disposition_type="attachment",
+        )
+    return FileResponse(target, media_type=media_type)
+
+
+CSL_LECTURE_TOOL_SPREADSHEET_KEY = os.getenv(
+    "CSL_LECTURE_TOOL_SPREADSHEET_KEY",
+    STAMP_MAIL_SPREADSHEET_KEY,
+)
+CSL_LECTURE_TOOL_SHEET_NAME = os.getenv("CSL_LECTURE_TOOL_SHEET_NAME", "講演会ツール")
+CSL_LECTURE_TOOL_SHEET_GID = int(os.getenv("CSL_LECTURE_TOOL_SHEET_GID", "0"))
+CSL_LECTURE_TOOL_OUTPUT_DIR = DATA_DIR / "csl_lecture_tool"
+CSL_LECTURE_TOOL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+CSL_LECTURE_TOOL_TEMPLATE_ZIP_PATH = APP_DIR / "csl_lecture_tool_template.zip"
+CSL_LECTURE_TOOL_IMAGE_WIDTH = int(os.getenv("CSL_LECTURE_TOOL_IMAGE_WIDTH", "2048"))
+CSL_LECTURE_TOOL_THUMBNAIL_NAME_WIDTH = int(os.getenv("CSL_LECTURE_TOOL_THUMBNAIL_NAME_WIDTH", "1200"))
+CSL_LECTURE_TOOL_IMAGE_QUALITY = int(os.getenv("CSL_LECTURE_TOOL_IMAGE_QUALITY", "92"))
+CSL_LECTURE_TOOL_FULL_SIZE = (1024, 768)
+CSL_LECTURE_TOOL_THUMB_SIZE = (200, 150)
+
+CSL_LECTURE_TOOL_COLUMN_ALIASES = {
+    "lecture_id": ["講演会ID", "システムID", "event_id", "Event ID", "講演会 id"],
+    "media_file_name": ["メディアファイル名", "FileName", "ファイル名", "メディア名", "media", "media_file_name"],
+    "presentation_id": ["PresentationId", "Presentation ID", "プレゼンテーションID", "presentation_id"],
+    "presentation_name": ["プレゼンテーション名", "Name", "タイトル", "presentation_name"],
+    "list_config_name": ["Name", "name"],
+    "detail_group": ["Detail Group", "Detail Group列", "DetailGroup", "detail_group", "ディテールグループ"],
+    "product": ["Product", "プロダクト", "製品", "製品名"],
+    "request_date": ["依頼日", "依頼日列", "request_date", "Request Date", "RequestDate"],
+    "response_type": ["種別", "対応区分", "対応区分列", "区分", "response_type", "Response Type", "ResponseType"],
+    "event_name": ["講演会名", "event_name", "Name", "name"],
+    "event_date": ["EventDate", "開催日", "開催日時", "event_date"],
+    "event_time": ["時間", "開催時間", "event_time"],
+    "thumbnail_name": ["ThumnailName", "ThumbnailName", "サムネイル名", "thumbnail_name"],
+    "pickup": ["Pickup", "pickup", "ピックアップ"],
+    "config_date": ["Date", "date", "リリース日", "公開日"],
+    "end_date": ["EndDate", "End Date", "終了日", "end_date"],
+}
+
+
+def _csl_lecture_tool_spreadsheet_url() -> str:
+    return f"https://docs.google.com/spreadsheets/d/{CSL_LECTURE_TOOL_SPREADSHEET_KEY}/edit?gid={CSL_LECTURE_TOOL_SHEET_GID}"
+
+
+def _csl_lecture_tool_open_spreadsheet_and_worksheet():
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    credentials = get_gsa_credentials(scope)
+    gc = gspread.authorize(credentials)
+    workbook = _retry_gspread(lambda: gc.open_by_key(CSL_LECTURE_TOOL_SPREADSHEET_KEY))
+    worksheets = _retry_gspread(lambda: workbook.worksheets())
+
+    for ws in worksheets:
+        if normalize_space(getattr(ws, "title", "")).lower() == CSL_LECTURE_TOOL_SHEET_NAME.lower():
+            return workbook, ws
+
+    for ws in worksheets:
+        if int(getattr(ws, "id", -1)) == CSL_LECTURE_TOOL_SHEET_GID:
+            return workbook, ws
+
+    raise RuntimeError(
+        f"講演会ツールタブ（name={CSL_LECTURE_TOOL_SHEET_NAME}, gid={CSL_LECTURE_TOOL_SHEET_GID}）が見つかりません。"
+    )
+
+
+def _csl_lecture_tool_pick_column(headers: list[str], field: str) -> str:
+    normalized = {_lecture_header_key(h): h for h in headers}
+    for alias in CSL_LECTURE_TOOL_COLUMN_ALIASES[field]:
+        hit = normalized.get(_lecture_header_key(alias))
+        if hit:
+            return hit
+    return ""
+
+
+def _csl_lecture_tool_find_header(values: list[list[str]]) -> tuple[int, list[str], dict[str, str]]:
+    for idx, row in enumerate(values[:20], start=1):
+        headers = make_unique(row)
+        columns = {
+            field: _csl_lecture_tool_pick_column(headers, field)
+            for field in CSL_LECTURE_TOOL_COLUMN_ALIASES.keys()
+        }
+        if columns["lecture_id"] and columns["media_file_name"]:
+            return idx, headers, columns
+    raise RuntimeError("必要な列（講演会ID、メディアファイル名）が見つかりません。")
+
+
+def _csl_lecture_tool_fetch_sheet_rows() -> dict[str, Any]:
+    workbook, ws = _csl_lecture_tool_open_spreadsheet_and_worksheet()
+    values = _retry_gspread(lambda: ws.get_all_values())
+    if not values:
+        return {
+            "spreadsheetTitle": getattr(workbook, "title", ""),
+            "spreadsheetUrl": _csl_lecture_tool_spreadsheet_url(),
+            "sheetTitle": ws.title,
+            "sheetGid": getattr(ws, "id", CSL_LECTURE_TOOL_SHEET_GID),
+            "headerRow": 0,
+            "columns": {},
+            "rows": [],
+        }
+
+    header_row, headers, columns = _csl_lecture_tool_find_header(values)
+    rows: list[dict[str, Any]] = []
+    for row_number, raw in enumerate(values[header_row:], start=header_row + 1):
+        data = {headers[i]: raw[i] if i < len(raw) else "" for i in range(len(headers))}
+        lecture_id = _lecture_sheet_text(data.get(columns["lecture_id"], ""))
+        media_file_name = _lecture_sheet_text(data.get(columns["media_file_name"], ""))
+        presentation_id = _lecture_sheet_text(data.get(columns.get("presentation_id") or "", ""))
+        presentation_name = _lecture_sheet_text(data.get(columns.get("presentation_name") or "", ""))
+        list_config_name = _lecture_sheet_text(data.get(columns.get("list_config_name") or "", ""))
+        detail_group = _lecture_sheet_text(data.get(columns.get("detail_group") or "", ""))
+        product = _csl_normalize_product_name(_lecture_sheet_text(data.get(columns.get("product") or "", "")))
+        request_date = _lecture_sheet_text(data.get(columns.get("request_date") or "", ""))
+        response_type = _lecture_sheet_text(data.get(columns.get("response_type") or "", ""))
+        event_name = _lecture_sheet_text(data.get(columns.get("event_name") or "", ""))
+        event_date = _lecture_sheet_text(data.get(columns.get("event_date") or "", ""))
+        event_time = _lecture_sheet_text(data.get(columns.get("event_time") or "", ""))
+        thumbnail_name = _lecture_sheet_text(data.get(columns.get("thumbnail_name") or "", ""))
+        pickup = _lecture_sheet_text(data.get(columns.get("pickup") or "", ""))
+        config_date = _lecture_sheet_text(data.get(columns.get("config_date") or "", ""))
+        end_date = _lecture_sheet_text(data.get(columns.get("end_date") or "", ""))
+        if not (lecture_id or media_file_name):
+            continue
+        rows.append(
+            {
+                "id": str(row_number),
+                "rowNumber": row_number,
+                "lectureId": lecture_id,
+                "lectureIdKey": _stamp_mail_filename_key(lecture_id),
+                "mediaFileName": media_file_name,
+                "mediaFileKey": _stamp_mail_filename_key(media_file_name),
+                "presentationId": presentation_id,
+                "presentationName": presentation_name,
+                "listConfigName": list_config_name,
+                "detailGroup": detail_group,
+                "product": product,
+                "requestDate": request_date,
+                "responseType": response_type,
+                "eventName": event_name,
+                "eventDate": event_date,
+                "eventTime": event_time,
+                "thumbnailName": thumbnail_name,
+                "pickup": pickup,
+                "configDate": config_date,
+                "endDate": end_date,
+                "raw": data,
+            }
+        )
+
+    return {
+        "spreadsheetTitle": getattr(workbook, "title", ""),
+        "spreadsheetUrl": _csl_lecture_tool_spreadsheet_url(),
+        "sheetTitle": ws.title,
+        "sheetGid": getattr(ws, "id", CSL_LECTURE_TOOL_SHEET_GID),
+        "headerRow": header_row,
+        "columns": columns,
+        "rows": rows,
+    }
+
+
+def _csl_lecture_tool_session_root(session_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}", session_id or ""):
+        raise HTTPException(status_code=400, detail="invalid session id")
+    return CSL_LECTURE_TOOL_OUTPUT_DIR / session_id
+
+
+def _csl_lecture_tool_result_url(session_id: str, rel_path: str) -> str:
+    encoded = "/".join(quote(part) for part in rel_path.split("/"))
+    return f"/csl-lecture-tool/results/{session_id}/{encoded}"
+
+
+def _csl_lecture_tool_media_base(row: dict[str, Any], fallback: str = "CSL_QUICK_TOOL") -> str:
+    raw = row.get("mediaFileName") or fallback
+    stem = Path(_lecture_sheet_text(raw)).stem if Path(_lecture_sheet_text(raw)).suffix else _lecture_sheet_text(raw)
+    return _stamp_mail_safe_filename(stem, fallback)
+
+
+def _csl_lecture_tool_related_rows(selected: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    lecture_key = selected.get("lectureIdKey") or _stamp_mail_filename_key(selected.get("lectureId") or "")
+    if not lecture_key:
+        return [selected]
+
+    related = [
+        row for row in rows
+        if (row.get("lectureIdKey") or _stamp_mail_filename_key(row.get("lectureId") or "")) == lecture_key
+    ] or [selected]
+
+    picked: list[dict[str, Any]] = []
+    seen_media: set[str] = set()
+    for row in sorted(
+        related,
+        key=lambda item: (
+            0 if str(item.get("rowNumber") or "") == str(selected.get("rowNumber") or "") else 1,
+            _lecture_sheet_text(item.get("product") or ""),
+            int(item.get("rowNumber") or 0),
+        ),
+    ):
+        media_key = _stamp_mail_filename_key(row.get("mediaFileName") or "")
+        if not media_key:
+            continue
+        if media_key in seen_media:
+            continue
+        seen_media.add(media_key)
+        picked.append(row)
+    return picked or [selected]
+
+
+def _csl_lecture_tool_rows_for_media(selected: dict[str, Any], rows: list[dict[str, Any]], media_key: str) -> list[dict[str, Any]]:
+    lecture_key = selected.get("lectureIdKey") or _stamp_mail_filename_key(selected.get("lectureId") or "")
+    related = [
+        row for row in rows
+        if (row.get("lectureIdKey") or _stamp_mail_filename_key(row.get("lectureId") or "")) == lecture_key
+        and (row.get("mediaFileKey") or _stamp_mail_filename_key(row.get("mediaFileName") or "")) == media_key
+    ]
+    return related or [selected]
+
+
+def _csl_lecture_tool_public_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id") or str(row.get("rowNumber") or ""),
+        "rowNumber": row.get("rowNumber"),
+        "lectureId": row.get("lectureId") or "",
+        "lectureIdKey": row.get("lectureIdKey") or _stamp_mail_filename_key(row.get("lectureId") or ""),
+        "mediaFileName": row.get("mediaFileName") or "",
+        "mediaFileKey": row.get("mediaFileKey") or _stamp_mail_filename_key(row.get("mediaFileName") or ""),
+        "presentationId": row.get("presentationId") or "",
+        "presentationName": row.get("presentationName") or "",
+        "listConfigName": row.get("listConfigName") or "",
+        "detailGroup": row.get("detailGroup") or "",
+        "product": row.get("product") or "",
+        "requestDate": row.get("requestDate") or "",
+        "responseType": row.get("responseType") or "",
+        "eventName": row.get("eventName") or "",
+        "eventDate": row.get("eventDate") or "",
+        "eventTime": row.get("eventTime") or "",
+        "thumbnailName": row.get("thumbnailName") or "",
+        "pickup": row.get("pickup") or "",
+        "configDate": row.get("configDate") or "",
+        "endDate": row.get("endDate") or "",
+    }
+
+
+def _csl_lecture_tool_flatten(img: Image.Image) -> Image.Image:
+    return _stamp_mail_flatten_image(img)
+
+
+def _csl_lecture_tool_jpeg(img: Image.Image, *, quality: int | None = None, progressive: bool = False) -> bytes:
+    out = io.BytesIO()
+    img.save(
+        out,
+        format="JPEG",
+        quality=quality or CSL_LECTURE_TOOL_IMAGE_QUALITY,
+        optimize=True,
+        progressive=progressive,
+    )
+    return out.getvalue()
+
+
+def _csl_lecture_tool_contain_jpeg(img: Image.Image, size: tuple[int, int]) -> bytes:
+    work = img.copy()
+    work.thumbnail(size, Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", size, (0, 0, 0))
+    x = (size[0] - work.width) // 2
+    y = (size[1] - work.height) // 2
+    canvas.paste(work, (x, y))
+    return _csl_lecture_tool_jpeg(canvas, progressive=False)
+
+
+def _csl_lecture_tool_width_limited_jpeg(img: Image.Image, max_width: int) -> tuple[bytes, dict[str, int]]:
+    work = img.copy()
+    original_width, original_height = work.size
+    target_width = min(max_width, original_width)
+    target_height = max(1, round(original_height * (target_width / original_width)))
+    if work.size != (target_width, target_height):
+        work = work.resize((target_width, target_height), Image.Resampling.LANCZOS)
+    data = _csl_lecture_tool_jpeg(work, progressive=False)
+    return data, {
+        "originalWidth": original_width,
+        "originalHeight": original_height,
+        "width": work.width,
+        "height": work.height,
+        "bytes": len(data),
+    }
+
+
+def _csl_lecture_tool_safe_image_filename(value: str, fallback: str) -> str:
+    name = Path(_lecture_sheet_text(value or "")).name
+    stem = Path(name).stem if Path(name).suffix else name
+    suffix = Path(name).suffix if Path(name).suffix else ".jpg"
+    return _stamp_mail_safe_filename(stem, fallback, suffix=suffix)
+
+
+def _csl_lecture_tool_prepare_image(
+    upload: UploadFile,
+    data: bytes,
+    merge_pdf_pages: bool,
+) -> dict[str, Any]:
+    filename = upload.filename or ""
+    suffix = Path(filename).suffix.lower()
+    content_type = (upload.content_type or "").lower()
+
+    if suffix == ".pdf" or content_type == "application/pdf":
+        main_img, page_count = _mail_render_pdf_image(data, CSL_LECTURE_TOOL_IMAGE_WIDTH, merge_pdf_pages)
+        original_width, original_height = main_img.size
+        source_type = "pdf"
+    else:
+        try:
+            with Image.open(io.BytesIO(data)) as src:
+                src = ImageOps.exif_transpose(src)
+                original_width, original_height = src.size
+                main_img = _csl_lecture_tool_flatten(src)
+                page_count = 0
+                source_type = "image"
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"{filename or 'upload'}: 画像またはPDFとして読み込めません。") from exc
+
+        if original_width <= 0:
+            raise HTTPException(status_code=400, detail=f"{filename or 'upload'}: 画像の幅を取得できません。")
+        target_width = min(CSL_LECTURE_TOOL_IMAGE_WIDTH, original_width)
+        target_height = max(1, round(original_height * (target_width / original_width)))
+        if main_img.size != (target_width, target_height):
+            main_img = main_img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+    main_jpg = _csl_lecture_tool_jpeg(main_img, progressive=False)
+    thumbnail_name_jpg, thumbnail_name_info = _csl_lecture_tool_width_limited_jpeg(
+        main_img,
+        CSL_LECTURE_TOOL_THUMBNAIL_NAME_WIDTH,
+    )
+    full_jpg = _csl_lecture_tool_contain_jpeg(main_img, CSL_LECTURE_TOOL_FULL_SIZE)
+    thumb_jpg = _csl_lecture_tool_contain_jpeg(main_img, CSL_LECTURE_TOOL_THUMB_SIZE)
+    return {
+        "mainBytes": main_jpg,
+        "thumbnailNameBytes": thumbnail_name_jpg,
+        "fullBytes": full_jpg,
+        "thumbBytes": thumb_jpg,
+        "imageInfo": {
+            "originalWidth": original_width,
+            "originalHeight": original_height,
+            "width": main_img.width,
+            "height": main_img.height,
+            "bytes": len(main_jpg),
+            "sourceType": source_type,
+            "pageCount": page_count,
+            "mergedPages": bool(source_type == "pdf" and merge_pdf_pages and page_count > 1),
+        },
+        "thumbnailNameImageInfo": thumbnail_name_info,
+    }
+
+
+def _csl_lecture_tool_template_root(zf: zipfile.ZipFile) -> str:
+    for info in zf.infolist():
+        parts = [part for part in Path(info.filename).parts if part not in {"", "."}]
+        if parts:
+            return parts[0]
+    raise RuntimeError("講演会ツールテンプレートZIPが空です。")
+
+
+def _csl_lecture_tool_write_package(
+    result_root: Path,
+    session_id: str,
+    row: dict[str, Any],
+    selected_row: dict[str, Any],
+    package_rows: list[dict[str, Any]],
+    source_filename: str,
+    prepared: dict[str, Any],
+) -> dict[str, Any]:
+    if not CSL_LECTURE_TOOL_TEMPLATE_ZIP_PATH.is_file():
+        raise RuntimeError(f"講演会ツールテンプレートZIPが見つかりません: {CSL_LECTURE_TOOL_TEMPLATE_ZIP_PATH}")
+
+    media_base = _csl_lecture_tool_media_base(row, Path(source_filename).stem or "CSL_QUICK_TOOL")
+    package_dir = _stamp_mail_unique_path(result_root / media_base)
+    package_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = _stamp_mail_unique_path(result_root / f"{media_base}.zip")
+
+    html_rel = f"{media_base}.html"
+    full_rel = f"{media_base}-full.jpg"
+    thumb_rel = f"{media_base}-thumb.jpg"
+    main_rel = "images/1.jpg"
+    thumbnail_images: list[dict[str, Any]] = []
+
+    with zipfile.ZipFile(CSL_LECTURE_TOOL_TEMPLATE_ZIP_PATH, "r") as template_zip:
+        template_root = _csl_lecture_tool_template_root(template_zip)
+        old_base = Path(template_root).name
+        written: list[tuple[Path, str]] = []
+
+        for info in template_zip.infolist():
+            if info.is_dir():
+                continue
+            raw_name = info.filename.replace("\\", "/")
+            parts = raw_name.split("/")
+            rel_parts = parts[1:] if parts and parts[0] == template_root else parts
+            if not rel_parts:
+                continue
+            rel = "/".join(rel_parts)
+            basename = Path(rel).name
+
+            if rel == f"images/1.jpg":
+                out_rel = main_rel
+                data_out = prepared["mainBytes"]
+            elif basename == f"{old_base}.html":
+                out_rel = html_rel
+                text = template_zip.read(info.filename).decode("utf-8", errors="replace")
+                data_out = text.replace(old_base, media_base).encode("utf-8")
+            elif basename == f"{old_base}-full.jpg":
+                out_rel = full_rel
+                data_out = prepared["fullBytes"]
+            elif basename == f"{old_base}-thumb.jpg":
+                out_rel = thumb_rel
+                data_out = prepared["thumbBytes"]
+            else:
+                out_rel = rel
+                data_out = template_zip.read(info.filename)
+
+            local_path = package_dir / out_rel
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(data_out)
+            written.append((local_path, out_rel))
+
+    seen_thumbnail_names: set[str] = set()
+    for item_row in package_rows:
+        thumbnail_name = item_row.get("thumbnailName") or ""
+        if not thumbnail_name:
+            continue
+        thumbnail_filename = _csl_lecture_tool_safe_image_filename(thumbnail_name, "thumbnail")
+        thumbnail_key = _stamp_mail_filename_key(thumbnail_filename)
+        if not thumbnail_key or thumbnail_key in seen_thumbnail_names:
+            continue
+        seen_thumbnail_names.add(thumbnail_key)
+        thumbnail_rel = f"thumbnail_images/{thumbnail_filename}"
+        thumbnail_path = package_dir / thumbnail_rel
+        thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
+        thumbnail_path.write_bytes(prepared["thumbnailNameBytes"])
+        thumbnail_images.append(
+            {
+                "name": thumbnail_filename,
+                "imageInfo": prepared["thumbnailNameImageInfo"],
+                "path": f"{package_dir.relative_to(result_root).as_posix()}/{thumbnail_rel}",
+                "url": _csl_lecture_tool_result_url(
+                    session_id,
+                    f"{package_dir.relative_to(result_root).as_posix()}/{thumbnail_rel}",
+                ),
+                "rowNumbers": [
+                    related_row.get("rowNumber")
+                    for related_row in package_rows
+                    if _stamp_mail_filename_key(related_row.get("thumbnailName") or "") == thumbnail_key
+                ],
+            }
+        )
+
+    existing = {rel for _, rel in written}
+    for out_rel, data_out in [
+        (html_rel, b""),
+        (full_rel, prepared["fullBytes"]),
+        (thumb_rel, prepared["thumbBytes"]),
+        (main_rel, prepared["mainBytes"]),
+    ]:
+        if out_rel in existing:
+            continue
+        local_path = package_dir / out_rel
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        if out_rel == html_rel:
+            local_path.write_text("", encoding="utf-8")
+        else:
+            local_path.write_bytes(data_out)
+        written.append((local_path, out_rel))
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for local_path, out_rel in written:
+            if local_path.is_file():
+                zf.write(local_path, f"{media_base}/{out_rel}")
+
+    package_rel = package_dir.relative_to(result_root).as_posix()
+    zip_rel = zip_path.relative_to(result_root).as_posix()
+    return {
+        "lectureId": row.get("lectureId") or "",
+        "mediaFileName": row.get("mediaFileName") or "",
+        "mediaBase": media_base,
+        "presentationId": row.get("presentationId") or "",
+        "presentationName": row.get("presentationName") or "",
+        "detailGroup": row.get("detailGroup") or "",
+        "product": row.get("product") or "",
+        "rowNumber": row.get("rowNumber"),
+        "selectedRowNumber": selected_row.get("rowNumber"),
+        "isRelatedProduct": str(row.get("rowNumber") or "") != str(selected_row.get("rowNumber") or ""),
+        "sourceFilename": source_filename,
+        "imageInfo": prepared["imageInfo"],
+        "rows": [_csl_lecture_tool_public_row(item_row) for item_row in package_rows],
+        "thumbnailImages": thumbnail_images,
+        "path": package_rel,
+        "zipPath": zip_rel,
+        "zipUrl": _csl_lecture_tool_result_url(session_id, zip_rel),
+        "htmlPath": f"{package_rel}/{html_rel}",
+        "htmlUrl": _csl_lecture_tool_result_url(session_id, f"{package_rel}/{html_rel}"),
+        "fullImagePath": f"{package_rel}/{full_rel}",
+        "fullImageUrl": _csl_lecture_tool_result_url(session_id, f"{package_rel}/{full_rel}"),
+        "thumbImagePath": f"{package_rel}/{thumb_rel}",
+        "thumbImageUrl": _csl_lecture_tool_result_url(session_id, f"{package_rel}/{thumb_rel}"),
+        "mainImagePath": f"{package_rel}/{main_rel}",
+        "mainImageUrl": _csl_lecture_tool_result_url(session_id, f"{package_rel}/{main_rel}"),
+    }
+
+
+@app.get("/csl-lecture-tool/sheet-rows")
+async def csl_lecture_tool_sheet_rows():
+    try:
+        sheet = _csl_lecture_tool_fetch_sheet_rows()
+        return JSONResponse({"ok": True, **sheet})
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"spreadsheet fetch failed: {exc}") from exc
+
+
+@app.post("/csl-lecture-tool/generate")
+async def csl_lecture_tool_generate(
+    files: List[UploadFile] = File(...),
+    rowIds: List[str] = Form(...),
+    mergePdfPages: Optional[List[str]] = Form(None),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="画像またはPDFをアップロードしてください。")
+    if len(files) != len(rowIds):
+        raise HTTPException(status_code=400, detail="ファイル数と選択行数が一致しません。")
+
+    sheet = _csl_lecture_tool_fetch_sheet_rows()
+    rows = sheet["rows"]
+    rows_by_id = {row["id"]: row for row in rows}
+    session_id = new_session_id()
+    result_root = _csl_lecture_tool_session_root(session_id) / "result"
+    result_root.mkdir(parents=True, exist_ok=True)
+    packages: list[dict[str, Any]] = []
+    generated_keys: set[str] = set()
+
+    for idx, upload in enumerate(files):
+        row_id = normalize_space(rowIds[idx])
+        selected_row = rows_by_id.get(row_id)
+        filename = upload.filename or f"upload_{idx + 1}"
+        if not selected_row:
+            raise HTTPException(status_code=400, detail=f"{filename}: スプレッドシート行が選択されていません。")
+        if not selected_row.get("lectureId"):
+            raise HTTPException(status_code=400, detail=f"{filename}: 講演会IDが空です。")
+        if not selected_row.get("mediaFileName"):
+            raise HTTPException(status_code=400, detail=f"{filename}: メディアファイル名が空です。")
+
+        data = await upload.read()
+        prepared = _csl_lecture_tool_prepare_image(
+            upload,
+            data,
+            merge_pdf_pages=_mail_form_bool(mergePdfPages, idx),
+        )
+        for row in _csl_lecture_tool_related_rows(selected_row, rows):
+            media_key = _stamp_mail_filename_key(row.get("mediaFileName") or "")
+            if not media_key or media_key in generated_keys:
+                continue
+            package_rows = _csl_lecture_tool_rows_for_media(selected_row, rows, media_key)
+            generated_keys.add(media_key)
+            packages.append(
+                _csl_lecture_tool_write_package(
+                    result_root,
+                    session_id,
+                    row,
+                    selected_row,
+                    package_rows,
+                    filename,
+                    prepared,
+                )
+            )
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "sessionId": session_id,
+            "imageWidth": CSL_LECTURE_TOOL_IMAGE_WIDTH,
+            "packages": packages,
+        }
+    )
+
+
+@app.get("/csl-lecture-tool/results/{session_id}/{rel_path:path}")
+async def csl_lecture_tool_result_file(session_id: str, rel_path: str, request: Request):
+    result_dir = (_csl_lecture_tool_session_root(session_id) / "result").resolve()
+    target = (result_dir / rel_path).resolve()
+
+    try:
+        target.relative_to(result_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid result path") from exc
+
+    if target == result_dir:
+        raise HTTPException(status_code=400, detail="invalid result path")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="result file not found")
+
+    media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    force_download = str(request.query_params.get("download") or "").lower() in {"1", "true", "yes"}
+    if force_download:
+        return FileResponse(
+            target,
+            media_type=media_type,
+            filename=target.name,
+            content_disposition_type="attachment",
+        )
+    return FileResponse(target, media_type=media_type)
+
 
 @app.post("/upload/simple/stream")
 async def upload_simple_stream(
