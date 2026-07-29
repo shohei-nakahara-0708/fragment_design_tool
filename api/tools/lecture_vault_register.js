@@ -353,6 +353,52 @@ async function withTimeout(promise, timeoutMs, label) {
     const SHORT_WAIT = 3000;
     const NORMAL_WAIT = 30000;
     const LONG_WAIT = 90000;
+    const SAVE_VAULT_DEBUG = !['0', 'false', 'no'].includes(String(process.env.LECTURE_TOOL_SAVE_VAULT_DEBUG || '1').trim().toLowerCase());
+
+    function safeDebugName(value, fallback = 'debug') {
+      const text = String(value || '')
+        .replace(/[\\/:*?"<>|]+/g, '_')
+        .replace(/\s+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 80);
+      return text || fallback;
+    }
+
+    async function saveVaultDebugArtifact(label, extra = {}) {
+      if (!SAVE_VAULT_DEBUG) return '';
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const debugDir = path.join(path.dirname(zIPfolder), 'vault_debug', `${stamp}_${safeDebugName(label)}`);
+      try {
+        fs.mkdirSync(debugDir, { recursive: true });
+        const state = await page.evaluate(() => ({
+          url: location.href,
+          title: document.title || '',
+          bodyText: (document.body?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 4000),
+          links: Array.from(document.querySelectorAll('a[href*="#doc_info/"], a[href*="doc_info/"]')).map(anchor => ({
+            href: anchor.getAttribute('href') || '',
+            text: (anchor.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 240),
+            title: anchor.getAttribute('title') || '',
+            className: String(anchor.className || ''),
+          })).slice(0, 80),
+        })).catch(err => ({ error: String(err) }));
+        fs.writeFileSync(path.join(debugDir, 'state.json'), JSON.stringify({ label, extra, state }, null, 2), 'utf8');
+        const html = await page.content().catch(err => `<!-- page.content failed: ${String(err)} -->`);
+        fs.writeFileSync(path.join(debugDir, 'page.html'), html, 'utf8');
+        await page.screenshot({ path: path.join(debugDir, 'screenshot.png'), fullPage: true }).catch(err => {
+          fs.writeFileSync(path.join(debugDir, 'screenshot-error.txt'), String(err), 'utf8');
+        });
+        console.log(`Vaultデバッグ情報を保存しました: ${debugDir}`);
+        return debugDir;
+      } catch (e) {
+        console.log(red + `Vaultデバッグ情報の保存に失敗しました: ${e.message}` + reset);
+        return '';
+      }
+    }
+
+    async function throwWithVaultDebug(message, label, extra = {}) {
+      const debugDir = await saveVaultDebugArtifact(label, extra);
+      throw new Error(debugDir ? `${message} / debug: ${debugDir}` : message);
+    }
 
     async function waitForOptionalSelector(selector, timeout = SHORT_WAIT, options = {}) {
       try {
@@ -3339,6 +3385,31 @@ async function withTimeout(promise, timeoutMs, label) {
       return url.toString();
     }
 
+    function parseDocInfoFromUrl(urlStr) {
+      const match = String(urlStr || '').match(/#doc_info\/(\d+)(?:\/(\d+))?(?:\/(\d+))?/);
+      if (!match) {
+        return {
+          docId: '',
+          major: '',
+          minor: '',
+        };
+      }
+      return {
+        docId: match[1] || '',
+        major: match[2] || '',
+        minor: match[3] || '',
+      };
+    }
+
+    function docInfoVersionChanged(beforeUrl, afterUrl) {
+      const before = parseDocInfoFromUrl(beforeUrl);
+      const after = parseDocInfoFromUrl(afterUrl);
+      return !!before.docId &&
+        !!after.docId &&
+        before.docId === after.docId &&
+        (before.major !== after.major || before.minor !== after.minor);
+    }
+
     async function createDraftFromExistingPresentation(zipPath, baseUrl) {
       const directCreateDraftButtonSelector = [
         '.vv-action-bar-frequent-actions button[aria-label="下書きの作成"]',
@@ -3363,6 +3434,8 @@ async function withTimeout(promise, timeoutMs, label) {
         '[role="option"]',
       ].join(', ');
       const createDraftDialogSelector = '[data-corgix-internal="DIALOG"], [role="dialog"]';
+      const binderRowSelector = '.vv_library_list .binderDocRow, .vv_library_list .vv_veeva_document, .vv_library_list .binderRow, .vv_library_list .vv-doc-compact-item';
+      const docStatusSelector = '.vv_docstatus_wrapper, .vv-doc-state-badge, .docRowStatus';
       const markedDraftUploadSelector = 'input[data-lecture-create-draft-upload="true"]';
       const sourceDocId = page.url().match(/#doc_info\/(\d+)/)?.[1] || '';
 
@@ -3944,7 +4017,7 @@ async function withTimeout(promise, timeoutMs, label) {
         await page.mouse.up();
       };
 
-      const collectDraftPageState = async () => page.evaluate(dialogSelector => {
+      const collectDraftPageState = async () => page.evaluate((dialogSelector, rowSelector, statusSelector) => {
         const visible = element => {
           const style = window.getComputedStyle(element);
           const rect = element.getBoundingClientRect();
@@ -3960,11 +4033,12 @@ async function withTimeout(promise, timeoutMs, label) {
           ].join(' ');
           return visible(dialog) && /Create\s*Draft|CreateDraft|下書きの作成/i.test(text);
         });
-        const currentDocId = location.hash.match(/#?doc_info\/(\d+)/)?.[1] || '';
-        const binderRows = Array.from(document.querySelectorAll('.vv_library_list .binderDocRow, .vv_library_list .vv_veeva_document'))
+        const currentDocInfo = location.hash.match(/#?doc_info\/(\d+)(?:\/(\d+))?(?:\/(\d+))?/);
+        const currentDocId = currentDocInfo?.[1] || '';
+        const binderRows = Array.from(document.querySelectorAll(rowSelector))
           .filter(visible)
           .map(row => (row.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200));
-        const docStatusText = Array.from(document.querySelectorAll('.vv_docstatus_wrapper, .vv-doc-state-badge'))
+        const docStatusText = Array.from(document.querySelectorAll(statusSelector))
           .filter(visible)
           .map(element => [
             element.textContent || '',
@@ -3981,64 +4055,103 @@ async function withTimeout(promise, timeoutMs, label) {
           url: location.href,
           title: document.title || '',
           currentDocId,
+          currentDocMajor: currentDocInfo?.[2] || '',
+          currentDocMinor: currentDocInfo?.[3] || '',
           dialogVisible,
           binderRowCount: binderRows.length,
           binderRows: binderRows.slice(0, 5),
           editBinderVisible: Array.from(document.querySelectorAll('.vv-edit-binder')).some(visible),
           docStatusText: docStatusText.slice(0, 5),
-          docStatusIsDraft: /(^|[\s_-])(Draft|ドラフト)($|[\s_-])/i.test(docStatusJoined),
+          docStatusIsDraft: /Draft|ドラフト|下書き/i.test(docStatusJoined),
         };
-      }, createDraftDialogSelector).catch(err => ({ error: String(err) }));
+      }, createDraftDialogSelector, binderRowSelector, docStatusSelector).catch(err => ({ error: String(err) }));
 
       const waitForBinderDraftToOpenSlide = async (previousUrl, previousDocId) => {
         console.log("Binderの下書き作成後、スライド画面への遷移を待っています。");
-        const waitResult = await Promise.race([
-          page.waitForNavigation({ waitUntil: ['load', 'networkidle2'], timeout: 120000 })
-            .then(() => ({ ok: true, reason: 'navigation' }))
-            .catch(e => ({ ok: false, reason: `navigation timeout: ${e.message}` })),
-          page.waitForFunction((dialogSelector, beforeUrl, beforeDocId) => {
-            const visible = element => {
-              const style = window.getComputedStyle(element);
-              const rect = element.getBoundingClientRect();
-              return rect.width > 0 &&
-                rect.height > 0 &&
-                style.visibility !== 'hidden' &&
-                style.display !== 'none';
-            };
-            const dialogVisible = Array.from(document.querySelectorAll(dialogSelector)).some(dialog => {
-              const text = [
-                dialog.querySelector('[data-corgix-internal="DIALOG-TITLE-CONTENT"]')?.textContent || '',
-                dialog.textContent || '',
-              ].join(' ');
-              return visible(dialog) && /Create\s*Draft|CreateDraft|下書きの作成/i.test(text);
-            });
-            const statusText = Array.from(document.querySelectorAll('.vv_docstatus_wrapper, .vv-doc-state-badge'))
-              .filter(visible)
-              .map(element => [
-                element.textContent || '',
-                ...Array.from(element.querySelectorAll('button, [title], [aria-activedescendant]')).map(child => [
-                  child.getAttribute('title') || '',
-                  child.getAttribute('aria-label') || '',
-                  child.getAttribute('aria-activedescendant') || '',
-                  child.textContent || '',
-                ].join(' ')),
-              ].join(' '))
-              .join(' ');
-            const draftStatusVisible = /(^|[\s_-])(Draft|ドラフト)($|[\s_-])/i.test(statusText);
-            const currentDocId = location.hash.match(/#?doc_info\/(\d+)/)?.[1] || '';
-            return dialogVisible ||
-              draftStatusVisible ||
-              (!!currentDocId && !!beforeDocId && currentDocId !== beforeDocId) ||
-              (!!beforeUrl && location.href !== beforeUrl);
-          }, { timeout: 120000 }, createDraftDialogSelector, previousUrl, previousDocId)
-            .then(() => ({ ok: true, reason: 'page state changed' }))
-            .catch(e => ({ ok: false, reason: `state timeout: ${e.message}` })),
-        ]);
-        await sleep(1500);
-        const state = await collectDraftPageState();
+        const waitResult = await page.waitForFunction((dialogSelector, rowSelector, statusSelector, beforeUrl, beforeDocId) => {
+          const visible = element => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.visibility !== 'hidden' &&
+              style.display !== 'none';
+          };
+          const dialogVisible = Array.from(document.querySelectorAll(dialogSelector)).some(dialog => {
+            const text = [
+              dialog.querySelector('[data-corgix-internal="DIALOG-TITLE-CONTENT"]')?.textContent || '',
+              dialog.textContent || '',
+            ].join(' ');
+            return visible(dialog) && /Create\s*Draft|CreateDraft|下書きの作成/i.test(text);
+          });
+          const statusText = Array.from(document.querySelectorAll(statusSelector))
+            .filter(visible)
+            .map(element => [
+              element.textContent || '',
+              ...Array.from(element.querySelectorAll('button, [title], [aria-activedescendant]')).map(child => [
+                child.getAttribute('title') || '',
+                child.getAttribute('aria-label') || '',
+                child.getAttribute('aria-activedescendant') || '',
+                child.textContent || '',
+              ].join(' ')),
+            ].join(' '))
+            .join(' ');
+          const draftStatusVisible = /Draft|ドラフト|下書き/i.test(statusText);
+          const currentDocInfo = location.hash.match(/#?doc_info\/(\d+)(?:\/(\d+))?(?:\/(\d+))?/);
+          const previousDocInfo = String(beforeUrl || '').match(/#doc_info\/(\d+)(?:\/(\d+))?(?:\/(\d+))?/);
+          const currentDocId = currentDocInfo?.[1] || '';
+          const docIdChanged = !!currentDocId && !!beforeDocId && currentDocId !== beforeDocId;
+          const docVersionChanged = !!currentDocInfo?.[1] &&
+            !!previousDocInfo?.[1] &&
+            currentDocInfo[1] === previousDocInfo[1] &&
+            (currentDocInfo[2] !== previousDocInfo[2] || currentDocInfo[3] !== previousDocInfo[3]);
+          const urlChanged = !!beforeUrl && location.href !== beforeUrl;
+          const binderRowsVisible = Array.from(document.querySelectorAll(rowSelector)).some(visible);
+          const editBinderVisible = Array.from(document.querySelectorAll('.vv-edit-binder')).some(visible);
+          return dialogVisible ||
+            draftStatusVisible ||
+            docIdChanged ||
+            docVersionChanged ||
+            (urlChanged && (binderRowsVisible || editBinderVisible));
+        }, { timeout: 120000 }, createDraftDialogSelector, binderRowSelector, docStatusSelector, previousUrl, previousDocId)
+          .then(() => ({ ok: true, reason: 'draft page ready' }))
+          .catch(e => ({ ok: false, reason: `state timeout: ${e.message}` }));
+        await sleep(waitResult.ok ? 1000 : 0);
+        let state = await collectDraftPageState();
+        state.docVersionChangedFromPrevious = docInfoVersionChanged(previousUrl, state.url);
+
+        if (state.docVersionChangedFromPrevious && !state.dialogVisible && !state.docStatusIsDraft && state.binderRowCount === 0 && !state.editBinderVisible) {
+          console.log("Binderの版数変更のみ確認できたため、現在のBinder下書きURLを開き直して画面状態を再取得します。");
+          try {
+            await page.goto(state.url, DCL);
+            await Promise.race([
+              page.waitForSelector(binderRowSelector, { timeout: 45000, visible: true }),
+              page.waitForSelector('.vv-edit-binder', { timeout: 45000, visible: true }),
+              page.waitForSelector(docStatusSelector, { timeout: 45000, visible: true }),
+              page.waitForSelector('li[data-target-key=doc_info_relationships__sys]', { timeout: 45000, visible: true }),
+            ]).catch(() => null);
+            await sleep(1000);
+            state = await collectDraftPageState();
+            state.docVersionChangedFromPrevious = docInfoVersionChanged(previousUrl, state.url);
+          } catch (e) {
+            console.log(red + `Binder下書きURLの開き直しに失敗しました: ${e.message}` + reset);
+          }
+        }
+
         console.log(`Binder下書き作成後の状態: ${JSON.stringify({ waitResult, state })}`);
-        if (!state.dialogVisible && !state.docStatusIsDraft && state.binderRowCount === 0 && (!state.currentDocId || state.currentDocId === previousDocId)) {
-          throw new Error(`Binderの下書き作成後にスライドへ遷移していません。状態: ${JSON.stringify(state)}`);
+        const urlChanged = !!previousUrl && !!state.url && state.url !== previousUrl;
+        const docIdChanged = !!state.currentDocId && !!previousDocId && state.currentDocId !== previousDocId;
+        const ready = state.dialogVisible ||
+          state.docStatusIsDraft ||
+          docIdChanged ||
+          state.docVersionChangedFromPrevious ||
+          (urlChanged && (state.binderRowCount > 0 || state.editBinderVisible));
+        if (!ready) {
+          await throwWithVaultDebug(
+            `Binderの下書き作成後にスライドへ遷移していません。状態: ${JSON.stringify(state)}`,
+            'binder-draft-not-ready',
+            { previousUrl, previousDocId, state }
+          );
         }
         return state;
       };
@@ -4050,7 +4163,7 @@ async function withTimeout(promise, timeoutMs, label) {
       const afterBinderDraftState = await waitForBinderDraftToOpenSlide(beforeBinderDraftUrl, sourceDocId);
       let binderDraftUrl = normalizeVeevaUrl(afterBinderDraftState.url || beforeBinderDraftUrl);
       if (!afterBinderDraftState.dialogVisible) {
-        if (afterBinderDraftState.binderRowCount > 0 || afterBinderDraftState.editBinderVisible || afterBinderDraftState.docStatusIsDraft) {
+        if (afterBinderDraftState.binderRowCount > 0 || afterBinderDraftState.editBinderVisible || afterBinderDraftState.docStatusIsDraft || afterBinderDraftState.docVersionChangedFromPrevious) {
           console.log("Binderドラフト画面内のスライドへ移動します。");
           await gotoSlideFromBinderList(baseUrl, NAME);
         }
@@ -4084,7 +4197,11 @@ async function withTimeout(promise, timeoutMs, label) {
       const afterDraftState = await collectDraftPageState();
       if (!currentDocId || (sourceDocId && currentDocId === sourceDocId) || afterDraftState.binderRowCount > 0 || afterDraftState.editBinderVisible) {
         const state = await visibleState();
-        throw new Error(`スライドの下書き作成後にスライド画面を確認できませんでした。現在URL: ${currentUrl} / BinderDocId: ${sourceDocId || '(なし)'} / 現在DocId: ${currentDocId || '(なし)'} / 画面状態: ${JSON.stringify(afterDraftState)} / UI状態: ${JSON.stringify(state)}`);
+        await throwWithVaultDebug(
+          `スライドの下書き作成後にスライド画面を確認できませんでした。現在URL: ${currentUrl} / BinderDocId: ${sourceDocId || '(なし)'} / 現在DocId: ${currentDocId || '(なし)'} / 画面状態: ${JSON.stringify(afterDraftState)} / UI状態: ${JSON.stringify(state)}`,
+          'slide-draft-not-confirmed',
+          { currentUrl, sourceDocId, currentDocId, afterDraftState, state }
+        );
       }
 
       console.log(`修正用スライドの下書き作成が完了しました: ${currentUrl}`);
@@ -4095,7 +4212,8 @@ async function withTimeout(promise, timeoutMs, label) {
     }
 
     async function gotoSlideFromBinderList(baseUrl, expectedName = '') {
-      const binderRowSelector = '.vv_library_list .binderDocRow, .vv_library_list .vv_veeva_document';
+      const binderRowSelector = '.vv_library_list .binderDocRow, .vv_library_list .vv_veeva_document, .vv_library_list .binderRow, .vv_library_list .vv-doc-compact-item';
+      let noVisibleRowState = null;
       let rowHandle = await waitForOptionalSelector(binderRowSelector, 8000, { visible: true });
       if (!rowHandle) {
         const editButton = await waitForOptionalSelector(".vv-edit-binder", 8000, { visible: true });
@@ -4106,7 +4224,21 @@ async function withTimeout(promise, timeoutMs, label) {
         }
       }
       if (!rowHandle) {
-        const state = await page.evaluate(() => {
+        const currentBinderUrl = page.url();
+        console.log("Binder内のスライド一覧がまだ見えないため、現在のBinder URLを開き直します。");
+        await page.goto(currentBinderUrl, DCL);
+        rowHandle = await waitForOptionalSelector(binderRowSelector, 30000, { visible: true });
+        if (!rowHandle) {
+          const editButton = await waitForOptionalSelector(".vv-edit-binder", 8000, { visible: true });
+          if (editButton) {
+            console.log("開き直し後にBinder編集画面を開きます。");
+            await clickWhenReady(".vv-edit-binder", LONG_WAIT);
+            rowHandle = await waitForOptionalSelector(binderRowSelector, LONG_WAIT, { visible: true });
+          }
+        }
+      }
+      if (!rowHandle) {
+        noVisibleRowState = await page.evaluate(() => {
           const visible = element => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -4123,7 +4255,7 @@ async function withTimeout(promise, timeoutMs, label) {
             bodyText: (document.body?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 800),
           };
         }).catch(err => ({ error: String(err) }));
-        throw new Error(`Binder内のスライド一覧を表示できませんでした。状態: ${JSON.stringify(state)}`);
+        console.log(red + `Binder内のスライド一覧を表示できませんでした。HTML全体からスライド候補を探索します。状態: ${JSON.stringify(noVisibleRowState)}` + reset);
       }
 
       const collectBinderRows = async () => page.evaluate(targetName => {
@@ -4134,7 +4266,7 @@ async function withTimeout(promise, timeoutMs, label) {
         const normalizeToken = value => String(value || '').replace(/\s+/g, ' ').trim();
         const expected = normalizeName(targetName);
 
-        return Array.from(document.querySelectorAll('.vv_library_list .binderDocRow, .vv_library_list .vv_veeva_document'))
+        return Array.from(document.querySelectorAll('.vv_library_list .binderDocRow, .vv_library_list .vv_veeva_document, .vv_library_list .binderRow, .vv_library_list .vv-doc-compact-item'))
           .map(row => {
             const docType = row.querySelector('.docType')?.textContent?.trim() || '';
             const name = row.querySelector('.docName')?.textContent?.trim() ||
@@ -4164,37 +4296,113 @@ async function withTimeout(promise, timeoutMs, label) {
           .filter(item => item.docId);
       }, expectedName);
 
-      await page.waitForFunction(targetName => {
+      const collectFallbackSlideCandidates = async () => page.evaluate((targetName, binderDocId) => {
         const normalizeName = value => String(value || '')
           .replace(/\s*\(v[\d.]+\)\s*$/i, '')
           .replace(/\s+/g, ' ')
           .trim();
+        const normalizeToken = value => String(value || '').replace(/\s+/g, ' ').trim();
         const expected = normalizeName(targetName);
-        return Array.from(document.querySelectorAll('.vv_library_list .binderDocRow, .vv_library_list .vv_veeva_document'))
-          .some(row => {
-            const docType = row.querySelector('.docType')?.textContent?.trim() || '';
-            const name = row.querySelector('.docName')?.textContent?.trim() ||
-              row.querySelector('.docNameLink')?.textContent?.trim() ||
-              '';
-            const href = row.querySelector('a.docNameLink[href*="#doc_info/"], a.docThumbnail[href*="#doc_info/"], a[href*="#doc_info/"]')?.getAttribute('href') || '';
-            const hrefMatch = href.match(/#doc_info\/(\d+)/);
-            const dockeyMatch = (row.getAttribute('dockey') || '').match(/^(\d+)-/);
-            const docId = hrefMatch?.[1] || dockeyMatch?.[1] || '';
-            const rowText = String(row.textContent || '').replace(/\s+/g, ' ').trim();
-            const isSlide = /スライド|slide/i.test(`${docType} ${row.getAttribute('class') || ''} ${rowText}`);
-            const nameMatched = !!expected && normalizeName(name) === expected;
-            return !!docId && (isSlide || nameMatched);
+        const currentDocId = location.hash.match(/#?doc_info\/(\d+)/)?.[1] || binderDocId || '';
+        const seen = new Set();
+        const candidates = [];
+
+        const addCandidate = (source, docId, href, container, anchor = null) => {
+          if (!docId || docId === currentDocId || seen.has(docId)) return;
+          seen.add(docId);
+          const docType = container?.querySelector?.('.docType')?.textContent?.trim() || '';
+          const name = container?.querySelector?.('.docName, .docNameLink, .vv_doc_title_name, .vv-search-result-name')?.textContent?.trim() ||
+            anchor?.getAttribute?.('title') ||
+            anchor?.textContent?.trim() ||
+            '';
+          const rowText = normalizeToken(container?.textContent || anchor?.textContent || '');
+          const hrefText = normalizeToken(href || '');
+          const classText = normalizeToken(`${container?.getAttribute?.('class') || ''} ${anchor?.getAttribute?.('class') || ''}`);
+          const typeText = normalizeToken(`${docType} ${classText} ${rowText} ${hrefText}`);
+          const normalizedName = normalizeName(name);
+          const isSlide = /Multichannel\s+Slide|スライド|slide|vv_mime_image|doc-thumbnail|doc-preview-thumbnail/i.test(typeText);
+          const nameMatched = !!expected && normalizedName === expected;
+          candidates.push({
+            source,
+            docId,
+            href: href || '',
+            docType,
+            name,
+            normalizedName,
+            rowText: rowText.slice(0, 500),
+            isSlide,
+            nameMatched,
           });
-      }, { timeout: LONG_WAIT }, expectedName).catch(() => null);
+        };
+
+        Array.from(document.querySelectorAll('a[href*="#doc_info/"], a[href*="doc_info/"]')).forEach(anchor => {
+          const href = anchor.getAttribute('href') || '';
+          const match = href.match(/#doc_info\/(\d+)/) || href.match(/doc_info\/(\d+)/);
+          const docId = match?.[1] || '';
+          const container = anchor.closest('.binderDocRow, .vv_veeva_document, .binderRow, .vv-doc-compact-item, li, tr, .normalDocDisplay, .vv_doc_compact') || anchor.parentElement;
+          const pointsToCurrentBinder = currentDocId && (href.includes(`bi=${currentDocId}`) || href.includes(`pi=${currentDocId}`));
+          addCandidate(pointsToCurrentBinder ? 'binder-link' : 'doc-info-link', docId, href, container, anchor);
+        });
+
+        Array.from(document.querySelectorAll('[dockey]')).forEach(element => {
+          const dockey = element.getAttribute('dockey') || '';
+          const docId = dockey.match(/^(\d+)-/)?.[1] || '';
+          addCandidate('dockey', docId, '', element, null);
+        });
+
+        return candidates
+          .filter(item => item.isSlide || item.nameMatched)
+          .sort((a, b) => {
+            if (a.nameMatched !== b.nameMatched) return a.nameMatched ? -1 : 1;
+            if (a.source !== b.source) return a.source === 'binder-link' ? -1 : 1;
+            return 0;
+          });
+      }, expectedName, parseDocInfoFromUrl(page.url()).docId);
+
+      if (rowHandle) {
+        await page.waitForFunction(targetName => {
+          const normalizeName = value => String(value || '')
+            .replace(/\s*\(v[\d.]+\)\s*$/i, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+          const expected = normalizeName(targetName);
+          return Array.from(document.querySelectorAll('.vv_library_list .binderDocRow, .vv_library_list .vv_veeva_document, .vv_library_list .binderRow, .vv_library_list .vv-doc-compact-item'))
+            .some(row => {
+              const docType = row.querySelector('.docType')?.textContent?.trim() || '';
+              const name = row.querySelector('.docName')?.textContent?.trim() ||
+                row.querySelector('.docNameLink')?.textContent?.trim() ||
+                '';
+              const href = row.querySelector('a.docNameLink[href*="#doc_info/"], a.docThumbnail[href*="#doc_info/"], a[href*="#doc_info/"]')?.getAttribute('href') || '';
+              const hrefMatch = href.match(/#doc_info\/(\d+)/);
+              const dockeyMatch = (row.getAttribute('dockey') || '').match(/^(\d+)-/);
+              const docId = hrefMatch?.[1] || dockeyMatch?.[1] || '';
+              const rowText = String(row.textContent || '').replace(/\s+/g, ' ').trim();
+              const isSlide = /Multichannel\s+Slide|スライド|slide/i.test(`${docType} ${row.getAttribute('class') || ''} ${rowText}`);
+              const nameMatched = !!expected && normalizeName(name) === expected;
+              return !!docId && (isSlide || nameMatched);
+            });
+        }, { timeout: LONG_WAIT }, expectedName).catch(() => null);
+      }
 
       const allCandidates = await collectBinderRows();
-      const slideCandidates = allCandidates.filter(item => item.isSlide || item.nameMatched);
+      let slideCandidates = allCandidates.filter(item => item.isSlide || item.nameMatched);
+      if (slideCandidates.length === 0) {
+        const fallbackCandidates = await collectFallbackSlideCandidates();
+        if (fallbackCandidates.length > 0) {
+          console.log(`HTML全体からBinder内スライド候補を取得しました: ${fallbackCandidates.map(candidate => `${candidate.docId}:${candidate.name || candidate.source}`).join(' / ')}`);
+          slideCandidates = fallbackCandidates;
+        }
+      }
 
       if (slideCandidates.length === 0) {
         const rowSummary = allCandidates.map(candidate => {
           return `${candidate.docId || '(idなし)'} / type=${candidate.docType || '(空)'} / name=${candidate.name || '(空)'} / text=${candidate.rowText || '(空)'}`;
         }).join(' || ');
-        throw new Error(`Binder内にスライドのドキュメント行が見つかりませんでした。候補行: ${rowSummary || 'なし'}`);
+        await throwWithVaultDebug(
+          `Binder内にスライドのドキュメント行が見つかりませんでした。候補行: ${rowSummary || 'なし'} / 表示状態: ${JSON.stringify(noVisibleRowState || {})}`,
+          'binder-slide-not-found',
+          { allCandidates, noVisibleRowState }
+        );
       }
 
       const nameMatchedCandidates = slideCandidates.filter(candidate => candidate.nameMatched);
@@ -4205,7 +4413,11 @@ async function withTimeout(promise, timeoutMs, label) {
         target = slideCandidates[0];
       } else {
         const candidateText = slideCandidates.map(candidate => `${candidate.docId}: ${candidate.name}`).join(' / ');
-        throw new Error(`Binder内のスライド候補が複数あり、対象を1件に絞れませんでした。候補: ${candidateText}`);
+        await throwWithVaultDebug(
+          `Binder内のスライド候補が複数あり、対象を1件に絞れませんでした。候補: ${candidateText}`,
+          'binder-slide-ambiguous',
+          { slideCandidates }
+        );
       }
 
       const slideUrl = `${baseUrl.replace(/\/$/, '')}/ui/#doc_info/${target.docId}`;
@@ -4666,7 +4878,11 @@ async function withTimeout(promise, timeoutMs, label) {
     } catch (err) {
       console.log(red + "エラーが発生した為、処理を終了します。" + reset);
       console.log(err);
-      return [status, page.url(), slideURL, err.toString()];
+      const errorText = err?.stack || err?.toString?.() || String(err);
+      const debugDir = errorText.includes('/ debug:')
+        ? ''
+        : await saveVaultDebugArtifact('vault-unhandled-error', { error: errorText });
+      return [status, page.url(), slideURL, debugDir ? `${err.toString()} / debug: ${debugDir}` : err.toString()];
     } finally {
       await withTimeout(page.close(), 10000, "ページ終了").catch(() => null);
     }
