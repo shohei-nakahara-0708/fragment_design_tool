@@ -307,7 +307,12 @@ async function withTimeout(promise, timeoutMs, label) {
     const presentationId_SELECTOR = 'textarea[name=crmPresentationId_b]';
 
 
-    const ACCESSCONTROL_SELECTOR = '#delegateAccessControl input';
+    const ACCESSCONTROL_SELECTOR = [
+      '#delegateAccessControl input',
+      '[class*="DelegateAccess-module__delegateAccessContainer"] input[role="combobox"]',
+      '[class*="DelegateAccess-module__userDropdown"] input[role="combobox"]',
+      'input[role="combobox"][placeholder="Choose User"]',
+    ].join(', ');
     const ACCESSCONTROL = 'arashimaru@msd.com';
 
 
@@ -346,8 +351,19 @@ async function withTimeout(promise, timeoutMs, label) {
     const STAGED_SUBMIT_SELECTOR = 'li[data-value=dynamicAction\\:stage]';
 
 
-    const MENU_CONTAINER_SELECTOR = 'ul.ui-autocomplete.ui-menu, ul.vv_vof_lookup_panel.ui-menu, ul.ui-menu.ui-autocomplete';
-    const MENU_ITEM_SELECTOR = 'li.ui-menu-item';
+    const MENU_CONTAINER_SELECTOR = [
+      'ul.ui-autocomplete.ui-menu',
+      'ul.vv_vof_lookup_panel.ui-menu',
+      'ul.ui-menu.ui-autocomplete',
+      '[role="listbox"]',
+      '[class*="Autocomplete-module__menu"]',
+      '[class*="Autocomplete-module__list"]',
+    ].join(', ');
+    const MENU_ITEM_SELECTOR = [
+      'li.ui-menu-item',
+      '[role="option"]',
+      '[class*="Autocomplete-module__option"]',
+    ].join(', ');
     const page = await browser.newPage();
     const DCL = { waitUntil: 'domcontentloaded' };
     const SHORT_WAIT = 3000;
@@ -1091,7 +1107,7 @@ async function withTimeout(promise, timeoutMs, label) {
     async function closeVisibleMenus() {
       await page.keyboard.press('Escape').catch(() => null);
       await page.evaluate(() => document.activeElement?.blur()).catch(() => null);
-      await waitForOptionalSelector('.ui-menu-item', SHORT_WAIT, { hidden: true });
+      await waitForOptionalSelector(MENU_ITEM_SELECTOR, SHORT_WAIT, { hidden: true });
     }
 
     function normalizeMenuText(text) {
@@ -1101,9 +1117,14 @@ async function withTimeout(promise, timeoutMs, label) {
         .toUpperCase();
     }
 
+    function compactMenuText(text) {
+      return normalizeMenuText(text).replace(/\s+/g, '');
+    }
+
     function menuTextMatchesTarget(text, expectedText) {
       const normalized = normalizeMenuText(text);
-      return normalized === expectedText;
+      const expected = normalizeMenuText(expectedText);
+      return normalized === expected || compactMenuText(normalized) === compactMenuText(expected);
     }
 
     function sleep(ms) {
@@ -1121,6 +1142,8 @@ async function withTimeout(promise, timeoutMs, label) {
             .trim()
             .replace(/\s+/g, ' ')
             .toUpperCase();
+          const compact = text => normalize(text).replace(/\s+/g, '');
+          const matchesExpected = text => normalize(text) === expectedText || compact(text) === compact(expectedText);
           const visibleCenterInput = selector => {
             const centerY = window.innerHeight / 2;
             const centerX = window.innerWidth / 2;
@@ -1193,8 +1216,8 @@ async function withTimeout(promise, timeoutMs, label) {
                 visible,
                 nearInput: menuInfo.nearInput,
                 dataText,
-                textMatches: normalize(text) === expectedText,
-                dataMatches: normalize(dataText) === expectedText || normalize(dataText).split(' ').includes(expectedText),
+                textMatches: matchesExpected(text),
+                dataMatches: matchesExpected(dataText) || normalize(dataText).split(' ').includes(expectedText),
                 hasAutocompleteData: !!dataText,
               };
             }))
@@ -1240,7 +1263,12 @@ async function withTimeout(promise, timeoutMs, label) {
               .trim()
               .replace(/\s+/g, ' ')
               .toUpperCase();
-            const matchesMenuText = text => expectedTexts.some(expectedText => normalize(text) === expectedText);
+            const compact = text => normalize(text).replace(/\s+/g, '');
+            const matchesMenuText = text => {
+              const normalized = normalize(text);
+              const compacted = compact(text);
+              return expectedTexts.some(expectedText => normalized === expectedText || compacted === compact(expectedText));
+            };
             const visibleCenterInput = selector => {
               const centerY = window.innerHeight / 2;
               const centerX = window.innerWidth / 2;
@@ -1340,7 +1368,12 @@ async function withTimeout(promise, timeoutMs, label) {
           .trim()
           .replace(/\s+/g, ' ')
           .toUpperCase();
-        const matchedIndexFor = text => expectedTexts.findIndex(expectedText => normalize(text) === expectedText);
+        const compact = text => normalize(text).replace(/\s+/g, '');
+        const matchedIndexFor = text => {
+          const normalized = normalize(text);
+          const compacted = compact(text);
+          return expectedTexts.findIndex(expectedText => normalized === expectedText || compacted === compact(expectedText));
+        };
         const visibleCenterInput = selector => {
           const centerY = window.innerHeight / 2;
           const centerX = window.innerWidth / 2;
@@ -1416,7 +1449,7 @@ async function withTimeout(promise, timeoutMs, label) {
               const itemDataText = itemData && typeof itemData === 'object'
                 ? [itemData.value, itemData.label, itemData.name, itemData.text].filter(Boolean).join(' ')
                 : String(itemData || '');
-              const itemDataMatches = normalize(itemDataText) === expectedTexts[0] ||
+              const itemDataMatches = matchedIndexFor(itemDataText) >= 0 ||
                 normalize(itemDataText).split(' ').includes(expectedTexts[0]);
               const matches = (!inputRect || menuInfo.nearInput) &&
                 rect.width > 0 &&
@@ -1564,6 +1597,9 @@ async function withTimeout(promise, timeoutMs, label) {
             .trim()
             .replace(/\s+/g, ' ')
             .toUpperCase();
+          const expected = normalize(expectedText);
+          const compact = text => normalize(text).replace(/\s+/g, '');
+          const matchesExpected = text => normalize(text) === expected || compact(text) === compact(expected);
           const visible = element => {
             if (!element) return false;
             const style = window.getComputedStyle(element);
@@ -1573,7 +1609,6 @@ async function withTimeout(promise, timeoutMs, label) {
               style.visibility !== 'hidden' &&
               style.display !== 'none';
           };
-          const expected = normalize(expectedText);
           const marker = document.querySelector('[data-lecture-active-lookup="true"]');
           const active = document.activeElement;
           const input = marker?.matches?.(fieldSelector) ? marker : active?.matches?.(fieldSelector) ? active : null;
@@ -1612,7 +1647,7 @@ async function withTimeout(promise, timeoutMs, label) {
                 itemIndex,
                 menuIndex: menuInfo.menuIndex,
                 text,
-                matches: visible(target) && normalize(text) === expected && (!inputRect || menuInfo.nearInput),
+                matches: visible(target) && matchesExpected(text) && (!inputRect || menuInfo.nearInput),
                 nearInput: menuInfo.nearInput,
                 distance: menuInfo.distance,
                 zIndex: menuInfo.zIndex,
@@ -2004,14 +2039,15 @@ async function withTimeout(promise, timeoutMs, label) {
       }
       try {
         await page.waitForFunction(
-          (selector, expected, baselineHiddenValues, baselineSelectedText, requireSelectedText) => {
+          (selector, menuItemSelector, expected, baselineHiddenValues, baselineSelectedText, requireSelectedText) => {
             const normalize = text => String(text || '')
               .trim()
               .replace(/\s+/g, ' ')
               .toUpperCase();
+            const compact = text => normalize(text).replace(/\s+/g, '');
             const matchesExpected = text => {
               const normalized = normalize(text);
-              if (normalized === expected) return true;
+              if (normalized === expected || compact(normalized) === compact(expected)) return true;
               const escaped = expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
               return new RegExp(`(^|[^A-Z0-9])${escaped}($|[^A-Z0-9])`).test(normalized);
             };
@@ -2026,7 +2062,7 @@ async function withTimeout(promise, timeoutMs, label) {
               .map(element => element.value)
               .filter(Boolean);
             const hiddenChanged = hiddenValues.join('|') !== (baselineHiddenValues || []).join('|');
-            const visibleMenus = Array.from(document.querySelectorAll('.ui-menu-item')).filter(element => {
+            const visibleMenus = Array.from(document.querySelectorAll(menuItemSelector)).filter(element => {
               const style = window.getComputedStyle(element);
               const rect = element.getBoundingClientRect();
               return rect.width > 0 &&
@@ -2055,7 +2091,7 @@ async function withTimeout(promise, timeoutMs, label) {
               );
             });
             const hasSelectedText = values.some(value => matchesExpected(value));
-            const inputHasUncommittedText = normalize(input?.value || '') === expected;
+            const inputHasUncommittedText = matchesExpected(input?.value || '');
             const committedBySelectedText = hasSelectedText && hiddenValues.length > 0;
             const committedByHiddenChange = !requireSelectedText &&
               hiddenValues.length > 0 &&
@@ -2065,6 +2101,7 @@ async function withTimeout(promise, timeoutMs, label) {
           },
           { timeout: NORMAL_WAIT },
           inputSelector,
+          MENU_ITEM_SELECTOR,
           normalizeMenuText(targetText),
           lookupBaseline?.hiddenValues || [],
           lookupBaseline?.selectedText || '',
@@ -2131,8 +2168,8 @@ async function withTimeout(promise, timeoutMs, label) {
         document.activeElement?.blur();
       }).catch(() => null);
       try {
-        await page.waitForFunction(() => {
-          return !Array.from(document.querySelectorAll('.ui-menu-item')).some(element => {
+        await page.waitForFunction(menuItemSelector => {
+          return !Array.from(document.querySelectorAll(menuItemSelector)).some(element => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
             return rect.width > 0 &&
@@ -2140,7 +2177,7 @@ async function withTimeout(promise, timeoutMs, label) {
               style.visibility !== 'hidden' &&
               style.display !== 'none';
           });
-        }, { timeout: SHORT_WAIT });
+        }, { timeout: SHORT_WAIT }, MENU_ITEM_SELECTOR);
       } catch (e) {
         await page.keyboard.press('Escape');
         await page.evaluate(() => document.activeElement?.blur());
@@ -2151,24 +2188,72 @@ async function withTimeout(promise, timeoutMs, label) {
       const expected = normalizeMenuText(expectedUser);
       try {
         await page.waitForFunction(
-          expectedText => {
+          (expectedText, delegateSelector) => {
             const normalize = text => String(text || '')
               .trim()
               .replace(/\s+/g, ' ')
               .toUpperCase();
+            const compact = text => normalize(text).replace(/\s+/g, '');
+            const matchesExpected = text => {
+              const normalized = normalize(text);
+              const compacted = compact(text);
+              const compactedExpected = compact(expectedText);
+              return normalized === expectedText ||
+                normalized.includes(expectedText) ||
+                compacted === compactedExpected ||
+                compacted.includes(compactedExpected);
+            };
             const username = normalize(document.querySelector(".vv_username")?.textContent || '');
-            return username === expectedText || username.includes(expectedText);
+            if (matchesExpected(username)) return true;
+
+            const delegateInput = document.querySelector(delegateSelector);
+            const delegateRoot = delegateInput?.closest('[class*="DelegateAccess-module__delegateAccessContainer"]') ||
+              delegateInput?.closest('#delegateAccessControl') ||
+              delegateInput?.parentElement;
+            const values = [
+              delegateInput?.value,
+              delegateInput?.getAttribute('title'),
+              delegateInput?.getAttribute('aria-label'),
+              delegateRoot?.textContent,
+              delegateRoot?.getAttribute('title'),
+              delegateRoot?.getAttribute('aria-label'),
+            ];
+            delegateRoot?.querySelectorAll?.('input, [title], [aria-label], [data-label], [data-value], [data-name], [data-text]').forEach(element => {
+              values.push(
+                element.value,
+                element.textContent,
+                element.getAttribute('title'),
+                element.getAttribute('aria-label'),
+                element.getAttribute('data-label'),
+                element.getAttribute('data-value'),
+                element.getAttribute('data-name'),
+                element.getAttribute('data-text')
+              );
+            });
+            return values.some(value => matchesExpected(value));
           },
           { timeout },
-          expected
+          expected,
+          ACCESSCONTROL_SELECTOR
         );
       } catch (e) {
-        const state = await page.evaluate(() => ({
-          url: location.href,
-          username: (document.querySelector(".vv_username")?.textContent || '').trim(),
-          searchBoxVisible: !!document.querySelector("#search_main_box"),
-          delegateInputValue: document.querySelector("#delegateAccessControl input")?.value || '',
-        })).catch(err => ({ error: String(err) }));
+        const state = await page.evaluate(delegateSelector => {
+          const delegateInputs = Array.from(document.querySelectorAll(delegateSelector));
+          const delegateInput = delegateInputs[0] || null;
+          const delegateRoot = delegateInput?.closest('[class*="DelegateAccess-module__delegateAccessContainer"]') ||
+            delegateInput?.closest('#delegateAccessControl') ||
+            delegateInput?.parentElement;
+          return {
+            url: location.href,
+            username: (document.querySelector(".vv_username")?.textContent || '').trim(),
+            searchBoxVisible: !!document.querySelector("#search_main_box"),
+            delegateInputCount: delegateInputs.length,
+            delegateInputValue: delegateInput?.value || '',
+            delegateInputPlaceholder: delegateInput?.getAttribute('placeholder') || '',
+            delegateRootText: (delegateRoot?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 500),
+            delegateRootClassName: String(delegateRoot?.className || '').slice(0, 200),
+          };
+        }, ACCESSCONTROL_SELECTOR).catch(err => ({ error: String(err) }));
         throw new Error(`代理アクセスユーザーへの切り替えを確認できませんでした。現在の状態: ${JSON.stringify(state)}`);
       }
     }
@@ -2181,21 +2266,133 @@ async function withTimeout(promise, timeoutMs, label) {
       await page.waitForSelector(".generatingRenditionSpinner", { hidden: true, timeout });
     }
 
-    async function getSearchResultSummary(baseUrl) {
-      return page.evaluate(vaultUrl => {
-        const paginatorText = document.querySelector(".vv-expanded-search-paginator")?.textContent?.trim() || '';
-        const gridText = document.querySelector(".vv-document-search-vcl-data-grid")?.textContent?.trim() || '';
-        const normalizedGridText = gridText.toLowerCase();
-        const noItems = /no items found|no results found|no documents found|項目はありません|該当する項目はありません|検索結果はありません/.test(normalizedGridText);
-        const linkIds = Array.from(document.querySelectorAll(".vv-document-search-vcl-data-grid a"))
-          .map(link => {
-            const dataLinkId = link.getAttribute("data-linkid") || '';
-            if (dataLinkId) return dataLinkId;
-            const href = link.getAttribute("href") || '';
-            return href.match(/#doc_info\/(\d+)/)?.[1] || '';
+    async function getSearchResultSummary(baseUrl, searchName = '') {
+      return page.evaluate((vaultUrl, expectedSearchName) => {
+        const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
+        const normalizeUpper = value => normalize(value).toUpperCase();
+        const expected = normalizeUpper(expectedSearchName);
+        const isVisible = element => {
+          if (!element) return false;
+          const rect = element.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) return false;
+          let current = element;
+          while (current && current.nodeType === 1) {
+            const style = window.getComputedStyle(current);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+            current = current.parentElement;
+          }
+          return true;
+        };
+        const visibleText = element => normalize(element?.innerText || element?.textContent || '');
+        const firstVisibleText = selectors => selectors
+          .flatMap(selector => Array.from(document.querySelectorAll(selector)))
+          .filter(isVisible)
+          .map(visibleText)
+          .find(Boolean) || '';
+        const gridSelectors = [
+          '.vv-document-search-vcl-data-grid',
+          '[class*="DocumentSearch"]',
+          '[class*="SearchResults"]',
+          '[class*="ResultsGrid"]',
+          '[class*="DataGrid"]',
+          '[role="grid"]',
+          '[role="table"]',
+        ];
+        const rowSelectors = [
+          '.vv-document-search-vcl-data-grid tr',
+          '.vv-document-search-vcl-data-grid .vv_grid_row',
+          '.vv-document-search-vcl-data-grid [role=row]',
+          '[role="grid"] [role="row"]',
+          '[role="table"] [role="row"]',
+          '[class*="SearchResults"] [role="row"]',
+          '[class*="DataGrid"] [role="row"]',
+          '[class*="GridRow"]',
+          '[class*="gridRow"]',
+        ];
+        const docInfoLinkSelector = [
+          'a[href*="#doc_info/"]',
+          'a[href*="doc_info/"]',
+          'a[data-linkid]',
+          '[data-linkid]',
+          '[data-doc-id]',
+          '[data-document-id]',
+          '[dockey]',
+        ].join(', ');
+        const paginatorText = firstVisibleText([
+          '.vv-expanded-search-paginator',
+          '[class*="Paginator"]',
+          '[class*="Pagination"]',
+          '[aria-label*="pagination" i]',
+        ]);
+        const gridElements = gridSelectors
+          .flatMap(selector => Array.from(document.querySelectorAll(selector)))
+          .filter(isVisible);
+        const gridText = gridElements.map(visibleText).find(Boolean) || '';
+        const searchSurface = gridElements.find(element => {
+          const text = normalizeUpper(visibleText(element));
+          return /PRESENTATION|DOCUMENT|CRM PRODUCT|STATUS|NAME|検索|RESULT/i.test(text) || (expected && text.includes(expected));
+        }) || gridElements[0] || document.body;
+        const bodyVisibleText = visibleText(document.body).slice(0, 8000);
+        const noItemsText = [paginatorText, gridText, visibleText(searchSurface)]
+          .join(' ')
+          .toLowerCase();
+        const noItems = /no items found|no results found|no documents found|no matching documents|0\s+results|項目はありません|該当する項目はありません|検索結果はありません/.test(noItemsText);
+        const loadingVisible = Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], .loading, .vv_loading, .vv-loader, [class*="Loading"], [class*="Spinner"], [class*="loading"], [class*="spinner"]'))
+          .some(element => isVisible(element) && /loading|spinner|読み込み|ロード/i.test(`${element.getAttribute('class') || ''} ${element.getAttribute('aria-label') || ''} ${visibleText(element)}`));
+        const docIdFrom = element => {
+          const dataLinkId = element.getAttribute('data-linkid') || '';
+          if (/^\d+$/.test(dataLinkId)) return dataLinkId;
+          const dataDocId = element.getAttribute('data-doc-id') || element.getAttribute('data-document-id') || '';
+          if (/^\d+$/.test(dataDocId)) return dataDocId;
+          const dockey = element.getAttribute('dockey') || element.closest('[dockey]')?.getAttribute('dockey') || '';
+          const dockeyId = dockey.match(/^(\d+)-/)?.[1] || '';
+          if (dockeyId) return dockeyId;
+          const href = element.getAttribute('href') || element.closest('a[href]')?.getAttribute('href') || '';
+          return href.match(/#doc_info\/(\d+)/)?.[1] || href.match(/doc_info\/(\d+)/)?.[1] || '';
+        };
+        const linkRows = Array.from((searchSurface || document).querySelectorAll(docInfoLinkSelector))
+          .map(element => {
+            const row = element.closest('tr, [role="row"], .vv_grid_row, [class*="GridRow"], [class*="gridRow"], .vv_veeva_document, li') || element;
+            const text = visibleText(row);
+            const docId = docIdFrom(element);
+            return {
+              docId,
+              text,
+              visible: isVisible(element) || isVisible(row),
+            };
           })
-          .filter(Boolean);
+          .filter(item => item.docId && item.visible);
+        const linkIds = linkRows.map(item => item.docId);
+        if (linkIds.length === 0 && searchSurface !== document.body) {
+          Array.from(document.querySelectorAll(docInfoLinkSelector)).forEach(element => {
+            const row = element.closest('tr, [role="row"], .vv_grid_row, [class*="GridRow"], [class*="gridRow"], .vv_veeva_document, li') || element;
+            const text = visibleText(row);
+            const docId = docIdFrom(element);
+            if (docId && (isVisible(element) || isVisible(row))) {
+              linkRows.push({ docId, text, visible: true });
+              linkIds.push(docId);
+            }
+          });
+        }
         const uniqueLinkIds = Array.from(new Set(linkIds));
+        const isHeaderRow = text => {
+          const upper = normalizeUpper(text);
+          return /NAME.*CRM PRODUCT.*STATUS.*PRESENTATION ID/.test(upper) ||
+            /PRESENTATION ID.*DOCUMENT ID.*CRM DETAIL GROUP/.test(upper);
+        };
+        const rowTexts = rowSelectors
+          .flatMap(selector => Array.from(document.querySelectorAll(selector)))
+          .filter(isVisible)
+          .map(visibleText)
+          .concat(linkRows.map(item => item.text))
+          .map(normalize)
+          .filter(Boolean)
+          .filter((text, index, self) => self.indexOf(text) === index)
+          .filter(text => !isHeaderRow(text))
+          .slice(0, 20);
+        const matchedRows = expected
+          ? rowTexts.filter(text => normalizeUpper(text).includes(expected))
+          : [];
         const normalizeNumber = value => String(value || '')
           .replace(/[０-９]/g, char => String.fromCharCode(char.charCodeAt(0) - 0xFEE0))
           .replace(/,/g, '');
@@ -2204,26 +2401,230 @@ async function withTimeout(promise, timeoutMs, label) {
           ? paginatorText.match(/[\/／]\s*(?:約\s*)?([０-９\d,]+)\+?\s*$/)
           : null;
         const countMatch = ofCountMatch || slashCountMatch;
+        const hasResultHeader = /NAME\s*CRM PRODUCT|PRESENTATION ID|DOCUMENT ID|CRM DETAIL GROUP/i.test(gridText || bodyVisibleText);
+        const emptyVisibleGrid = hasResultHeader && !loadingVisible && uniqueLinkIds.length === 0 && matchedRows.length === 0;
         const count = countMatch
           ? Number(normalizeNumber(countMatch[1]))
           : noItems
             ? 0
             : uniqueLinkIds.length > 0
               ? uniqueLinkIds.length
-              : null;
+              : matchedRows.length > 0
+                ? matchedRows.length
+                : emptyVisibleGrid
+                  ? 0
+                  : null;
 
         return {
           count,
-          countSource: ofCountMatch ? 'paginator-of' : slashCountMatch ? 'paginator-slash' : noItems ? 'no-items' : uniqueLinkIds.length > 0 ? 'grid-links' : 'unknown',
+          countSource: ofCountMatch
+            ? 'paginator-of'
+            : slashCountMatch
+              ? 'paginator-slash'
+              : noItems
+                ? 'no-items'
+                : uniqueLinkIds.length > 0
+                  ? 'doc-info-links'
+                  : matchedRows.length > 0
+                    ? 'matched-visible-rows'
+                    : emptyVisibleGrid
+                      ? 'empty-visible-grid'
+                      : 'unknown',
           paginatorText,
           gridText,
-          resultRows: Array.from(document.querySelectorAll(".vv-document-search-vcl-data-grid tr, .vv-document-search-vcl-data-grid .vv_grid_row, .vv-document-search-vcl-data-grid [role=row]"))
-            .map(row => (row.textContent || '').replace(/\s+/g, ' ').trim())
-            .filter(Boolean)
-            .slice(0, 10),
+          bodyText: bodyVisibleText.slice(0, 1200),
+          loadingVisible,
+          resultRows: rowTexts.slice(0, 10),
           urls: uniqueLinkIds.map(id => `${vaultUrl}/ui/#doc_info/${id}`),
         };
-      }, baseUrl);
+      }, baseUrl, searchName);
+    }
+
+    function escapeVqlString(value) {
+      return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    }
+
+    async function getVaultApiVersions() {
+      const versionText = await page.evaluate(() => String(window.VAULT_I18N_HASH || '')).catch(() => '');
+      const current = versionText.match(/(\d+\.\d+)/)?.[1] || '';
+      return Array.from(new Set([
+        current ? `v${current}` : '',
+        'v26.2',
+        'v26.1',
+        'v25.3',
+        'v24.3',
+      ].filter(Boolean)));
+    }
+
+    async function getVaultApiAuthCandidates(baseUrl) {
+      const cookies = await page.cookies(baseUrl).catch(() => []);
+      const cookieCandidates = cookies
+        .filter(cookie => /session|vault|auth|token|sid/i.test(cookie.name || '') || String(cookie.value || '').length >= 24)
+        .map(cookie => String(cookie.value || '').trim())
+        .filter(value => value.length >= 20);
+      const storageCandidates = await page.evaluate(() => {
+        const values = [];
+        const collect = storage => {
+          if (!storage) return;
+          for (let i = 0; i < storage.length; i += 1) {
+            const key = storage.key(i) || '';
+            const value = storage.getItem(key) || '';
+            if (/session|vault|auth|token|sid/i.test(key) && value.length >= 20) {
+              values.push(value);
+            }
+          }
+        };
+        collect(window.localStorage);
+        collect(window.sessionStorage);
+        return values;
+      }).catch(() => []);
+      return Array.from(new Set(['', ...cookieCandidates, ...storageCandidates])).slice(0, 12);
+    }
+
+    async function callVaultApi(baseUrl, pathname, options = {}) {
+      const authCandidates = await getVaultApiAuthCandidates(baseUrl);
+      return page.evaluate(async (path, requestOptions, candidates) => {
+        const attempts = [];
+        for (const auth of candidates) {
+          const headers = {
+            Accept: 'application/json',
+            ...(requestOptions.headers || {}),
+          };
+          if (auth) headers.Authorization = auth;
+          try {
+            const response = await fetch(path, {
+              method: requestOptions.method || 'GET',
+              credentials: 'include',
+              headers,
+              body: requestOptions.body || undefined,
+            });
+            const text = await response.text();
+            let json = null;
+            try {
+              json = JSON.parse(text);
+            } catch (e) {
+              json = null;
+            }
+            attempts.push({
+              status: response.status,
+              ok: response.ok,
+              responseStatus: json?.responseStatus || '',
+              errors: json?.errors || json?.responseDetails?.errors || [],
+              text: text.slice(0, 500),
+              usedAuthorization: !!auth,
+            });
+            if (response.ok && json?.responseStatus === 'SUCCESS') {
+              return {
+                ok: true,
+                json,
+                status: response.status,
+                usedAuthorization: !!auth,
+                attempts,
+              };
+            }
+          } catch (e) {
+            attempts.push({
+              status: 0,
+              ok: false,
+              responseStatus: '',
+              errors: [String(e)],
+              text: '',
+              usedAuthorization: !!auth,
+            });
+          }
+        }
+        return {
+          ok: false,
+          attempts,
+        };
+      }, pathname, options, authCandidates);
+    }
+
+    function collectDocumentFieldCandidates(metadataJson) {
+      const fields = [];
+      const visit = value => {
+        if (!value || typeof value !== 'object') return;
+        if (typeof value.name === 'string') {
+          const label = String(value.label || value.label_plural || value.localized_label || '');
+          const name = value.name;
+          const searchable = `${name} ${label}`.toLowerCase();
+          if (/presentation/.test(searchable) && /\bid\b|_id|id__|id_/.test(searchable)) {
+            fields.push(name);
+          }
+        }
+        Object.values(value).forEach(visit);
+      };
+      visit(metadataJson);
+      return Array.from(new Set(fields));
+    }
+
+    async function searchExistingDocumentByApi(searchName, baseUrl) {
+      const expectedSearchName = String(searchName || '').trim();
+      if (!expectedSearchName) return null;
+      const versions = await getVaultApiVersions();
+      const escaped = escapeVqlString(expectedSearchName);
+      const defaultFields = [
+        'crmPresentationId_b',
+        'crmpresentationid_b',
+        'crm_presentation_id__c',
+        'crm_presentation_id__v',
+        'presentation_id__c',
+        'presentation_id__v',
+      ];
+      let lastError = '';
+
+      for (const version of versions) {
+        let fieldCandidates = [...defaultFields];
+        const metadata = await callVaultApi(baseUrl, `/api/${version}/metadata/objects/documents/properties`);
+        if (metadata.ok) {
+          fieldCandidates = Array.from(new Set([
+            ...collectDocumentFieldCandidates(metadata.json),
+            ...fieldCandidates,
+          ]));
+        } else {
+          lastError = `metadata ${version}: ${metadata.attempts?.map(item => item.status || item.responseStatus || 'error').join('/') || 'failed'}`;
+        }
+
+        for (const fieldName of fieldCandidates) {
+          const q = `SELECT id, name__v, ${fieldName} FROM documents WHERE ${fieldName} = '${escaped}'`;
+          const apiResult = await callVaultApi(baseUrl, `/api/${version}/query`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'X-VaultAPI-DescribeQuery': 'true',
+            },
+            body: new URLSearchParams({ q }).toString(),
+          });
+          if (!apiResult.ok) {
+            lastError = `query ${version}/${fieldName}: ${apiResult.attempts?.map(item => item.responseStatus || item.status || 'error').join('/') || 'failed'}`;
+            continue;
+          }
+
+          const records = Array.isArray(apiResult.json?.data) ? apiResult.json.data : [];
+          const total = Number(apiResult.json?.responseDetails?.total ?? records.length);
+          const ids = records
+            .map(record => record.id)
+            .filter(Boolean)
+            .map(String);
+          console.log(`VQLで既存登録を確認しました: ${fieldName}="${expectedSearchName}" / ${total}件`);
+          return {
+            count: Number.isFinite(total) ? total : records.length,
+            countSource: `vql-${fieldName}`,
+            paginatorText: '',
+            gridText: '',
+            bodyText: '',
+            loadingVisible: false,
+            resultRows: records.map(record => `${record.id || ''} ${record.name__v || ''}`.trim()).filter(Boolean).slice(0, 10),
+            urls: ids.map(id => `${baseUrl.replace(/\/$/, '')}/ui/#doc_info/${id}`),
+            searchName: expectedSearchName,
+            verified: true,
+            inputValue: expectedSearchName,
+          };
+        }
+      }
+
+      console.log(`VQLで既存登録を確認できませんでした。UI検索にフォールバックします: ${lastError || 'no successful query'}`);
+      return null;
     }
 
 
@@ -2244,6 +2645,84 @@ async function withTimeout(promise, timeoutMs, label) {
       let lastSummary = null;
       let lastInputValue = '';
       let lastError = '';
+
+      const apiSummary = await searchExistingDocumentByApi(expectedSearchName, baseUrl).catch(e => {
+        console.log(`VQL既存登録チェックで例外が発生しました。UI検索にフォールバックします: ${e.message}`);
+        return null;
+      });
+      if (apiSummary?.verified && apiSummary.count !== null) {
+        return apiSummary;
+      }
+
+      async function normalizeDuplicateSearchRoute() {
+        const routeState = await page.evaluate(expected => {
+          const normalize = value => String(value || '').trim();
+          if (!location.hash.includes('/advSearch')) {
+            return {
+              changed: false,
+              reason: 'not-advanced-search',
+              hash: location.hash,
+            };
+          }
+          const [hashPath, queryString = ''] = location.hash.split('?');
+          const params = new URLSearchParams(queryString);
+          let changed = false;
+
+          const deleteContentScope = key => {
+            if (normalize(params.get(key)).toUpperCase() === 'CONTENT') {
+              params.delete(key);
+              changed = true;
+            }
+          };
+          Array.from(params.keys())
+            .filter(key => /^frsc\d*$/i.test(key))
+            .forEach(deleteContentScope);
+
+          if (params.get('ivv') !== 'DETAIL') {
+            params.set('ivv', 'DETAIL');
+            changed = true;
+          }
+
+          const decodedSearch = (() => {
+            const raw = params.get('search') || '';
+            try {
+              return JSON.parse(decodeURIComponent(raw));
+            } catch (e) {
+              try {
+                return JSON.parse(raw);
+              } catch (err) {
+                return null;
+              }
+            }
+          })();
+          if (!decodedSearch || normalize(decodedSearch.text) !== expected) {
+            params.set('search', encodeURIComponent(JSON.stringify({ text: expected })));
+            changed = true;
+          }
+
+          if (!changed) {
+            return {
+              changed: false,
+              reason: 'already-normalized',
+              hash: location.hash,
+            };
+          }
+
+          const nextHash = `${hashPath}?${params.toString()}`;
+          location.hash = nextHash;
+          return {
+            changed: true,
+            hash: nextHash,
+          };
+        }, expectedSearchName).catch(err => ({ changed: false, reason: String(err) }));
+
+        if (routeState.changed) {
+          console.log(`既存登録検索URLを軽量化しました: ${routeState.hash}`);
+          await sleep(1500);
+        }
+        return routeState;
+      }
+
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
           await clearAndType("#search_main_box", expectedSearchName, { delay: attempt === 1 ? 120 : 200 });
@@ -2261,23 +2740,60 @@ async function withTimeout(promise, timeoutMs, label) {
           continue;
         }
 
-        const beforeSummary = await getSearchResultSummary(baseUrl).catch(() => null);
+        const beforeSummary = await getSearchResultSummary(baseUrl, expectedSearchName).catch(() => null);
         console.log(`${expectedSearchName}で既存登録を検索します。(${attempt}/3)`);
         await page.click("#search_main_button");
+        await page.waitForFunction(() => location.hash.includes('/advSearch'), { timeout: 10000 }).catch(() => null);
+        await normalizeDuplicateSearchRoute();
 
         try {
-          await page.waitForFunction((expected, previousGridText, previousPaginatorText) => {
+          await page.waitForFunction((expected, previousGridText, previousPaginatorText, startedAt) => {
+            const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
+            const visible = element => {
+              if (!element) return false;
+              const rect = element.getBoundingClientRect();
+              if (rect.width <= 0 || rect.height <= 0) return false;
+              let current = element;
+              while (current && current.nodeType === 1) {
+                const style = window.getComputedStyle(current);
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                current = current.parentElement;
+              }
+              return true;
+            };
+            const visibleText = element => normalize(element?.innerText || element?.textContent || '');
             const inputValue = document.querySelector("#search_main_box")?.value?.trim() || '';
             if (inputValue !== expected) return false;
-            const paginatorText = document.querySelector(".vv-expanded-search-paginator")?.textContent || '';
-            const gridText = document.querySelector(".vv-document-search-vcl-data-grid")?.textContent || '';
+            const paginatorText = visibleText(document.querySelector(".vv-expanded-search-paginator"));
+            const gridElements = [
+              '.vv-document-search-vcl-data-grid',
+              '[class*="DocumentSearch"]',
+              '[class*="SearchResults"]',
+              '[class*="ResultsGrid"]',
+              '[class*="DataGrid"]',
+              '[role="grid"]',
+              '[role="table"]',
+            ].flatMap(selector => Array.from(document.querySelectorAll(selector))).filter(visible);
+            const gridText = gridElements.map(visibleText).find(Boolean) || '';
+            const searchSurface = gridElements[0] || document.body;
+            const surfaceText = visibleText(searchSurface);
+            const hasVisibleDocLink = Array.from(searchSurface.querySelectorAll('a[href*="#doc_info/"], a[href*="doc_info/"], a[data-linkid], [data-linkid], [data-doc-id], [data-document-id], [dockey]'))
+              .some(element => visible(element) || visible(element.closest('tr, [role="row"], .vv_grid_row, [class*="GridRow"], [class*="gridRow"], .vv_veeva_document, li')));
+            const loadingVisible = Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"], .loading, .vv_loading, .vv-loader, [class*="Loading"], [class*="Spinner"], [class*="loading"], [class*="spinner"]'))
+              .some(element => visible(element) && /loading|spinner|読み込み|ロード/i.test(`${element.getAttribute('class') || ''} ${element.getAttribute('aria-label') || ''} ${visibleText(element)}`));
+            const hasResultHeader = /NAME\s*CRM PRODUCT|PRESENTATION ID|DOCUMENT ID|CRM DETAIL GROUP/i.test(`${gridText} ${surfaceText}`);
             const resultReady = /of\s+(?:about\s+)?[\d,]+/i.test(paginatorText) ||
               /[\/／]\s*(?:約\s*)?[０-９\d,]+\+?\s*$/.test(paginatorText) ||
-              /no items found|no results found|no documents found|項目はありません|該当する項目はありません|検索結果はありません/i.test(gridText) ||
-              !!document.querySelector(".vv-document-search-vcl-data-grid a[data-linkid]");
+              /no items found|no results found|no documents found|no matching documents|0\s+results|項目はありません|該当する項目はありません|検索結果はありません/i.test(`${gridText} ${surfaceText}`) ||
+              hasVisibleDocLink ||
+              (Date.now() - startedAt > 12000 && hasResultHeader && !loadingVisible);
             if (!resultReady) return false;
-            return gridText !== previousGridText || paginatorText !== previousPaginatorText || /no items found|no results found|no documents found|項目はありません|該当する項目はありません|検索結果はありません/i.test(gridText);
-          }, { timeout: 45000 }, expectedSearchName, beforeSummary?.gridText || '', beforeSummary?.paginatorText || '');
+            return gridText !== previousGridText ||
+              paginatorText !== previousPaginatorText ||
+              hasVisibleDocLink ||
+              /no items found|no results found|no documents found|no matching documents|0\s+results|項目はありません|該当する項目はありません|検索結果はありません/i.test(`${gridText} ${surfaceText}`) ||
+              (Date.now() - startedAt > 12000 && hasResultHeader && !loadingVisible);
+          }, { timeout: 45000 }, expectedSearchName, beforeSummary?.gridText || '', beforeSummary?.paginatorText || '', Date.now());
         } catch (e) {
           // ヘッダーだけ表示される中途半端な状態なら下のsummary判定でリトライする
         }
@@ -2290,7 +2806,7 @@ async function withTimeout(promise, timeoutMs, label) {
           continue;
         }
 
-        lastSummary = await getSearchResultSummary(baseUrl);
+        lastSummary = await getSearchResultSummary(baseUrl, expectedSearchName);
         if (lastSummary.count !== null) {
           return {
             ...lastSummary,
@@ -4558,10 +5074,17 @@ async function withTimeout(promise, timeoutMs, label) {
           console.log("input:", searchSummary.inputValue || "(なし)");
           console.log("paginator:", searchSummary.paginatorText || "(なし)");
           console.log("grid:", searchSummary.gridText ? searchSummary.gridText.slice(0, 300) : "(なし)");
+          if (searchSummary.bodyText) {
+            console.log("body:", searchSummary.bodyText.slice(0, 300));
+          }
           if (searchSummary.resultRows?.length) {
             console.log("rows:", searchSummary.resultRows.join(" / ").slice(0, 500));
           }
-          return ["作成失敗", page.url(), slideURL, message];
+          const debugDir = await saveVaultDebugArtifact('duplicate-search-unverified', {
+            duplicateTarget,
+            searchSummary,
+          });
+          return ["作成失敗", page.url(), slideURL, debugDir ? `${message} / debug: ${debugDir}` : message];
         }
 
         if (IS_REVISION) {
