@@ -351,6 +351,9 @@ async function withTimeout(promise, timeoutMs, label) {
       '.vv-action-bar-dropdown-menu > button',
       '.vv_docstatus_wrapper .documentLifecycleStateBadgeContainer button[data-corgix-internal="BUTTON"]',
       '.vv_docstatus_wrapper .vv-picker-badge button',
+      '.vv-doc-state-badge .vv-picker-badge button',
+      '[title="Draft"] .vv-picker-badge button',
+      '[class*="DocInfoHeader-module__headerDocStatuses"] .vv-picker-badge button',
       '.documentLifecycleStateBadgeContainer button[data-corgix-internal="BUTTON"]',
       '.vv-picker-badge button',
     ].join(', ');
@@ -363,6 +366,9 @@ async function withTimeout(promise, timeoutMs, label) {
       '.vv-picker-badge-menu [data-value="dynamicAction:LifecycleUserAction3"]',
       '[data-overlay-tree-id] .vv-picker-badge-menu [role="option"]',
       '[data-overlay-tree-id] [data-corgix-internal="MENU-ITEM"]',
+      '[role="option"][id$="dynamicAction:stage"]',
+      '[role="option"][id$="dynamicAction:LifecycleUserAction2"]',
+      '[role="option"][id$="dynamicAction:LifecycleUserAction3"]',
       'li[data-value=dynamicAction\\:stage]',
       'li[data-value="dynamicAction:stage"]',
     ].join(', ');
@@ -3421,7 +3427,30 @@ async function withTimeout(promise, timeoutMs, label) {
       }), statusButtonSelector, stagedMenuItemSelector, dialogSelector).catch(err => ({ error: String(err) }));
 
       const statusIsStaged = async () => page.evaluate(selector => {
-        return Array.from(document.querySelectorAll(selector)).some(button => {
+        const visible = element => {
+          if (!element) return false;
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return rect.width > 0 &&
+            rect.height > 0 &&
+            style.visibility !== 'hidden' &&
+            style.display !== 'none';
+        };
+        const statusRank = button => {
+          if (button.closest('[class*="DocInfoHeader-module__headerDocStatuses"]')) return 0;
+          if (button.closest('.vv_docstatus_wrapper')) return 1;
+          if (button.closest('.documentLifecycleStateBadgeContainer')) return 2;
+          if (button.closest('.vv-doc-state-badge')) return 3;
+          return 9;
+        };
+        const buttons = Array.from(document.querySelectorAll(selector))
+          .filter(visible)
+          .map(button => ({ button, rank: statusRank(button) }))
+          .filter(item => item.rank < 9);
+        if (buttons.length === 0) return false;
+        const bestRank = Math.min(...buttons.map(item => item.rank));
+        return buttons.some(({ button, rank }) => {
+          if (rank !== bestRank) return false;
           const label = [
             button.getAttribute('title') || '',
             button.textContent || '',
@@ -3444,7 +3473,15 @@ async function withTimeout(promise, timeoutMs, label) {
               style.display !== 'none';
           };
           const buttons = Array.from(document.querySelectorAll(selector));
-          const isStatusBadgeButton = button => button.closest('.vv_docstatus_wrapper, .documentLifecycleStateBadgeContainer, .vv-picker-badge');
+          const isStatusBadgeButton = button => button.closest('.vv_docstatus_wrapper, .vv-doc-state-badge, .documentLifecycleStateBadgeContainer, [class*="DocInfoHeader-module__headerDocStatuses"], .vv-picker-badge');
+          const statusRank = button => {
+            if (button.closest('[class*="DocInfoHeader-module__headerDocStatuses"]')) return 0;
+            if (button.closest('.vv_docstatus_wrapper')) return 1;
+            if (button.closest('.documentLifecycleStateBadgeContainer')) return 2;
+            if (button.closest('.vv-doc-state-badge')) return 3;
+            if (button.closest('.vv-picker-badge')) return 4;
+            return 9;
+          };
           const hasDraftLabel = button => {
             const label = [
               button.getAttribute('title') || '',
@@ -3452,7 +3489,13 @@ async function withTimeout(promise, timeoutMs, label) {
             ].join(' ');
             return /draft|ドラフト|下書き/i.test(label);
           };
+          const visibleButtons = buttons
+            .filter(visible)
+            .map(button => ({ button, rank: statusRank(button) }))
+            .sort((a, b) => a.rank - b.rank);
           const target =
+            visibleButtons.find(item => item.rank < 4 && hasDraftLabel(item.button))?.button ||
+            visibleButtons.find(item => item.rank < 4)?.button ||
             buttons.find(button => visible(button) && isStatusBadgeButton(button) && hasDraftLabel(button)) ||
             buttons.find(button => visible(button) && isStatusBadgeButton(button)) ||
             buttons.find(button => visible(button) && hasDraftLabel(button)) ||
@@ -3476,14 +3519,28 @@ async function withTimeout(promise, timeoutMs, label) {
       };
 
       const clickStagedMenuItem = async () => {
-        await page.waitForFunction(selector => {
+        await page.waitForFunction((selector, buttonSelector) => {
           const stagedValues = new Set(['dynamicAction:LifecycleUserAction2', 'dynamicAction:LifecycleUserAction3', 'dynamicAction:stage']);
           const isStagedItem = element => {
             const value = element.getAttribute('data-value') || '';
             const text = (element.textContent || '').trim();
-            return stagedValues.has(value) || /staged|ステージング|ステージ済|ステージ|アップロード済/i.test(text);
+            const id = element.getAttribute('id') || '';
+            return stagedValues.has(value) ||
+              /dynamicAction:(LifecycleUserAction2|LifecycleUserAction3|stage)$/.test(id) ||
+              /staged|ステージング|ステージ済|ステージ|アップロード済/i.test(text);
           };
-          return Array.from(document.querySelectorAll(selector)).some(element => {
+          const ariaOwnedItems = Array.from(document.querySelectorAll(buttonSelector)).flatMap(button => {
+            const refs = [
+              button.getAttribute('aria-owns') || '',
+              button.getAttribute('aria-activedescendant') || '',
+            ].join(' ').split(/\s+/).filter(Boolean);
+            return refs.map(id => document.getElementById(id)).filter(Boolean);
+          });
+          const candidates = Array.from(new Set([
+            ...Array.from(document.querySelectorAll(selector)),
+            ...ariaOwnedItems,
+          ]));
+          return candidates.some(element => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
             return rect.width > 0 &&
@@ -3493,9 +3550,9 @@ async function withTimeout(promise, timeoutMs, label) {
               style.pointerEvents !== 'none' &&
               isStagedItem(element);
           });
-        }, { timeout: NORMAL_WAIT }, stagedMenuItemSelector);
+        }, { timeout: NORMAL_WAIT }, stagedMenuItemSelector, statusButtonSelector);
 
-        const point = await page.evaluate(selector => {
+        const point = await page.evaluate((selector, buttonSelector) => {
           const stagedValues = new Set(['dynamicAction:LifecycleUserAction2', 'dynamicAction:LifecycleUserAction3', 'dynamicAction:stage']);
           const visible = element => {
             if (!element) return false;
@@ -3507,13 +3564,26 @@ async function withTimeout(promise, timeoutMs, label) {
               style.display !== 'none' &&
               style.pointerEvents !== 'none';
           };
-          const menuVisible = element => visible(element.closest('.vv-picker-badge-menu, [data-overlay-tree-id]'));
+          const menuVisible = element => visible(element.closest('.vv-picker-badge-menu, [data-overlay-tree-id], [data-overlay-portal]'));
           const isStagedItem = element => {
             const value = element.getAttribute('data-value') || '';
             const text = (element.textContent || '').trim();
-            return stagedValues.has(value) || /staged|ステージング|ステージ済|ステージ|アップロード済/i.test(text);
+            const id = element.getAttribute('id') || '';
+            return stagedValues.has(value) ||
+              /dynamicAction:(LifecycleUserAction2|LifecycleUserAction3|stage)$/.test(id) ||
+              /staged|ステージング|ステージ済|ステージ|アップロード済/i.test(text);
           };
-          const items = Array.from(document.querySelectorAll(selector));
+          const ariaOwnedItems = Array.from(document.querySelectorAll(buttonSelector)).flatMap(button => {
+            const refs = [
+              button.getAttribute('aria-owns') || '',
+              button.getAttribute('aria-activedescendant') || '',
+            ].join(' ').split(/\s+/).filter(Boolean);
+            return refs.map(id => document.getElementById(id)).filter(Boolean);
+          });
+          const items = Array.from(new Set([
+            ...ariaOwnedItems,
+            ...Array.from(document.querySelectorAll(selector)),
+          ]));
           const target = items.find(element => visible(element) && menuVisible(element) && isStagedItem(element)) ||
             items.find(element => visible(element) && isStagedItem(element));
           if (!target) return { ok: false, reason: 'staged menu item not found' };
@@ -3532,7 +3602,7 @@ async function withTimeout(promise, timeoutMs, label) {
             className: String(target.className || ''),
             elementAtPointText: (document.elementFromPoint(x, y)?.textContent || '').trim(),
           };
-        }, stagedMenuItemSelector);
+        }, stagedMenuItemSelector, statusButtonSelector);
         if (!point.ok) throw new Error(`Stagedメニュー項目が見つかりません: ${JSON.stringify(point)}`);
         console.log(`ステータスメニューのStagedを押します: ${JSON.stringify(point)}`);
         await page.mouse.move(point.x, point.y);
@@ -4152,7 +4222,7 @@ async function withTimeout(promise, timeoutMs, label) {
           document.querySelectorAll(selector).forEach(button => {
             button.removeAttribute('data-lecture-direct-create-draft');
           });
-        }, directCreateDraftButtonSelector).catch(() => {});
+        }, directCreateDraftButtonSelector).catch(() => { });
         const point = await page.evaluate(selector => {
           const visible = element => {
             const style = window.getComputedStyle(element);
@@ -4254,7 +4324,7 @@ async function withTimeout(promise, timeoutMs, label) {
           document.querySelectorAll(selector).forEach(button => {
             button.removeAttribute('data-lecture-more-actions');
           });
-        }, moreActionsButtonSelector).catch(() => {});
+        }, moreActionsButtonSelector).catch(() => { });
         const point = await page.evaluate(selector => {
           const visible = element => {
             const style = window.getComputedStyle(element);
@@ -5391,17 +5461,19 @@ async function withTimeout(promise, timeoutMs, label) {
         console.log("Shared Resourceを紐付けています: MSD_ONC_TOOL_SHARED");
         await addSharedResource("MSD_ONC_TOOL_SHARED");
 
-        if (!IS_DIRECT_VAULT_USER) {
-          console.log("スライドのステータスをStagedへ変更しています。");
-          await changeDocumentStatusToStaged();
-        }
+
+        console.log("スライドのステータスをStagedへ変更しています。");
+        await changeDocumentStatusToStaged();
+
 
 
         await page.goto(binderURL, DCL);
-        if (!IS_DIRECT_VAULT_USER) {
-          console.log("BinderのステータスをStagedへ変更しています。");
-          await changeDocumentStatusToStaged();
+        const binderStatusButton = await waitForOptionalSelector(STATUS_SUBMIT_SELECTOR, LONG_WAIT, { visible: true });
+        if (!binderStatusButton) {
+          await throwWithVaultDebug("Binderのステータスボタンが見つかりませんでした。", "binder-status-button-not-found", { binderURL });
         }
+        console.log("BinderのステータスをStagedへ変更しています。");
+        await changeDocumentStatusToStaged();
 
 
         console.log("登録が正常に完了しました。");
