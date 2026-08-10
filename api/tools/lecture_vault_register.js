@@ -347,8 +347,25 @@ async function withTimeout(promise, timeoutMs, label) {
 
     const EDIT_SUBMIT_SELECTOR = '.docInfoEditButton';
 
-    const STATUS_SUBMIT_SELECTOR = '.vv-action-bar-dropdown-menu > button';
-    const STAGED_SUBMIT_SELECTOR = 'li[data-value=dynamicAction\\:stage]';
+    const STATUS_SUBMIT_SELECTOR = [
+      '.vv-action-bar-dropdown-menu > button',
+      '.vv_docstatus_wrapper .documentLifecycleStateBadgeContainer button[data-corgix-internal="BUTTON"]',
+      '.vv_docstatus_wrapper .vv-picker-badge button',
+      '.documentLifecycleStateBadgeContainer button[data-corgix-internal="BUTTON"]',
+      '.vv-picker-badge button',
+    ].join(', ');
+    const STAGED_SUBMIT_SELECTOR = [
+      '.vv-picker-badge-menu li[data-value="dynamicAction:stage"]',
+      '.vv-picker-badge-menu [data-value="dynamicAction:stage"]',
+      '.vv-picker-badge-menu li[data-value="dynamicAction:LifecycleUserAction2"]',
+      '.vv-picker-badge-menu [data-value="dynamicAction:LifecycleUserAction2"]',
+      '.vv-picker-badge-menu li[data-value="dynamicAction:LifecycleUserAction3"]',
+      '.vv-picker-badge-menu [data-value="dynamicAction:LifecycleUserAction3"]',
+      '[data-overlay-tree-id] .vv-picker-badge-menu [role="option"]',
+      '[data-overlay-tree-id] [data-corgix-internal="MENU-ITEM"]',
+      'li[data-value=dynamicAction\\:stage]',
+      'li[data-value="dynamicAction:stage"]',
+    ].join(', ');
 
 
     const MENU_CONTAINER_SELECTOR = [
@@ -3385,8 +3402,8 @@ async function withTimeout(promise, timeoutMs, label) {
     }
 
     async function changeDocumentStatusToStaged() {
-      const statusButtonSelector = '.vv_docstatus_wrapper .documentLifecycleStateBadgeContainer button[data-corgix-internal="BUTTON"], .vv_docstatus_wrapper .vv-picker-badge button';
-      const stagedMenuItemSelector = '.vv-picker-badge-menu li[data-value="dynamicAction:LifecycleUserAction3"], .vv-picker-badge-menu [role="option"], [data-corgix-internal="MENU-ITEM"]';
+      const statusButtonSelector = STATUS_SUBMIT_SELECTOR;
+      const stagedMenuItemSelector = STAGED_SUBMIT_SELECTOR;
       const dialogSelector = '.ui-dialog, [role="dialog"], [data-corgix-internal="DIALOG"], .vv-dialog, .vv_modal, .modal';
       const visibleTextState = async () => page.evaluate((buttonSelector, menuSelector, modalSelector) => ({
         statusButtons: Array.from(document.querySelectorAll(buttonSelector)).map(button => ({
@@ -3427,13 +3444,19 @@ async function withTimeout(promise, timeoutMs, label) {
               style.display !== 'none';
           };
           const buttons = Array.from(document.querySelectorAll(selector));
-          const target = buttons.find(button => {
+          const isStatusBadgeButton = button => button.closest('.vv_docstatus_wrapper, .documentLifecycleStateBadgeContainer, .vv-picker-badge');
+          const hasDraftLabel = button => {
             const label = [
               button.getAttribute('title') || '',
               button.textContent || '',
             ].join(' ');
-            return visible(button) && /draft|ドラフト|下書き/i.test(label);
-          }) || buttons.find(visible);
+            return /draft|ドラフト|下書き/i.test(label);
+          };
+          const target =
+            buttons.find(button => visible(button) && isStatusBadgeButton(button) && hasDraftLabel(button)) ||
+            buttons.find(button => visible(button) && isStatusBadgeButton(button)) ||
+            buttons.find(button => visible(button) && hasDraftLabel(button)) ||
+            buttons.find(visible);
           if (!target) return { ok: false, reason: 'status button not found' };
           target.scrollIntoView({ block: 'center', inline: 'center' });
           const rect = target.getBoundingClientRect();
@@ -3454,6 +3477,12 @@ async function withTimeout(promise, timeoutMs, label) {
 
       const clickStagedMenuItem = async () => {
         await page.waitForFunction(selector => {
+          const stagedValues = new Set(['dynamicAction:LifecycleUserAction2', 'dynamicAction:LifecycleUserAction3', 'dynamicAction:stage']);
+          const isStagedItem = element => {
+            const value = element.getAttribute('data-value') || '';
+            const text = (element.textContent || '').trim();
+            return stagedValues.has(value) || /staged|ステージング|ステージ済|ステージ|アップロード済/i.test(text);
+          };
           return Array.from(document.querySelectorAll(selector)).some(element => {
             const style = window.getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -3461,12 +3490,13 @@ async function withTimeout(promise, timeoutMs, label) {
               rect.height > 0 &&
               style.visibility !== 'hidden' &&
               style.display !== 'none' &&
-              (element.getAttribute('data-value') === 'dynamicAction:LifecycleUserAction3' ||
-                /staged|ステージング|ステージ済|ステージ|アップロード済/i.test((element.textContent || '').trim()));
+              style.pointerEvents !== 'none' &&
+              isStagedItem(element);
           });
         }, { timeout: NORMAL_WAIT }, stagedMenuItemSelector);
 
         const point = await page.evaluate(selector => {
+          const stagedValues = new Set(['dynamicAction:LifecycleUserAction2', 'dynamicAction:LifecycleUserAction3', 'dynamicAction:stage']);
           const visible = element => {
             if (!element) return false;
             const style = window.getComputedStyle(element);
@@ -3474,12 +3504,18 @@ async function withTimeout(promise, timeoutMs, label) {
             return rect.width > 0 &&
               rect.height > 0 &&
               style.visibility !== 'hidden' &&
-              style.display !== 'none';
+              style.display !== 'none' &&
+              style.pointerEvents !== 'none';
+          };
+          const menuVisible = element => visible(element.closest('.vv-picker-badge-menu, [data-overlay-tree-id]'));
+          const isStagedItem = element => {
+            const value = element.getAttribute('data-value') || '';
+            const text = (element.textContent || '').trim();
+            return stagedValues.has(value) || /staged|ステージング|ステージ済|ステージ|アップロード済/i.test(text);
           };
           const items = Array.from(document.querySelectorAll(selector));
-          const target = items.find(element => visible(element) &&
-            (element.getAttribute('data-value') === 'dynamicAction:LifecycleUserAction3' ||
-              /staged|ステージング|ステージ済|ステージ|アップロード済/i.test((element.textContent || '').trim())));
+          const target = items.find(element => visible(element) && menuVisible(element) && isStagedItem(element)) ||
+            items.find(element => visible(element) && isStagedItem(element));
           if (!target) return { ok: false, reason: 'staged menu item not found' };
           target.scrollIntoView({ block: 'center', inline: 'center' });
           const rect = target.getBoundingClientRect();
