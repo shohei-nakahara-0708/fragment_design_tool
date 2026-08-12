@@ -870,6 +870,9 @@ export default function JobEditorPage() {
       lastSentRef.current = s;
       if (d.previewDataUrl) {
         setPreviewSrc(d.previewDataUrl);
+      } else if (d.previewUrl) {
+        const sep = d.previewUrl.includes("?") ? "&" : "?";
+        setPreviewSrc(`${API_BASE}${d.previewUrl}${sep}t=${Date.now()}`);
       } else {
         setPreviewSrc(`${API_BASE}/preview/${jobId}.jpg?t=${Date.now()}`);
       }

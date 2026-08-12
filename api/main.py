@@ -115,6 +115,14 @@ EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_HEIGHT = 2000
 BASE_VIEWPORT = {"width": 600, "height": 800}
+CHROMIUM_LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
+PLAYWRIGHT_PRESTART_BROWSER = str(os.getenv("PLAYWRIGHT_PRESTART_BROWSER") or "").lower() in {"1", "true", "yes", "on"}
+PLAYWRIGHT_BROWSER_IDLE_SECONDS = max(0, int(os.getenv("PLAYWRIGHT_BROWSER_IDLE_SECONDS", "180")))
+_pw = None
+_browser = None
+_browser_loop = None
+_browser_idle_task = None
+_browser_active_uses = 0
 
 # より高性能なモデルを使用して精度向上
 AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # gpt-4o-mini → gpt-4o
@@ -2307,19 +2315,18 @@ async def apply_precise_typeset_initial(payload: DesignJSON, page=None) -> Desig
 
     # ---- page が無ければグローバル _browser から一時ページを作成 ----
     if page is None:
-        global _browser
-        if _browser is not None:
-            # グローバルブラウザから一時ページを作成（2重ブラウザ起動によるOOMを回避）
-            ctx = await _browser.new_context(viewport=BASE_VIEWPORT)
+        shared_browser = await _acquire_shared_browser()
+        if shared_browser is not None:
+            ctx = await shared_browser.new_context(viewport=BASE_VIEWPORT)
             pg = await ctx.new_page()
             try:
                 new_obj = await _run(pg)
             finally:
                 await ctx.close()
+                _release_shared_browser(shared_browser)
         else:
-            # フォールバック: グローバルブラウザが未初期化の場合のみ新規起動
             async with async_playwright() as p:
-                browser = await p.chromium.launch()
+                browser = await p.chromium.launch(args=CHROMIUM_LAUNCH_ARGS)
                 pg = await browser.new_page(viewport=BASE_VIEWPORT)
                 try:
                     new_obj = await _run(pg)
@@ -14292,22 +14299,37 @@ def trim_last_pixel(path: str):
 
 
 async def render_png_bytes(payload: DesignJSON, browser=None) -> tuple[bytes, str]:
-    global _cached_template, _browser
+    global _cached_template
 
     if _cached_template is None:
         _cached_template = TEMPLATE_PATH.read_text(encoding="utf-8")
 
-    active_browser = browser or _browser
-    if active_browser is None:
-        raise RuntimeError("Playwright browser is not initialized")
+    active_browser = browser
+    borrowed_shared_browser = None
+    local_pw = None
+    local_browser = None
+    context = None
 
-    context = await active_browser.new_context(
-        viewport=BASE_VIEWPORT,
-        device_scale_factor=1,
-    )
-    page = await context.new_page()
+    if active_browser is None:
+        borrowed_shared_browser = await _acquire_shared_browser()
+        active_browser = borrowed_shared_browser
+
+    if active_browser is None:
+        local_pw = await async_playwright().start()
+        try:
+            os.environ.setdefault("LECTURE_TOOL_CHROME_EXECUTABLE_PATH", local_pw.chromium.executable_path)
+        except Exception as e:
+            print("[render chromium executable path warning]", e)
+        local_browser = await local_pw.chromium.launch(args=CHROMIUM_LAUNCH_ARGS)
+        active_browser = local_browser
 
     try:
+        context = await active_browser.new_context(
+            viewport=BASE_VIEWPORT,
+            device_scale_factor=1,
+        )
+        page = await context.new_page()
+
         page.on("pageerror", lambda e: print("[pageerror]", e))
         page.on("console", lambda m: print("[console]", m.type, m.text))
 
@@ -14401,7 +14423,14 @@ async def render_png_bytes(payload: DesignJSON, browser=None) -> tuple[bytes, st
         return jpg_bytes, html
 
     finally:
-        await context.close()
+        if context is not None:
+            await context.close()
+        if borrowed_shared_browser is not None:
+            _release_shared_browser(borrowed_shared_browser)
+        if local_browser is not None:
+            await local_browser.close()
+        if local_pw is not None:
+            await local_pw.stop()
 
 async def render_png(payload: DesignJSON, out_path: Path, debug_html_path: Path):
     global _cached_template
@@ -14410,7 +14439,7 @@ async def render_png(payload: DesignJSON, out_path: Path, debug_html_path: Path)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=CHROMIUM_LAUNCH_ARGS,
         )
 
         context = await browser.new_context(
@@ -14816,6 +14845,129 @@ async def root_health_head():
 async def healthz():
     return {"ok": True}
 
+
+def _browser_connected(browser) -> bool:
+    try:
+        return bool(browser and browser.is_connected())
+    except Exception:
+        return False
+
+
+def _shared_browser_for_current_loop():
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    if _browser_loop is not loop:
+        return None
+    if not _browser_connected(_browser):
+        return None
+    return _browser
+
+
+async def _ensure_shared_browser():
+    global _pw, _browser, _browser_loop, _browser_idle_task
+
+    existing = _shared_browser_for_current_loop()
+    if existing is not None:
+        return existing
+
+    loop = asyncio.get_running_loop()
+    if _browser is not None and _browser_loop is not loop and _browser_connected(_browser):
+        return None
+    if _browser_loop is not None and _browser_loop is not loop:
+        return None
+
+    if _browser_idle_task is not None:
+        _browser_idle_task.cancel()
+        _browser_idle_task = None
+
+    if _pw is None:
+        _pw = await async_playwright().start()
+        try:
+            os.environ.setdefault("LECTURE_TOOL_CHROME_EXECUTABLE_PATH", _pw.chromium.executable_path)
+        except Exception as e:
+            print("[playwright chromium executable path warning]", e)
+
+    _browser = await _pw.chromium.launch(args=CHROMIUM_LAUNCH_ARGS)
+    _browser_loop = loop
+    return _browser
+
+
+async def _close_shared_browser(reason: str = "idle") -> None:
+    global _pw, _browser, _browser_loop, _browser_idle_task, _browser_active_uses
+
+    if _browser_active_uses > 0 and reason != "shutdown":
+        return
+
+    browser = _browser
+    pw = _pw
+    _browser = None
+    _pw = None
+    _browser_loop = None
+    _browser_idle_task = None
+    _browser_active_uses = 0
+
+    try:
+        if browser is not None and _browser_connected(browser):
+            await browser.close()
+    except Exception as e:
+        print(f"[playwright browser close error:{reason}]", e)
+
+    try:
+        if pw is not None:
+            await pw.stop()
+    except Exception as e:
+        print(f"[playwright stop error:{reason}]", e)
+
+
+def _schedule_shared_browser_idle_close() -> None:
+    global _browser_idle_task
+
+    if PLAYWRIGHT_BROWSER_IDLE_SECONDS <= 0:
+        return
+    if _browser_active_uses > 0 or _browser is None:
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _browser_loop is not loop:
+        return
+
+    if _browser_idle_task is not None:
+        _browser_idle_task.cancel()
+
+    async def _close_later():
+        await asyncio.sleep(PLAYWRIGHT_BROWSER_IDLE_SECONDS)
+        if _browser_active_uses == 0:
+            await _close_shared_browser("idle")
+
+    _browser_idle_task = loop.create_task(_close_later())
+
+
+async def _acquire_shared_browser():
+    global _browser_active_uses, _browser_idle_task
+
+    browser = await _ensure_shared_browser()
+    if browser is None:
+        return None
+    if _browser_idle_task is not None:
+        _browser_idle_task.cancel()
+        _browser_idle_task = None
+    _browser_active_uses += 1
+    return browser
+
+
+def _release_shared_browser(browser) -> None:
+    global _browser_active_uses
+
+    if browser is not _browser:
+        return
+    _browser_active_uses = max(0, _browser_active_uses - 1)
+    _schedule_shared_browser_idle_close()
+
 # データベース接続エラーのグローバルハンドラー
 @app.exception_handler(OperationalError)
 async def database_exception_handler(request: Request, exc: OperationalError):
@@ -14852,7 +15004,7 @@ async def database_exception_handler(request: Request, exc: OperationalError):
 
 @app.on_event("startup")
 async def startup():
-    global _cached_template, _pw, _browser
+    global _cached_template
 
     # データベース初期化（エラーハンドリング付き）
     try:
@@ -14883,15 +15035,14 @@ async def startup():
     if browsers_path:
         Path(browsers_path).mkdir(parents=True, exist_ok=True)
 
-    # Playwright を1回だけ起動して使い回す
-    _pw = await async_playwright().start()
-    try:
-        os.environ.setdefault("LECTURE_TOOL_CHROME_EXECUTABLE_PATH", _pw.chromium.executable_path)
-    except Exception as e:
-        print("[startup chromium executable path warning]", e)
-    _browser = await _pw.chromium.launch(
-        args=["--no-sandbox", "--disable-dev-shm-usage"],
-    )
+    if PLAYWRIGHT_PRESTART_BROWSER:
+        await _ensure_shared_browser()
+    else:
+        try:
+            async with async_playwright() as pw:
+                os.environ.setdefault("LECTURE_TOOL_CHROME_EXECUTABLE_PATH", pw.chromium.executable_path)
+        except Exception as e:
+            print("[startup chromium executable path warning]", e)
 
     # Ensure Chromium exists
     # try:
@@ -14901,25 +15052,8 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    global _browser, _pw
-
     close_db_pool()
-
-    try:
-        if _browser is not None:
-            await _browser.close()
-    except Exception as e:
-        print("[shutdown browser close error]", e)
-    finally:
-        _browser = None
-
-    try:
-        if _pw is not None:
-            await _pw.stop()
-    except Exception as e:
-        print("[shutdown playwright stop error]", e)
-    finally:
-        _pw = None
+    await _close_shared_browser("shutdown")
 
 
 def _sse(event: str, data: dict) -> str:
@@ -15195,7 +15329,7 @@ async def _upload_batch_worker_async(
     try:
         local_pw = await async_playwright().start()
         local_browser = await local_pw.chromium.launch(
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=CHROMIUM_LAUNCH_ARGS,
         )
 
         emit("phase", {"phase": "processing", "message": "生成を開始します…"})
@@ -18610,7 +18744,7 @@ async def render(req: RenderReq, background_tasks: BackgroundTasks):
     _signed_url_cache.pop(preview_cache_key, None)
 
     # Storage アップロード + DB更新はバックグラウンドで実行
-    # （レスポンスには previewDataUrl が含まれるので待つ必要なし）
+    # プレビューはローカル保存済みの /preview から取得する。
     _job_id_bg = req.jobId
     _payload_dict_bg = payload_dict
     _jpg_bytes_bg = jpg_bytes
@@ -18732,7 +18866,6 @@ async def render(req: RenderReq, background_tasks: BackgroundTasks):
         "warnings": getattr(payload, "warnings", None),
         "previewUrl": f"/preview/{req.jobId}.jpg",
         "downloadUrl": f"/download/{req.jobId}.jpg",
-        "previewDataUrl": f"data:image/jpeg;base64,{base64.b64encode(jpg_bytes).decode('ascii')}",
     })
 
 def _parse_date_start(s: str) -> Optional[datetime]:
