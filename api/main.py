@@ -11,7 +11,7 @@ import shlex
 import uuid
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Literal, Tuple
+from typing import List, Optional, Dict, Any, Literal, Tuple, Union
 from urllib.parse import quote
 
 import httpx
@@ -1845,12 +1845,19 @@ def extract_blocks_from_pdf(pdf_path: Path, first_page_only: bool = True) -> Lis
     return blocks
 
 
-def extract_blocks_from_pdf2(file_path: str) -> list[dict[str, Any]]:
+def open_pdf_source(src: Union[str, bytes]) -> fitz.Document:
+    # bytes はディスクに書かずにメモリ上で開く
+    if isinstance(src, (bytes, bytearray)):
+        return fitz.open(stream=src, filetype="pdf")
+    return fitz.open(src)
+
+
+def extract_blocks_from_pdf2(file_path: Union[str, bytes]) -> list[dict[str, Any]]:
     """
     PDFから line 単位でテキストブロックを抽出する。
     さらに各 line の spans も返す。
     """
-    doc = fitz.open(file_path)
+    doc = open_pdf_source(file_path)
     out: list[dict[str, Any]] = []
 
     try:
@@ -19446,6 +19453,88 @@ def delete_file_quietly(path: Path | str) -> None:
         pass
 
 
+# =========================
+# DATA_DIR の古い生成物を定期削除
+# =========================
+
+DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "14"))
+DATA_CLEANUP_INTERVAL_SEC = 6 * 60 * 60
+
+# 各ツールの生成結果（session_id ごとのフォルダ）
+DATA_CLEANUP_SESSION_DIRNAMES = (
+    "lecture_search_guide",
+    "stamp_mail",
+    "banner_mail",
+    "csl_lecture_tool",
+    "fragment_slide_results",
+    "_exports",
+    "vm_diff_previews",
+)
+
+_JOB_DIR_RE = re.compile(r"^[0-9a-f]{32}$")
+_TOP_LEVEL_TMP_RE = re.compile(r"^(pdf_preview_|pptx_preview_|tmp)")
+
+
+def _remove_path_quietly(p: Path) -> None:
+    try:
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            p.unlink()
+    except Exception:
+        pass
+
+
+def cleanup_old_data_dir(retention_days: int = DATA_RETENTION_DAYS) -> int:
+    """
+    retention_days より古い生成物を削除する。
+    - 各ツールの結果フォルダ
+    - job_id フォルダ（Supabase Storage のローカルキャッシュ）
+    - DATA_DIR 直下に残ったプレビュー等の一時ファイル
+    """
+    if retention_days <= 0:
+        return 0
+
+    cutoff = time.time() - retention_days * 24 * 60 * 60
+    targets: list[Path] = []
+
+    for name in DATA_CLEANUP_SESSION_DIRNAMES:
+        base = DATA_DIR / name
+        if base.is_dir():
+            targets.extend(base.iterdir())
+
+    for p in DATA_DIR.iterdir():
+        if (p.is_dir() and _JOB_DIR_RE.match(p.name)) or _TOP_LEVEL_TMP_RE.match(p.name):
+            targets.append(p)
+
+    removed = 0
+    for p in targets:
+        try:
+            if p.stat().st_mtime >= cutoff:
+                continue
+        except Exception:
+            continue
+        _remove_path_quietly(p)
+        removed += 1
+
+    return removed
+
+
+async def _data_cleanup_loop() -> None:
+    while True:
+        try:
+            removed = await asyncio.to_thread(cleanup_old_data_dir)
+            if removed:
+                logger.info("cleanup_old_data_dir: removed %s items older than %s days", removed, DATA_RETENTION_DAYS)
+        except Exception:
+            logger.exception("cleanup_old_data_dir failed")
+        await asyncio.sleep(DATA_CLEANUP_INTERVAL_SEC)
+
+
+@app.on_event("startup")
+async def start_data_cleanup_loop():
+    asyncio.create_task(_data_cleanup_loop())
+
 
 
 
@@ -19892,9 +19981,9 @@ def normalize_blocks_to_preview_pixels(
 # 戻り値: (preview_image_path, width, height)
 # =========================
 
-def pdf_has_extractable_text(file_path: str) -> bool:
+def pdf_has_extractable_text(file_path: Union[str, bytes]) -> bool:
     try:
-        doc = fitz.open(file_path)
+        doc = open_pdf_source(file_path)
         try:
             for page in doc:
                 text = page.get_text("text")
@@ -19908,8 +19997,11 @@ def pdf_has_extractable_text(file_path: str) -> bool:
 
 
 
-def extract_text_blocks_for_vm_diff(file_path: str) -> list[Any]:
-    ext = os.path.splitext(file_path)[1].lower()
+def extract_text_blocks_for_vm_diff(file_path: Union[str, bytes]) -> list[Any]:
+    if isinstance(file_path, (bytes, bytearray)):
+        ext = ".pdf"
+    else:
+        ext = os.path.splitext(file_path)[1].lower()
 
     if ext == ".pdf":
         if not pdf_has_extractable_text(file_path):
@@ -19977,13 +20069,8 @@ async def extract_text_blocks_endpoint(
             detail="このファイル形式は対応していません。テキスト抽出可能な PDF を使用してください。"
         )
 
-    tmp_path = ""
-
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=str(DATA_DIR)) as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
+        content = await file.read()
 
         event_id = normalize_space(eventId or "")
 
@@ -19995,7 +20082,7 @@ async def extract_text_blocks_endpoint(
             except Exception:
                 headers, vm_rows = [], []
 
-        blocks = extract_text_blocks_for_vm_diff(tmp_path)
+        blocks = extract_text_blocks_for_vm_diff(content)
         shaped_rows = shape_vm_rows_for_diff(vm_rows, headers)
 
         return {
@@ -20016,9 +20103,6 @@ async def extract_text_blocks_endpoint(
         logger.exception("extract_text_blocks_endpoint failed")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"failed to extract text blocks: {type(e).__name__}: {e}")
-    finally:
-        if tmp_path:
-            delete_file_quietly(tmp_path)
 
 # =========================
 # endpoint: preview 取得後に削除
