@@ -3849,6 +3849,26 @@ async function withTimeout(promise, timeoutMs, label) {
       throw new Error("Binder作成ウィザードを開けませんでした。");
     }
 
+    // Move a closed native <select> to `value` with arrow keys, so the page sees trusted keyboard events.
+    async function selectOptionByKeyboard(selector, value) {
+      const indexes = () => page.$eval(selector, (select, wanted) => {
+        const options = Array.from(select.options);
+        return { current: select.selectedIndex, target: options.findIndex(option => option.value === wanted) };
+      }, value);
+      try {
+        await page.focus(selector);
+        for (let step = 0; step < 20; step++) {
+          const { current, target } = await indexes();
+          if (target < 0 || current === target) break;
+          await page.keyboard.press(current < target ? 'ArrowDown' : 'ArrowUp');
+          await new Promise(resolve => setTimeout(resolve, 150));
+        }
+        await page.keyboard.press('Tab');
+      } catch (e) {
+        console.log(red + `キーボードでの選択に失敗しました: ${e.message}` + reset);
+      }
+    }
+
     // Vault may re-render the type picker right after it appears, dropping a selection made too early.
     // Keep selecting until the value sticks and the OK button is enabled.
     async function selectDocumentType(value) {
@@ -3861,13 +3881,13 @@ async function withTimeout(promise, timeoutMs, label) {
           value
         ).catch(() => false);
         if (hasOption) {
-          await page.select(TPYE_SUBMIT_SELECTOR, value).catch(() => {});
-          // Vault's picker is jQuery; fire its change handler too in case the native event was missed.
-          await page.evaluate((selector, wanted) => {
-            const select = document.querySelector(selector);
-            if (!select || select.value !== wanted) return;
-            if (window.jQuery) window.jQuery(select).trigger('change');
-          }, TPYE_SUBMIT_SELECTOR, value).catch(() => {});
+          // Vault now reverts values set by script (page.select ends up on the first option),
+          // so choose the option with real key presses like a user; page.select is the fallback.
+          if (attempt % 3 !== 0) {
+            await selectOptionByKeyboard(TPYE_SUBMIT_SELECTOR, value);
+          } else {
+            await page.select(TPYE_SUBMIT_SELECTOR, value).catch(() => {});
+          }
           const ready = await page.waitForFunction(
             (selector, wanted) => {
               const select = document.querySelector(selector);
