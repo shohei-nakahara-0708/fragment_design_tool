@@ -22,3 +22,5 @@ PyMuPDF
 python-multipart
 
 requests
+
+openpyxl>=3.1

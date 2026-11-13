@@ -65,6 +65,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import logging
 
+import regeneron_fragments
+import regeneron_sheet
+
 logger = logging.getLogger(__name__)
 load_dotenv()
 
@@ -14823,6 +14826,14 @@ async def upload_all_assets_async(
 
 # ---------------- App ----------------
 app = FastAPI(title="PPTX → JSON → HTML → jpg (Keep Newlines + Split ~...~)")
+regeneron_service = regeneron_fragments.FragmentService(
+    regeneron_fragments.Store(db_connect), upload_bytes_to_storage, download_storage_file,
+    sheet_reader=lambda: regeneron_sheet.read_sheet(get_gsa_credentials),
+    sheet_writer=lambda entry: regeneron_sheet.append_transcript(get_gsa_credentials, entry),
+)
+# REGENERON_API_ENABLED=0 keeps only the background inbox/transcript/Chat work (e.g. production while the UI stays local).
+if os.getenv("REGENERON_API_ENABLED", "1").lower() not in ("0", "false", "no"):
+    app.include_router(regeneron_fragments.create_router(regeneron_service))
 
 app.add_middleware(
     CORSMiddleware,
@@ -15017,6 +15028,7 @@ async def startup():
     try:
         logger.info("Starting database initialization...")
         init_db()
+        regeneron_service.store.init()
         logger.info("Database initialization completed successfully")
     except OperationalError as e:
         error_msg = f"Database connection failed during startup: {e}"
@@ -15051,6 +15063,8 @@ async def startup():
         except Exception as e:
             print("[startup chromium executable path warning]", e)
 
+    regeneron_service.start()
+
     # Ensure Chromium exists
     # try:
     #     subprocess.check_call(["python", "-m", "playwright", "install", "chromium"])
@@ -15059,6 +15073,7 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
+    regeneron_service.stop()
     close_db_pool()
     await _close_shared_browser("shutdown")
 
