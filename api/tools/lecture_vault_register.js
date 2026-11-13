@@ -3849,6 +3849,51 @@ async function withTimeout(promise, timeoutMs, label) {
       throw new Error("Binder作成ウィザードを開けませんでした。");
     }
 
+    // Vault may re-render the type picker right after it appears, dropping a selection made too early.
+    // Keep selecting until the value sticks and the OK button is enabled.
+    async function selectDocumentType(value) {
+      const deadline = Date.now() + LONG_WAIT;
+      for (let attempt = 1; Date.now() < deadline; attempt++) {
+        await page.waitForSelector(TPYE_SUBMIT_SELECTOR, { visible: true, timeout: NORMAL_WAIT });
+        const hasOption = await page.$eval(
+          TPYE_SUBMIT_SELECTOR,
+          (select, wanted) => Array.from(select.options).some(option => option.value === wanted),
+          value
+        ).catch(() => false);
+        if (hasOption) {
+          await page.select(TPYE_SUBMIT_SELECTOR, value).catch(() => {});
+          // Vault's picker is jQuery; fire its change handler too in case the native event was missed.
+          await page.evaluate((selector, wanted) => {
+            const select = document.querySelector(selector);
+            if (!select || select.value !== wanted) return;
+            if (window.jQuery) window.jQuery(select).trigger('change');
+          }, TPYE_SUBMIT_SELECTOR, value).catch(() => {});
+          const ready = await page.waitForFunction(
+            (selector, wanted) => {
+              const select = document.querySelector(selector);
+              if (!select || select.value !== wanted) return false;
+              const dialog = select.closest('.ui-dialog') || document;
+              const ok = dialog.querySelector('.ok');
+              return !!ok && !ok.classList.contains('vv_disabled');
+            },
+            // Interval polling: requestAnimationFrame polling can stall in a headless/background page.
+            { timeout: 3000, polling: 250 },
+            TPYE_SUBMIT_SELECTOR,
+            value
+          ).then(() => true).catch(() => false);
+          if (ready) return;
+          const state = await page.$eval(TPYE_SUBMIT_SELECTOR, select => {
+            const ok = (select.closest('.ui-dialog') || document).querySelector('.ok');
+            return `value=${select.value || '(空)'} ok=${ok ? ok.className : '(なし)'}`;
+          }).catch(err => `取得失敗: ${err.message}`);
+          console.log(`ドキュメントタイプ選択欄の状態: ${state}`);
+        }
+        console.log(red + `ドキュメントタイプ(${value})が選択できていません。再選択します。(${attempt})` + reset);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      await throwWithVaultDebug(`ドキュメントタイプ(${value})を選択できませんでした。`, 'document-type-select');
+    }
+
 
     async function ensureSectionFieldVisible(sectionTitle, fieldSelector) {
       if (!sectionTitle) {
@@ -5267,12 +5312,7 @@ async function withTimeout(promise, timeoutMs, label) {
         console.log("Engage PresentationのBinder作成画面を開いています。");
         await openBinderCreateWizard(tUrl);
 
-        await page.select(TPYE_SUBMIT_SELECTOR, 'engagePresentation_b');
-        await page.waitForFunction(
-          selector => document.querySelector(selector)?.value === 'engagePresentation_b',
-          { timeout: NORMAL_WAIT },
-          TPYE_SUBMIT_SELECTOR
-        );
+        await selectDocumentType('engagePresentation_b');
         console.log("ドキュメントタイプ選択後のOKボタンを押します。");
         await clickWhenReady(OK_SUBMIT_SELECTOR, LONG_WAIT);
         try {
@@ -5375,12 +5415,7 @@ async function withTimeout(promise, timeoutMs, label) {
 
 
 
-        await page.select(TPYE_SUBMIT_SELECTOR, 'slide_b');
-        await page.waitForFunction(
-          selector => document.querySelector(selector)?.value === 'slide_b',
-          { timeout: NORMAL_WAIT },
-          TPYE_SUBMIT_SELECTOR
-        );
+        await selectDocumentType('slide_b');
         console.log("ドキュメントタイプ選択後のOKボタンを押します。");
         await clickWhenReady(OK_SUBMIT_SELECTOR, LONG_WAIT);
         try {
